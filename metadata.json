@@ -1,0 +1,6 @@
+{
+  "name": "AetherTerra 3D — Thiết Kế Bản Đồ Thế Giới Mở",
+  "description": "Studio thiết kế bản đồ 3D thế giới mở phong cách Genshin Impact & Pokémon với công cụ điêu khắc địa hình, sơn kết cấu chân thực, thư viện vật thể có sẵn và AI tái tạo địa hình 3D từ ảnh thực tế.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
