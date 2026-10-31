@@ -4,7 +4,7 @@ import { Ruler } from 'lucide-react';
 interface DistanceScaleBarProps {
   metersPerPixel: number;
   cameraDistanceMeters: number;
-  hoverCoords: { x: number; y: number; z: number } | null;
+  hoverCoords: { x: number; z: number } | null; // chỉ cần x, z (thanh thước không hiển thị độ cao)
 }
 
 const NICE_STEPS_METERS = [

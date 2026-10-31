@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 220" width="320" height="220">
+  <!-- Crisp bright alpine sky -->
+  <rect width="320" height="220" fill="#f8fafc" />
+  <!-- Left & right snow-draped alpine col / saddle -->
+  <polygon points="0,120 55,112 105,102 155,48 188,82 245,126 320,145 320,220 0,220" fill="#57534e" />
+  <!-- Matterhorn Sunlit East/Left Face -->
+  <polygon points="105,102 142,48 152,54 146,112" fill="#a8a29e" />
+  <!-- Matterhorn Dark Navy-Slate North/Right Shadow Face -->
+  <polygon points="142,48 156,52 178,94 146,112" fill="#1e3a8a" />
+  <polygon points="148,56 175,92 162,106 144,86" fill="#1e293b" />
+  <!-- Hooked Snow Summit & White Glacier Snowfields on Col -->
+  <polygon points="139,52 146,46 156,55 148,62" fill="#ffffff" />
+  <polygon points="18,125 62,115 112,106 144,98 126,126 54,142" fill="#f8fafc" />
+  <polygon points="154,96 208,108 242,126 196,136 148,114" fill="#f1f5f9" />
+  <!-- Mid-slope dark rock ribs -->
+  <polygon points="75,148 138,102 186,134 115,168" fill="#44403c" />
+  <!-- Lush Yellow-Green Alpine Rhododendron Meadow Foreground -->
+  <path d="M0,168 Q85,158 155,146 Q235,122 320,124 L320,220 L0,220 Z" fill="#65a30d" />
+  <path d="M120,162 Q215,128 320,132 L320,220 L100,220 Z" fill="#84cc16" />
+  <!-- Warm golden & pink alpine rhododendron flower clusters -->
+  <g fill="#d97706" opacity="0.75">
+    <circle cx="210" cy="152" r="14" />
+    <circle cx="265" cy="148" r="16" />
+    <circle cx="175" cy="176" r="15" />
+    <circle cx="285" cy="178" r="18" />
+    <circle cx="45" cy="182" r="14" />
+  </g>
+  <g fill="#ec4899">
+    <circle cx="62" cy="196" r="4.5" />
+    <circle cx="78" cy="204" r="5" />
+    <circle cx="95" cy="192" r="4" />
+    <circle cx="118" cy="205" r="5.5" />
+    <circle cx="136" cy="198" r="4.5" />
+    <circle cx="152" cy="208" r="5" />
+    <circle cx="220" cy="188" r="4" />
+    <circle cx="248" cy="196" r="4.5" />
+  </g>
+</svg>

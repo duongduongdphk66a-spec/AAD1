@@ -32,7 +32,29 @@ import {
   formatTerrainRuleFormula,
   BIOMES,
   WEATHER_CATALOG,
+  DAY_NIGHT_PRESETS,
+  timeOfDayToSunElevation,
+  formatTimeOfDayClock,
+  computeDayNightLightingState,
+  TEXTURE_INDEX_MAP,
+  serializeWorldToSavePayload,
+  deserializeWorldFromSavePayload,
 } from './terrainEngine';
+import {
+  createSurfaceEcosystemPatch,
+  PATCH_BUILDERS,
+  disposeObject3DTree,
+} from './surfaceEcosystem3D';
+import * as THREE from 'three';
+import { ProceduralPrefabFactory } from './proceduralModels';
+import { SAMPLE_PHOTO_PRESETS } from './samplePhotos';
+import * as constantsMod from './constants';
+import * as registryMod from './registry';
+import * as biomesMod from './registry/biomes';
+import * as prefabsMod from './registry/prefabs';
+import * as brushesMod from './brushes';
+import * as sculptingMod from './sculpting';
+import * as generationMod from './generation';
 
 test('world dimensions are 10x10km, 10,000,000,000px (100x increase, 10cm/px) vector resolution, 1km max elevation, multi-page brush scales (5m, 25m, 100m, 500m, 2.5km), 3-5cm real grass, customizable 3D flowers, and 1:1 real building dimensions', () => {
   assert.equal(WORLD_SIZE, 10000);
@@ -79,7 +101,7 @@ test('generateFlatEarthTerrain creates a flat 0m earth plane with earth_soil bas
   assert.equal(flatWorld.splatMap[0], getTextureIndex('earth_soil'));
   assert.ok(flatWorld.initialObjects.length >= 4);
   for (const obj of flatWorld.initialObjects) {
-    assert.ok(Math.abs(obj.x) <= 60 && Math.abs(obj.z) <= 60, 'Starter 1:1 village objects should be placed within realistic meter distances');
+    assert.ok(Math.abs(obj.x) <= 85 && Math.abs(obj.z) <= 60, 'Starter 1:1 village & 7-mountain gallery objects should be placed within realistic meter distances');
   }
 });
 
@@ -231,9 +253,16 @@ test('reconstructFromRgbaBuffer converts an RGBA image into 10x10km 3D heightfie
 });
 
 test('Genshin, Pokémon, Earth Megaregions (Himalaya/Alps/Andes, Sahara/Atacama/Gobi, Hawaii, Amazon/Congo, Taiga) & Planetary (Pluto, Titan, Mars, Venus, Europa, CoRoT-7b) work accurately', () => {
-  assert.equal(PREFAB_CATALOG.length, 28);
+  assert.equal(PREFAB_CATALOG.length, 31);
   const prefabIds = PREFAB_CATALOG.map((p) => p.id);
   for (const expectedId of [
+    'pluto_cryo_volcano',
+    'europa_penitentes_spire',
+    'himalaya_matterhorn_peak',
+    'himalaya_fishtail_peak',
+    'mars_olympus_shield',
+    'titan_mithrim_montes',
+    'island_volcano_icon',
     'floating_sky_island',
     'sheer_cliff_wall',
     'active_volcano',
@@ -241,7 +270,6 @@ test('Genshin, Pokémon, Earth Megaregions (Himalaya/Alps/Andes, Sahara/Atacama/
     'statue_of_seven',
     'pokemon_gym_stadium',
     'berry_apricorn_tree',
-    'himalaya_matterhorn_peak',
     'sahara_atacama_oasis',
     'hawaii_kilauea_shield',
     'amazon_congo_canopy_tree',
@@ -401,4 +429,301 @@ test('Rule-based generation ("Vẽ theo quy luật") places sharp rock spires (k
     assert.ok(obj.y > 500, `Placed sharp rock object must sit above 500m, got ${obj.y}m`);
   }
 });
+
+test('Day/Night cycle engine computes solar/lunar vectors, real-time shadow caster coordinates across azimuths, and nocturnal starlight intensity', () => {
+  assert.equal(DAY_NIGHT_PRESETS.length, 4);
+  assert.equal(formatTimeOfDayClock(6.25), '06:15');
+  assert.equal(formatTimeOfDayClock(12.0), '12:00');
+  assert.equal(formatTimeOfDayClock(17.75), '17:45');
+  assert.equal(formatTimeOfDayClock(23.0), '23:00');
+
+  const noonElev = timeOfDayToSunElevation(12);
+  const midnightElev = timeOfDayToSunElevation(0);
+  assert.ok(noonElev > 65, `Noon sun elevation should exceed 65°, got ${noonElev}°`);
+  assert.ok(midnightElev < -50, `Midnight sun elevation should be below -50°, got ${midnightElev}°`);
+
+  // 1. Midday (12:00) with azimuth 0° vs 180° shifts shadow caster X/Z coordinates in opposite directions
+  const noonEast = computeDayNightLightingState({
+    timeOfDayHours: 12,
+    sunElevationDeg: 45,
+    sunAzimuthDeg: 0,
+    starlightMode: false,
+    biomeId: 'mondstadt_meadow',
+  });
+  const noonWest = computeDayNightLightingState({
+    timeOfDayHours: 12,
+    sunElevationDeg: 45,
+    sunAzimuthDeg: 180,
+    starlightMode: false,
+    biomeId: 'mondstadt_meadow',
+  });
+  assert.equal(noonEast.phase, 'day');
+  assert.equal(noonEast.starlightIntensity, 0);
+  assert.equal(noonEast.isNightOrStarlight, false);
+  assert.ok(noonEast.shadowCasterPosition.x > 200, 'Azimuth 0° places shadow caster on +X side');
+  assert.ok(noonWest.shadowCasterPosition.x < -200, 'Azimuth 180° places shadow caster on -X side');
+  assert.ok(noonEast.shadowCasterPosition.y > 200, 'Shadow caster Y should be elevated above terrain');
+
+  // 2. Dusk (17:45) golden hour
+  const duskState = computeDayNightLightingState({
+    timeOfDayHours: 17.75,
+    sunElevationDeg: 8,
+    sunAzimuthDeg: 260,
+    starlightMode: false,
+    biomeId: 'mondstadt_meadow',
+  });
+  assert.equal(duskState.phase, 'dusk');
+  assert.ok(duskState.starlightIntensity > 0, 'Twilight should begin fading in early stars');
+
+  // 3. Midnight (23:00) naturally enables starry night and moonlight shadow caster
+  const nightState = computeDayNightLightingState({
+    timeOfDayHours: 23.0,
+    sunElevationDeg: -50,
+    sunAzimuthDeg: 310,
+    starlightMode: false,
+    biomeId: 'mondstadt_meadow',
+  });
+  assert.equal(nightState.phase, 'night');
+  assert.equal(nightState.starlightIntensity, 1.0);
+  assert.equal(nightState.isNightOrStarlight, true);
+  assert.ok(nightState.shadowCasterPosition.y > 100, 'Moonlight shadow caster stays above horizon at night');
+
+  // 4. Explicit Starlight Mode (Chế độ Ánh Sao Ban Đêm) forces full starlight visibility even at higher sun angles
+  const forcedStarlight = computeDayNightLightingState({
+    timeOfDayHours: 14.0,
+    sunElevationDeg: 48,
+    sunAzimuthDeg: 135,
+    starlightMode: true,
+    biomeId: 'mondstadt_meadow',
+  });
+  assert.equal(forcedStarlight.starlightIntensity, 1.0);
+  assert.equal(forcedStarlight.isNightOrStarlight, true);
+  assert.equal(forcedStarlight.phase, 'night');
+});
+
+test('surfaceEcosystem3D PATCH_BUILDERS exhaustively builds and disposes all 18 TextureBrushId brushes (including earth_soil, atacama_salt_crust, tropical_rainforest_floor, taiga_moss_needles) without ReferenceError', () => {
+  const flatWorld = generateFlatEarthTerrain('mondstadt_meadow');
+  assert.equal(Object.keys(PATCH_BUILDERS).length, TEXTURE_INDEX_MAP.length);
+
+  for (const brushId of TEXTURE_INDEX_MAP) {
+    assert.equal(typeof PATCH_BUILDERS[brushId], 'function', `PATCH_BUILDERS must register ${brushId}`);
+    const patch = createSurfaceEcosystemPatch(
+      {
+        id: `test_patch_${brushId}`,
+        brushId,
+        x: 0,
+        z: 0,
+        radius: 6,
+        grassHeightCm: 4.0,
+        flowerSpecies: 'cecilia_star',
+        flowerColorHex: '#f8fafc',
+      },
+      1
+    );
+    assert.ok(patch.children.length > 0, `Surface patch for ${brushId} should generate 3D children`);
+    disposeObject3DTree(patch);
+  }
+});
+
+test('WorldSaveFileV2 serializeWorldToSavePayload and deserializeWorldFromSavePayload preserve heightMap, splatMap with named texturePalette remapping, placedObjects, and Day/Night state', () => {
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
+  applySculptBrush(world.heightMap, world.splatMap, world.colorMap, 'mondstadt_meadow', 'raise', 0, 0, 250, 90);
+  applyTextureBrush(world.heightMap, world.splatMap, world.colorMap, 'mondstadt_meadow', 'atacama_salt_crust', 0, 0, 200);
+
+  const payload = serializeWorldToSavePayload({
+    regionTitle: 'Salar de Atacama Test',
+    biomeId: 'sahara_atacama_gobi',
+    activeWeather: 'clear_sky',
+    waterLevel: -20,
+    sunElevation: -35,
+    sunAzimuth: 240,
+    timeOfDay: 22.5,
+    starlightMode: true,
+    grassHeightCm: 4.0,
+    flowerSpecies: 'sakura_bloom',
+    flowerColorHex: '#f472b6',
+    heightMap: world.heightMap,
+    splatMap: world.splatMap,
+    placedObjects: world.initialObjects,
+    microStrokes: [
+      {
+        id: 'stroke_1',
+        brushId: 'atacama_salt_crust',
+        x: 0,
+        z: 0,
+        radius: 8,
+      },
+    ],
+  });
+
+  assert.equal(payload.version, 2);
+  assert.deepEqual(payload.texturePalette, TEXTURE_INDEX_MAP);
+
+  const restored = deserializeWorldFromSavePayload(payload);
+  assert.ok(restored !== null, 'deserializeWorldFromSavePayload should return valid restored state');
+  assert.equal(restored.biomeId, 'sahara_atacama_gobi');
+  assert.equal(restored.starlightMode, true);
+  assert.equal(restored.sunAzimuth, 240);
+  assert.equal(restored.timeOfDay, 22.5);
+  const centerIdx = (GRID_SIZE / 2) * (GRID_SIZE + 1) + GRID_SIZE / 2;
+  assert.equal(restored.splatMap[centerIdx], getTextureIndex('atacama_salt_crust'));
+  assert.ok(Math.abs(restored.heightMap[centerIdx] - world.heightMap[centerIdx]) < 0.05);
+});
+
+test('modular terrainEngine split (constants, brushes, sculpting, generation) exports identical bindings and table-driven SCULPT_TOOL_HANDLERS without circular issues', () => {
+  assert.equal(constantsMod.BIOMES, BIOMES);
+  assert.equal(constantsMod.WEATHER_CATALOG, WEATHER_CATALOG);
+  assert.equal(constantsMod.PREFAB_CATALOG, PREFAB_CATALOG);
+  assert.equal(constantsMod.TEXTURE_INDEX_MAP, TEXTURE_INDEX_MAP);
+  assert.equal(constantsMod.getTextureIndex, getTextureIndex);
+  assert.equal(constantsMod.BRUSH_SCALE_PAGES, BRUSH_SCALE_PAGES);
+  assert.equal(constantsMod.DEFAULT_TERRAIN_RULES, DEFAULT_TERRAIN_RULES);
+  assert.equal(constantsMod.DAY_NIGHT_PRESETS, DAY_NIGHT_PRESETS);
+
+  assert.equal(brushesMod.applyTextureBrush, applyTextureBrush);
+  assert.equal(typeof brushesMod.recomputeTerrainColors, 'function');
+
+  assert.equal(sculptingMod.getGroundHeightAt, getGroundHeightAt);
+  assert.equal(sculptingMod.getTerrainElevationStats, getTerrainElevationStats);
+  assert.equal(sculptingMod.applySculptBrush, applySculptBrush);
+  assert.equal(typeof sculptingMod.fbm2D, 'function');
+  assert.equal(Object.keys(sculptingMod.SCULPT_TOOL_HANDLERS).length, 17);
+
+  assert.equal(generationMod.generateFlatEarthTerrain, generateFlatEarthTerrain);
+  assert.equal(generationMod.generateBiomeTerrain, generateBiomeTerrain);
+  assert.equal(generationMod.reconstructFromRgbaBuffer, reconstructFromRgbaBuffer);
+  assert.equal(generationMod.executeTerrainRules, executeTerrainRules);
+  assert.equal(generationMod.computeDayNightLightingState, computeDayNightLightingState);
+  assert.equal(generationMod.serializeWorldToSavePayload, serializeWorldToSavePayload);
+  assert.equal(generationMod.deserializeWorldFromSavePayload, deserializeWorldFromSavePayload);
+});
+
+test('island_volcano_icon 3D model reproduces all 5 layers of reference image_19e38ffa.png (sandy beach, green foliage collar, fluted brown cone, yellow-orange lava crown/streams, diagonal two-tone smoke plume + 2 detached clouds)', () => {
+  const dummyTex = new THREE.Texture();
+  const factory = new ProceduralPrefabFactory(dummyTex, true);
+  const volcanoGroup = factory.createPrefab('island_volcano_icon');
+
+  assert.equal(volcanoGroup.name, 'island_volcano_icon_root');
+  assert.ok(volcanoGroup.getObjectByName('contact_shadow'), 'Includes ground contact shadow');
+  assert.ok(volcanoGroup.getObjectByName('sand_beach_base'), 'Layer 1: Scalloped golden sand beach base');
+  assert.ok(volcanoGroup.getObjectByName('foliage_jungle_collar'), 'Layer 2: Lush green foliage collar');
+  assert.ok(volcanoGroup.getObjectByName('volcano_brown_cone'), 'Layer 3a: Steep mahogany-brown volcanic cone');
+  assert.ok(volcanoGroup.getObjectByName('volcano_dark_flutes'), 'Layer 3b: Dark brown vertical ribs and gullies');
+  assert.ok(volcanoGroup.getObjectByName('crater_lava_crown'), 'Layer 4a: Yellow-gold molten crater crown');
+  assert.ok(volcanoGroup.getObjectByName('cascading_lava_streams'), 'Layer 4b: Cascading yellow/orange lava streams & fissures');
+
+  const smokePlume = volcanoGroup.getObjectByName('diagonal_smoke_plume');
+  assert.ok(smokePlume, 'Layer 5a: Diagonal two-tone smoke plume');
+  assert.equal(smokePlume.userData.isStylizedVolcanoPlume, true);
+
+  const cloud1 = volcanoGroup.getObjectByName('detached_smoke_cloud_1');
+  const cloud2 = volcanoGroup.getObjectByName('detached_smoke_cloud_2');
+  assert.ok(cloud1 && cloud1.userData.isDetachedSmokeCloud, 'Layer 5b: Detached smoke cloud 1 on right');
+  assert.ok(cloud2 && cloud2.userData.isDetachedSmokeCloud, 'Layer 5c: Detached smoke cloud 2 higher on right');
+  assert.ok(cloud2.position.x > cloud1.position.x && cloud2.position.y > cloud1.position.y);
+
+  // Verify sample photo preset and starter flat earth terrain include all 7 featured reference mountains
+  const volcanoPreset = SAMPLE_PHOTO_PRESETS.find((p) => p.id === 'island_volcano_ref');
+  assert.ok(volcanoPreset);
+  assert.equal(volcanoPreset.imageUrl, '/assets/aistudio/image_19e38ffa.png');
+  const flatWorld = generateFlatEarthTerrain('mondstadt_meadow');
+  for (const featuredId of [
+    'pluto_cryo_volcano',
+    'europa_penitentes_spire',
+    'himalaya_matterhorn_peak',
+    'himalaya_fishtail_peak',
+    'mars_olympus_shield',
+    'titan_mithrim_montes',
+    'island_volcano_icon',
+  ] as const) {
+    assert.ok(
+      flatWorld.initialObjects.some((o) => o.prefabId === featuredId),
+      `Flat Earth starter showcase should include ${featuredId}`
+    );
+  }
+  disposeObject3DTree(volcanoGroup);
+});
+
+test('6 new reference-image 3D mountains (Pluto Wright Mons, Europa Ocean Rift Cutaway, Alps Matterhorn, Himalaya Machapuchare Fishtail, Mars Olympus Mons, Titan Mithrim Montes) reproduce all geological layers', () => {
+  const dummyTex = new THREE.Texture();
+  const factory = new ProceduralPrefabFactory(dummyTex, true);
+
+  // 1. Pluto Wright Mons Cryovolcano (NASA/JHUAPL/SwRI)
+  const plutoGroup = factory.createPrefab('pluto_cryo_volcano');
+  assert.equal(plutoGroup.name, 'pluto_cryo_volcano_root');
+  assert.ok(plutoGroup.getObjectByName('tholin_hummocky_bedrock'));
+  assert.ok(plutoGroup.getObjectByName('nitrogen_glacier_lobes'));
+  assert.ok(plutoGroup.getObjectByName('wright_mons_conical_caldera'));
+  assert.ok(plutoGroup.getObjectByName('cryoplume_eruption_jet'));
+  disposeObject3DTree(plutoGroup);
+
+  // 2. Europa Subsurface Ocean & Ice-Shell Rift Cutaway
+  const europaGroup = factory.createPrefab('europa_penitentes_spire');
+  assert.equal(europaGroup.name, 'europa_ocean_rift_cutaway_root');
+  assert.ok(europaGroup.getObjectByName('europa_mantle_magma_core'));
+  assert.ok(europaGroup.getObjectByName('hydrothermal_seafloor_smokers'));
+  assert.ok(europaGroup.getObjectByName('subsurface_turquoise_ocean'));
+  assert.ok(europaGroup.getObjectByName('white_ice_shell_crust'));
+  assert.ok(europaGroup.getObjectByName('chaos_ridge_surface'));
+  assert.ok(europaGroup.getObjectByName('europa_cryo_geyser_plume'));
+  disposeObject3DTree(europaGroup);
+
+  // 3. Alps Matterhorn Peak
+  const alpsGroup = factory.createPrefab('himalaya_matterhorn_peak');
+  assert.equal(alpsGroup.name, 'alps_matterhorn_peak_root');
+  assert.ok(alpsGroup.getObjectByName('alpine_rhododendron_meadow'));
+  assert.ok(alpsGroup.getObjectByName('glacier_saddle_col'));
+  assert.ok(alpsGroup.getObjectByName('matterhorn_horn_pyramid'));
+  assert.ok(alpsGroup.getObjectByName('matterhorn_hooked_summit'));
+  disposeObject3DTree(alpsGroup);
+
+  // 4. Himalaya Machapuchare Fishtail Peak
+  const himalayaGroup = factory.createPrefab('himalaya_fishtail_peak');
+  assert.equal(himalayaGroup.name, 'himalaya_fishtail_peak_root');
+  assert.ok(himalayaGroup.getObjectByName('himalaya_golden_foothill'));
+  assert.ok(himalayaGroup.getObjectByName('annapurna_fluted_buttresses'));
+  assert.ok(himalayaGroup.getObjectByName('machapuchare_fishtail_summit'));
+  assert.ok(himalayaGroup.getObjectByName('fishtail_left_horn'));
+  assert.ok(himalayaGroup.getObjectByName('fishtail_right_horn'));
+  disposeObject3DTree(himalayaGroup);
+
+  // 5. Mars Olympus Mons Shield Volcano (m8uek02co8l91_09cb37ea.png)
+  const olympusGroup = factory.createPrefab('mars_olympus_shield');
+  assert.equal(olympusGroup.name, 'mars_olympus_shield_root');
+  assert.ok(olympusGroup.getObjectByName('aureole_plains_apron'));
+  assert.ok(olympusGroup.getObjectByName('basal_scarp_cliff_ring'));
+  assert.ok(olympusGroup.getObjectByName('shield_gentle_dome'));
+  assert.ok(olympusGroup.getObjectByName('radial_flow_ribs'));
+  assert.ok(olympusGroup.getObjectByName('nested_caldera_complex'));
+  disposeObject3DTree(olymusGroupCompat(olympusGroup));
+
+  // 6. Titan Mithrim Montes / Doom Mons (images_1f7cdcc6.jpg)
+  const titanGroup = factory.createPrefab('titan_mithrim_montes');
+  assert.equal(titanGroup.name, 'titan_mithrim_montes_root');
+  assert.ok(titanGroup.getObjectByName('titan_dune_basin_floor'));
+  assert.ok(titanGroup.getObjectByName('titan_dendritic_ridges'));
+  assert.ok(titanGroup.getObjectByName('titan_summit_peak_crater'));
+  disposeObject3DTree(titanGroup);
+});
+
+function olymusGroupCompat(g: THREE.Group): THREE.Group {
+  return g;
+}
+
+test('src/world/registry modular structure exports all 20 individual biomes and 31 individual prefabs in separate modules', () => {
+  assert.equal(registryMod.BIOMES, BIOMES);
+  assert.equal(registryMod.PREFAB_CATALOG, PREFAB_CATALOG);
+  assert.equal(registryMod.WEATHER_CATALOG, WEATHER_CATALOG);
+  assert.equal(Object.keys(biomesMod.BIOMES).length, 20);
+  assert.equal(prefabsMod.PREFAB_CATALOG.length, 31);
+  assert.equal(Object.keys(prefabsMod.PREFAB_MAP).length, 31);
+
+  for (const [id, cfg] of Object.entries(BIOMES)) {
+    assert.equal((biomesMod as Record<string, unknown>)[id], cfg, `Biome module ${id} should match BIOMES[${id}]`);
+  }
+  for (const prefab of PREFAB_CATALOG) {
+    assert.equal((prefabsMod as Record<string, unknown>)[prefab.id], prefab, `Prefab module ${prefab.id} should match PREFAB_CATALOG entry`);
+  }
+});
+
 

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 220" width="320" height="220">
+  <defs>
+    <linearGradient id="himalayaSky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#60a5fa" />
+    </linearGradient>
+  </defs>
+  <!-- Deep Himalayan cobalt-blue sky -->
+  <rect width="320" height="220" fill="url(#himalayaSky)" />
+  <!-- Twin-horned Fishtail Summit Spire (Machapuchare) & Annapurna Massif -->
+  <polygon points="32,162 92,98 118,86 130,52 142,58 156,44 192,88 228,86 275,104 320,148 320,220 20,220" fill="#1e293b" />
+  <!-- Sheer sunlit triangular upper rock face & twin horns -->
+  <polygon points="130,52 142,58 156,44 185,88 144,96" fill="#cbd5e1" />
+  <polygon points="145,56 156,44 176,82 152,88" fill="#94a3b8" />
+  <!-- Bright white fluted snow slopes & diagonal glacier chute -->
+  <polygon points="128,54 140,60 124,106 96,138" fill="#ffffff" />
+  <polygon points="156,44 188,88 224,90 268,112 315,165 235,195 152,115" fill="#f8fafc" />
+  <!-- Craggy dark slate-blue granite ribs across snow face -->
+  <polygon points="142,92 172,118 148,142 122,124" fill="#334155" />
+  <polygon points="188,96 226,125 204,148 175,122" fill="#475569" />
+  <polygon points="232,102 276,136 254,158 218,128" fill="#334155" />
+  <!-- Sweeping white diagonal glacier avalanche chute on lower right -->
+  <polygon points="196,142 312,188 312,216 172,162" fill="#f1f5f9" />
+  <!-- Warm Golden-Brown & Russet Himalayan Foothill Ridge on Front-Left -->
+  <polygon points="0,132 38,162 72,164 138,166 218,220 0,220" fill="#451a03" />
+  <polygon points="0,136 32,164 82,168 148,176 196,220 0,220" fill="#92400e" />
+  <polygon points="48,168 118,168 172,212 86,216" fill="#b45309" />
+  <!-- Dark silhouette rhododendron/oak foliage on front-right -->
+  <g fill="#1c1917">
+    <ellipse cx="262" cy="204" rx="8" ry="16" />
+    <ellipse cx="286" cy="192" rx="9" ry="22" />
+    <ellipse cx="306" cy="206" rx="10" ry="16" />
+  </g>
+</svg>

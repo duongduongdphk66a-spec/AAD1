@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { PrefabId } from './terrainEngine';
+import { PrefabId } from './registry';
 
 /**
  * Shared material cache and procedural 3-12 part composite models
@@ -33,9 +33,24 @@ export class ProceduralPrefabFactory {
   }
 
   public createPrefab(prefabId: PrefabId): THREE.Group {
+    const group = this.createPrefabInternal(prefabId);
+    group.traverse((child) => {
+      if ((child as THREE.Mesh).isMesh && child.name !== 'contact_shadow') {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    return group;
+  }
+
+  private createPrefabInternal(prefabId: PrefabId): THREE.Group {
     switch (prefabId) {
+      case 'island_volcano_icon':
+        return this.createIslandVolcanoIcon();
       case 'himalaya_matterhorn_peak':
         return this.createHimalayaMatterhornPeak();
+      case 'himalaya_fishtail_peak':
+        return this.createHimalayaFishtailPeak();
       case 'sahara_atacama_oasis':
         return this.createSaharaAtacamaOasis();
       case 'hawaii_kilauea_shield':
@@ -52,6 +67,8 @@ export class ProceduralPrefabFactory {
         return this.createEuropaPenitentesSpire();
       case 'mars_olympus_shield':
         return this.createMarsOlympusShield();
+      case 'titan_mithrim_montes':
+        return this.createTitanMithrimMontes();
       case 'venus_pancake_dome':
         return this.createVenusPancakeDome();
       case 'meteor_impact_crater':
@@ -340,6 +357,519 @@ export class ProceduralPrefabFactory {
   }
 
   /**
+   * FEATURED: Núi Lửa Đảo Nhiệt Đới — Dựng 3D Trực Tiếp Từ Ảnh Mẫu (image_19e38ffa.png) (14 distinct parts)
+   * Faithfully reproduces every visual layer of the reference illustration:
+   * 1. Scalloped golden-orange sandy beach base ring (#f4b256 / #e59934) with wavy shoreline lobes at y = 0.
+   * 2. Lush emerald-green bushy foliage collar (#15992b / #0b6e1c / #22c55e) wrapping the foot of the volcano.
+   * 3. Steep fluted mahogany-brown volcanic cone (#6b3814) with 12 sculpted dark-brown vertical ribs & gullies (#4a240b / #7e441b).
+   * 4. Bright yellow-gold molten crater crown (#facc15) & two-tone yellow/orange cascading lava streams (#f97316 / #facc15) + glowing mid-slope fissures.
+   * 5. Signature diagonal billowing two-tone smoke plume (cream-white upper domes #f5f5f4 + warm brown-taupe shaded undersides #a6826c)
+   *    plus 2 detached floating smoke cloud puffs drifting to the upper-right.
+   */
+  private createIslandVolcanoIcon(): THREE.Group {
+    const group = new THREE.Group();
+    group.name = 'island_volcano_icon_root';
+    this.addContactShadow(group, 12.2);
+
+    // 1. Golden-Orange Sandy Beach Materials
+    const sandBeachPrimaryMat = new THREE.MeshStandardMaterial({
+      color: 0xf4b256,
+      roughness: 0.78,
+      metalness: 0.04,
+      flatShading: true,
+    });
+    const sandBeachRimMat = new THREE.MeshStandardMaterial({
+      color: 0xe59934,
+      roughness: 0.82,
+      metalness: 0.04,
+      flatShading: true,
+    });
+
+    // 2. Lush Emerald-Green Bushy Foliage Materials
+    const foliageMainMat = new THREE.MeshStandardMaterial({
+      color: 0x15992b,
+      roughness: 0.62,
+      metalness: 0.04,
+      flatShading: true,
+    });
+    const foliageDarkShadowMat = new THREE.MeshStandardMaterial({
+      color: 0x0b6e1c,
+      roughness: 0.7,
+      metalness: 0.04,
+      flatShading: true,
+    });
+    const foliageHighlightMat = new THREE.MeshStandardMaterial({
+      color: 0x22c55e,
+      roughness: 0.56,
+      metalness: 0.04,
+      flatShading: true,
+    });
+
+    // 3. Fluted Mahogany-Brown Volcanic Cone & Dark Rib Materials
+    const coneBrownMainMat = new THREE.MeshStandardMaterial({
+      color: 0x6b3814,
+      roughness: 0.86,
+      metalness: 0.06,
+      flatShading: true,
+    });
+    const coneDarkFluteMat = new THREE.MeshStandardMaterial({
+      color: 0x4a240b,
+      roughness: 0.9,
+      metalness: 0.06,
+      flatShading: true,
+    });
+    const coneLitRidgeMat = new THREE.MeshStandardMaterial({
+      color: 0x7e441b,
+      roughness: 0.82,
+      metalness: 0.06,
+      flatShading: true,
+    });
+
+    // 4. Molten Yellow-Gold Crater Crown & Orange-Gold Lava Tongue Materials
+    const lavaYellowBrightMat = new THREE.MeshStandardMaterial({
+      color: 0xfacc15,
+      emissive: 0xf59e0b,
+      emissiveIntensity: 0.85,
+      roughness: 0.2,
+      metalness: 0.05,
+    });
+    const lavaOrangeFlowMat = new THREE.MeshStandardMaterial({
+      color: 0xf97316,
+      emissive: 0xea580c,
+      emissiveIntensity: 0.75,
+      roughness: 0.24,
+      metalness: 0.05,
+    });
+
+    // 5. Stylized Two-Tone Billowing Smoke Materials (Cream-White Top + Taupe-Brown Shaded Underside)
+    const smokeCreamTopMat = new THREE.MeshStandardMaterial({
+      color: 0xf5f5f4,
+      emissive: 0xe7e5e4,
+      emissiveIntensity: 0.22,
+      roughness: 0.75,
+      metalness: 0.02,
+    });
+    const smokeTaupeUnderMat = new THREE.MeshStandardMaterial({
+      color: 0xa6826c,
+      emissive: 0x785540,
+      emissiveIntensity: 0.14,
+      roughness: 0.84,
+      metalness: 0.03,
+    });
+
+    // =========================================================================
+    // LAYER 1 (Parts 1 & 2): Scalloped Golden Sand Beach Base Ring (y = 0..0.56m)
+    // =========================================================================
+    const sandBeachGroup = new THREE.Group();
+    sandBeachGroup.name = 'sand_beach_base';
+
+    const coreBeachDisc = new THREE.Mesh(
+      new THREE.CylinderGeometry(10.6, 11.4, 0.52, 24),
+      sandBeachPrimaryMat
+    );
+    coreBeachDisc.position.y = 0.26;
+    sandBeachGroup.add(coreBeachDisc);
+
+    // 12 organic scalloped shoreline lobes matching the wavy golden beach in image_19e38ffa.png
+    const beachLobes = [
+      { ang: 0.0, dist: 10.6, rx: 3.5, rz: 2.2, h: 0.48 },
+      { ang: 0.52, dist: 9.8, rx: 3.1, rz: 2.2, h: 0.50 },
+      { ang: 1.08, dist: 9.6, rx: 3.3, rz: 2.5, h: 0.52 },
+      { ang: 1.57, dist: 9.9, rx: 3.8, rz: 2.5, h: 0.54 }, // Front-center protruding sand lobe
+      { ang: 2.12, dist: 9.6, rx: 3.2, rz: 2.4, h: 0.50 },
+      { ang: 2.65, dist: 10.2, rx: 3.4, rz: 2.2, h: 0.48 },
+      { ang: Math.PI, dist: 10.8, rx: 3.6, rz: 2.2, h: 0.48 }, // Leftmost sand lobe
+      { ang: 3.68, dist: 9.8, rx: 3.0, rz: 2.1, h: 0.48 },
+      { ang: 4.2, dist: 9.5, rx: 3.1, rz: 2.2, h: 0.48 },
+      { ang: 4.71, dist: 9.6, rx: 3.3, rz: 2.2, h: 0.48 },
+      { ang: 5.25, dist: 9.8, rx: 3.0, rz: 2.1, h: 0.48 },
+      { ang: 5.78, dist: 10.3, rx: 3.3, rz: 2.1, h: 0.49 },
+    ];
+    beachLobes.forEach((lobe, idx) => {
+      const lobeMesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(1.0, 1.12, lobe.h, 14),
+        idx % 3 === 1 ? sandBeachRimMat : sandBeachPrimaryMat
+      );
+      lobeMesh.scale.set(lobe.rx, 1.0, lobe.rz);
+      lobeMesh.position.set(
+        Math.cos(lobe.ang) * lobe.dist,
+        lobe.h * 0.5,
+        Math.sin(lobe.ang) * lobe.dist
+      );
+      lobeMesh.rotation.y = -lobe.ang;
+      sandBeachGroup.add(lobeMesh);
+    });
+    group.add(sandBeachGroup);
+
+    // =========================================================================
+    // LAYER 2 (Parts 3 & 4): Lush Scalloped Green Jungle / Bush Collar (y = 0.35..2.3m)
+    // =========================================================================
+    const foliageGroup = new THREE.Group();
+    foliageGroup.name = 'foliage_jungle_collar';
+
+    // Inner dark-green forest base ring
+    const foliageCoreRing = new THREE.Mesh(
+      new THREE.CylinderGeometry(7.2, 8.6, 1.45, 20),
+      foliageDarkShadowMat
+    );
+    foliageCoreRing.position.y = 0.88;
+    foliageGroup.add(foliageCoreRing);
+
+    // 18 puffed cel-shaded bush clusters ringing the foot of the brown cone
+    const bushCount = 18;
+    for (let i = 0; i < bushCount; i++) {
+      const ang = (i / bushCount) * Math.PI * 2;
+      const radialDist = 7.45 + Math.sin(i * 2.3) * 0.55;
+      const bushRadius = 1.55 + (i % 3) * 0.22;
+      const mat =
+        i % 4 === 0
+          ? foliageHighlightMat
+          : i % 3 === 0
+          ? foliageDarkShadowMat
+          : foliageMainMat;
+
+      const bushPuff = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(bushRadius, 1),
+        mat
+      );
+      bushPuff.scale.set(1.28, 0.76, 1.15);
+      bushPuff.position.set(
+        Math.cos(ang) * radialDist,
+        1.05 + (i % 2) * 0.22,
+        Math.sin(ang) * radialDist
+      );
+      bushPuff.rotation.y = ang;
+      foliageGroup.add(bushPuff);
+
+      // Upper bush sub-puff hugging the lower brown rock flank
+      const upperBush = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(bushRadius * 0.74, 1),
+        i % 2 === 0 ? foliageMainMat : foliageHighlightMat
+      );
+      upperBush.scale.set(1.2, 0.82, 1.05);
+      upperBush.position.set(
+        Math.cos(ang + 0.14) * (radialDist - 0.85),
+        1.65 + (i % 3) * 0.14,
+        Math.sin(ang + 0.14) * (radialDist - 0.85)
+      );
+      foliageGroup.add(upperBush);
+    }
+    group.add(foliageGroup);
+
+    // =========================================================================
+    // LAYER 3 (Parts 5, 6 & 7): Steep Fluted Brown Volcanic Cone & Dark Ribs (y = 0.8..12.2m)
+    // =========================================================================
+    const coneGroup = new THREE.Group();
+    coneGroup.name = 'volcano_brown_cone';
+
+    // Core truncated volcanic cone
+    const mainBrownCone = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.45, 7.85, 11.6, 18),
+      coneBrownMainMat
+    );
+    mainBrownCone.position.y = 6.2;
+    mainBrownCone.castShadow = !this.isSoftwareGl;
+    mainBrownCone.receiveShadow = !this.isSoftwareGl;
+    coneGroup.add(mainBrownCone);
+
+    // 14 vertical sculpted mountain ribs & dark gullies matching the hand-illustrated brown ridges
+    const fluteGroup = new THREE.Group();
+    fluteGroup.name = 'volcano_dark_flutes';
+    const ribCount = 14;
+    for (let i = 0; i < ribCount; i++) {
+      const ang = (i / ribCount) * Math.PI * 2;
+      const isDarkGully = i % 2 === 0;
+      const ribMat = isDarkGully
+        ? coneDarkFluteMat
+        : i % 3 === 0
+        ? coneLitRidgeMat
+        : coneBrownMainMat;
+
+      // Sloped triangular buttress rib from crater rim down to green foliage skirt
+      const ribHeight = 11.2;
+      const rib = new THREE.Mesh(
+        new THREE.ConeGeometry(isDarkGully ? 1.15 : 1.45, ribHeight, 4),
+        ribMat
+      );
+      const midRadius = isDarkGully ? 5.55 : 5.72;
+      const slopeTilt = 0.36; // Matches atan((7.85 - 3.45) / 11.6)
+      rib.scale.set(0.78, 1.0, 1.25);
+      rib.position.set(
+        Math.cos(ang) * midRadius,
+        5.9,
+        Math.sin(ang) * midRadius
+      );
+      rib.rotation.order = 'YXZ';
+      rib.rotation.y = -ang + Math.PI * 0.5;
+      rib.rotation.x = -slopeTilt;
+      fluteGroup.add(rib);
+
+      // Lower flaring root crag at the base of the brown cone
+      const lowerCrag = new THREE.Mesh(
+        new THREE.ConeGeometry(1.35, 5.4, 4),
+        isDarkGully ? coneDarkFluteMat : coneBrownMainMat
+      );
+      lowerCrag.position.set(
+        Math.cos(ang + 0.12) * 6.55,
+        3.2,
+        Math.sin(ang + 0.12) * 6.55
+      );
+      lowerCrag.rotation.order = 'YXZ';
+      lowerCrag.rotation.y = -ang + Math.PI * 0.5;
+      lowerCrag.rotation.x = -0.42;
+      fluteGroup.add(lowerCrag);
+    }
+    coneGroup.add(fluteGroup);
+    group.add(coneGroup);
+
+    // =========================================================================
+    // LAYER 4 (Parts 8, 9 & 10): Molten Yellow-Gold Crater Rim & Cascading Lava Tongues
+    // =========================================================================
+    const lavaCrownGroup = new THREE.Group();
+    lavaCrownGroup.name = 'crater_lava_crown';
+
+    // Flat-topped glowing yellow-gold magma cap at summit (y = 11.5..12.3m)
+    const summitLavaCap = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.55, 3.95, 0.95, 20),
+      lavaYellowBrightMat
+    );
+    summitLavaCap.position.y = 11.85;
+    lavaCrownGroup.add(summitLavaCap);
+
+    // Wavy overflowing crater rim collar
+    for (let i = 0; i < 14; i++) {
+      const ang = (i / 14) * Math.PI * 2;
+      const rimLobe = new THREE.Mesh(
+        new THREE.SphereGeometry(0.76 + (i % 2) * 0.16, 10, 8),
+        i % 3 === 0 ? lavaOrangeFlowMat : lavaYellowBrightMat
+      );
+      rimLobe.scale.set(1.25, 0.72, 1.05);
+      rimLobe.position.set(
+        Math.cos(ang) * 3.45,
+        11.82 - (i % 2) * 0.14,
+        Math.sin(ang) * 3.45
+      );
+      lavaCrownGroup.add(rimLobe);
+
+      // Short upper crater lip lava drips
+      const lipDrip = new THREE.Mesh(
+        new THREE.ConeGeometry(0.56, 2.3 + (i % 3) * 0.55, 5),
+        i % 2 === 0 ? lavaOrangeFlowMat : lavaYellowBrightMat
+      );
+      lipDrip.rotation.order = 'YXZ';
+      lipDrip.rotation.y = -ang + Math.PI * 0.5;
+      lipDrip.rotation.x = Math.PI - 0.36;
+      lipDrip.position.set(
+        Math.cos(ang) * 3.92,
+        10.75,
+        Math.sin(ang) * 3.92
+      );
+      lavaCrownGroup.add(lipDrip);
+    }
+    group.add(lavaCrownGroup);
+
+    // Cascading Two-Tone Lava Streams & Mid-Slope Lava Fissures matching image_19e38ffa.png
+    const lavaStreamsGroup = new THREE.Group();
+    lavaStreamsGroup.name = 'cascading_lava_streams';
+
+    const lavaStreamSpecs = [
+      // Front-right long signature lava river cascading almost to the green bushes
+      { ang: 1.18, len: 9.6, topR: 3.65, botR: 6.95, width: 0.82, hasYellowCore: true },
+      // Front-center upper-mid lava tongue
+      { ang: 1.62, len: 5.6, topR: 3.65, botR: 5.55, width: 0.72, hasYellowCore: true },
+      // Front-left cascading lava stream
+      { ang: 2.18, len: 8.4, topR: 3.65, botR: 6.55, width: 0.78, hasYellowCore: true },
+      // Left flank lava stream
+      { ang: 2.85, len: 6.8, topR: 3.65, botR: 6.0, width: 0.68, hasYellowCore: true },
+      // Right flank lava stream
+      { ang: 0.52, len: 7.4, topR: 3.65, botR: 6.2, width: 0.72, hasYellowCore: true },
+      // Rear-right lava stream (for 360° completeness)
+      { ang: 5.65, len: 8.2, topR: 3.65, botR: 6.45, width: 0.74, hasYellowCore: true },
+      // Rear-center lava stream
+      { ang: 4.71, len: 6.5, topR: 3.65, botR: 5.85, width: 0.68, hasYellowCore: false },
+      // Rear-left lava stream
+      { ang: 3.75, len: 7.8, topR: 3.65, botR: 6.3, width: 0.72, hasYellowCore: true },
+    ];
+
+    for (const st of lavaStreamSpecs) {
+      const midR = (st.topR + st.botR) * 0.5;
+      const midY = 11.6 - st.len * 0.44;
+      const slopeAngle = Math.atan2(st.botR - st.topR, st.len * 0.88);
+
+      // Outer orange-gold lava tongue
+      const orangeChannel = new THREE.Mesh(
+        new THREE.ConeGeometry(st.width, st.len, 5),
+        lavaOrangeFlowMat
+      );
+      orangeChannel.scale.set(1.0, 1.0, 0.42);
+      orangeChannel.position.set(
+        Math.cos(st.ang) * midR,
+        midY,
+        Math.sin(st.ang) * midR
+      );
+      orangeChannel.rotation.order = 'YXZ';
+      orangeChannel.rotation.y = -st.ang + Math.PI * 0.5;
+      orangeChannel.rotation.x = Math.PI - slopeAngle;
+      lavaStreamsGroup.add(orangeChannel);
+
+      // Inner bright yellow-gold molten core inside the orange stream
+      if (st.hasYellowCore) {
+        const yellowCore = new THREE.Mesh(
+          new THREE.ConeGeometry(st.width * 0.58, st.len * 0.82, 5),
+          lavaYellowBrightMat
+        );
+        yellowCore.scale.set(1.0, 1.0, 0.48);
+        yellowCore.position.set(
+          Math.cos(st.ang) * (midR + 0.08),
+          midY + 0.18,
+          Math.sin(st.ang) * (midR + 0.08)
+        );
+        yellowCore.rotation.order = 'YXZ';
+        yellowCore.rotation.y = -st.ang + Math.PI * 0.5;
+        yellowCore.rotation.x = Math.PI - slopeAngle;
+        lavaStreamsGroup.add(yellowCore);
+      }
+    }
+
+    // 4 Mid-slope glowing diamond lava pockets/fissures (visible on front-center and flanks in image_19e38ffa.png)
+    const fissureAngles = [1.55, 1.38, 1.95, 0.85];
+    fissureAngles.forEach((ang, idx) => {
+      const fY = idx === 0 ? 4.4 : idx === 1 ? 8.3 : idx === 2 ? 5.8 : 6.2;
+      const fR = 7.75 - ((fY - 1.0) / 11.0) * 4.1;
+      const outerFissure = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.58, 0),
+        lavaOrangeFlowMat
+      );
+      outerFissure.scale.set(0.55, 2.35, 0.45);
+      outerFissure.position.set(Math.cos(ang) * fR, fY, Math.sin(ang) * fR);
+      outerFissure.rotation.order = 'YXZ';
+      outerFissure.rotation.y = -ang + Math.PI * 0.5;
+      outerFissure.rotation.x = -0.35;
+      lavaStreamsGroup.add(outerFissure);
+
+      const innerFissure = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.38, 0),
+        lavaYellowBrightMat
+      );
+      innerFissure.scale.set(0.52, 1.85, 0.52);
+      innerFissure.position.set(
+        Math.cos(ang) * (fR + 0.07),
+        fY,
+        Math.sin(ang) * (fR + 0.07)
+      );
+      innerFissure.rotation.order = 'YXZ';
+      innerFissure.rotation.y = -ang + Math.PI * 0.5;
+      innerFissure.rotation.x = -0.35;
+      lavaStreamsGroup.add(innerFissure);
+    });
+
+    group.add(lavaStreamsGroup);
+
+    // =========================================================================
+    // LAYER 5 (Parts 11, 12, 13 & 14): Diagonal Two-Tone Billowing Smoke Plume
+    // + 2 Detached Floating Smoke Clouds Drifting Upper-Right
+    // =========================================================================
+    const smokeRoot = new THREE.Group();
+    smokeRoot.name = 'diagonal_smoke_plume';
+    smokeRoot.position.set(0, 12.25, 0);
+    smokeRoot.userData.isStylizedVolcanoPlume = true;
+    smokeRoot.userData.baseY = 12.25;
+
+    // Helper that creates a cel-shaded two-tone cloud cluster (Cream-White upper dome + Taupe-Brown lower contour)
+    const addTwoToneSmokeLobe = (
+      target: THREE.Group,
+      x: number,
+      y: number,
+      z: number,
+      rx: number,
+      ry: number,
+      rz: number,
+      underOffsetX = 0.22,
+      underOffsetY = -0.34
+    ) => {
+      // Shaded warm taupe-brown lower belly (#a6826c)
+      const underMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(1.0, 14, 12),
+        smokeTaupeUnderMat
+      );
+      underMesh.scale.set(rx * 1.04, ry * 0.88, rz * 0.98);
+      underMesh.position.set(x + underOffsetX, y + underOffsetY, z - 0.05);
+      target.add(underMesh);
+
+      // Bright warm cream-white upper puff (#f5f5f4)
+      const topMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(1.0, 14, 12),
+        smokeCreamTopMat
+      );
+      topMesh.scale.set(rx, ry, rz);
+      topMesh.position.set(x, y + 0.14, z + 0.05);
+      target.add(topMesh);
+    };
+
+    // Main diagonal smoke column rising from crater at (0,0) up and to the right (+X)
+    const mainPlumeLobes = [
+      // Wide base smoke cushion resting directly on the yellow crater rim
+      { x: -1.35, y: 0.65, z: 0.1, rx: 1.55, ry: 0.95, rz: 1.35, ux: -0.18, uy: -0.28 },
+      { x: 0.0, y: 0.72, z: 0.2, rx: 1.85, ry: 1.02, rz: 1.55, ux: 0.15, uy: -0.32 },
+      { x: 1.45, y: 0.68, z: 0.1, rx: 1.45, ry: 0.92, rz: 1.32, ux: 0.25, uy: -0.28 },
+      // Mid-lower billowing puffs curving diagonally right
+      { x: -0.55, y: 1.95, z: 0.12, rx: 1.52, ry: 1.12, rz: 1.35, ux: 0.24, uy: -0.34 },
+      { x: 0.95, y: 2.25, z: 0.15, rx: 1.68, ry: 1.18, rz: 1.42, ux: 0.34, uy: -0.36 },
+      // Mid-upper diagonal puffs
+      { x: 0.45, y: 3.55, z: 0.08, rx: 1.48, ry: 1.15, rz: 1.28, ux: 0.26, uy: -0.32 },
+      { x: 2.15, y: 3.95, z: 0.12, rx: 1.72, ry: 1.22, rz: 1.38, ux: 0.38, uy: -0.38 },
+      // High billowing crown puffs tilted upper-right
+      { x: 1.75, y: 5.25, z: 0.05, rx: 1.55, ry: 1.18, rz: 1.25, ux: 0.28, uy: -0.32 },
+      { x: 3.35, y: 5.65, z: 0.08, rx: 1.78, ry: 1.25, rz: 1.32, ux: 0.38, uy: -0.38 },
+      { x: 4.55, y: 6.35, z: 0.0, rx: 1.42, ry: 1.05, rz: 1.18, ux: 0.32, uy: -0.32 },
+    ];
+
+    for (const lobe of mainPlumeLobes) {
+      addTwoToneSmokeLobe(
+        smokeRoot,
+        lobe.x,
+        lobe.y,
+        lobe.z,
+        lobe.rx,
+        lobe.ry,
+        lobe.rz,
+        lobe.ux,
+        lobe.uy
+      );
+    }
+
+    // Detached Floating Smoke Cloud 1 (Medium puff lower-right of main plume, matching image_19e38ffa.png)
+    const detachedCloud1 = new THREE.Group();
+    detachedCloud1.name = 'detached_smoke_cloud_1';
+    detachedCloud1.position.set(5.45, 3.65, 0.15);
+    detachedCloud1.rotation.z = 0.22;
+    detachedCloud1.userData.isDetachedSmokeCloud = true;
+    detachedCloud1.userData.baseX = 5.45;
+    detachedCloud1.userData.baseY = 3.65;
+    detachedCloud1.userData.phase = 0.8;
+    addTwoToneSmokeLobe(detachedCloud1, -0.55, 0, 0, 1.08, 0.78, 0.92, 0.15, -0.28);
+    addTwoToneSmokeLobe(detachedCloud1, 0.35, 0.18, 0.04, 1.22, 0.85, 0.96, 0.22, -0.3);
+    addTwoToneSmokeLobe(detachedCloud1, 1.05, 0.32, 0, 0.88, 0.68, 0.82, 0.2, -0.25);
+    smokeRoot.add(detachedCloud1);
+
+    // Detached Floating Smoke Cloud 2 (Smaller puff higher & further right, matching image_19e38ffa.png)
+    const detachedCloud2 = new THREE.Group();
+    detachedCloud2.name = 'detached_smoke_cloud_2';
+    detachedCloud2.position.set(7.55, 6.85, 0.05);
+    detachedCloud2.rotation.z = 0.08;
+    detachedCloud2.userData.isDetachedSmokeCloud = true;
+    detachedCloud2.userData.baseX = 7.55;
+    detachedCloud2.userData.baseY = 6.85;
+    detachedCloud2.userData.phase = 2.1;
+    addTwoToneSmokeLobe(detachedCloud2, -0.42, 0, 0, 0.86, 0.56, 0.75, 0.12, -0.22);
+    addTwoToneSmokeLobe(detachedCloud2, 0.35, 0.06, 0.02, 0.95, 0.62, 0.78, 0.16, -0.24);
+    smokeRoot.add(detachedCloud2);
+
+    group.add(smokeRoot);
+    return group;
+  }
+
+  /**
    * NEW 3. Núi Lửa Phun Trào Natlan / Mt. Chimney Active Volcano (10 distinct parts + animated smoke plume)
    */
   private createActiveVolcano(): THREE.Group {
@@ -404,9 +934,10 @@ export class ProceduralPrefabFactory {
     for (let i = 0; i < 3; i++) {
       const a = (i * Math.PI * 2) / 3 + 0.35;
       const stream = new THREE.Mesh(new THREE.BoxGeometry(1.55, 12.8, 0.45), lavaStreamMat);
-      stream.position.set(Math.cos(a) * 6.1, 6.2, Math.sin(a) * 6.1);
+      stream.position.set(Math.cos(a) * 6.4, 6.6, Math.sin(a) * 6.4);
+      stream.rotation.order = 'YXZ';
       stream.rotation.y = -a + Math.PI / 2;
-      stream.rotation.x = 0.42;
+      stream.rotation.x = -0.38;
       group.add(stream);
     }
 
@@ -1436,111 +1967,413 @@ export class ProceduralPrefabFactory {
   }
 
   /**
-   * PLANETARY 1. Núi Lửa Khiên Olympus Mons (Sao Hỏa)
-   * Broad terraced Martian shield volcano with nested summit calderas & swirling red dust plume
+   * PLANETARY 1. Núi Lửa Khiên Olympus Mons (Sao Hỏa — Từ Ảnh Mẫu m8uek02co8l91_09cb37ea.png)
+   * Reconstructed directly from the user's NASA MOLA / Wolfgang Wieser orbital 3D photo:
+   * - Layer 1 (aureole_plains_apron): Ochre-tan Tharsis plains (#c58b56) & wrinkled radial aureole landslide aprons
+   * - Layer 2 (basal_scarp_cliff_ring): Iconic 8km vertical perimeter cliff escarpment with sunlit cream-gold left faces (#f3d59b) & deep shadow right faces (#23170d)
+   * - Layer 3 (shield_gentle_dome & radial_flow_ribs): Ultra-broad low-angle dusty buff-ochre shield dome (#bfa06f / #8c7248) with radial lava flow ribs
+   * - Layer 4 (nested_caldera_complex): Central sunken summit caldera complex with 6 overlapping collapse pits + 2 small plateau impact craters
    */
   private createMarsOlympusShield(): THREE.Group {
     const group = new THREE.Group();
-    this.addContactShadow(group, 10.5);
+    group.name = 'mars_olympus_shield_root';
+    this.addContactShadow(group, 11.8);
 
-    const rustBasaltMat = new THREE.MeshStandardMaterial({
-      color: 0x9a3412,
+    const tharsisPlainMat = new THREE.MeshStandardMaterial({
+      color: 0xc58b56,
       roughness: 0.9,
       flatShading: true,
     });
-    const upperOxideMat = new THREE.MeshStandardMaterial({
-      color: 0xc2410c,
-      roughness: 0.85,
+    const aureoleWrinkleMat = new THREE.MeshStandardMaterial({
+      color: 0xa46d3d,
+      roughness: 0.92,
       flatShading: true,
     });
-    const scarpCliffMat = new THREE.MeshStandardMaterial({
-      color: 0x7c2d12,
+    const scarpSunlitMat = new THREE.MeshStandardMaterial({
+      color: 0xf3d59b,
+      emissive: 0xd6a56a,
+      emissiveIntensity: 0.14,
+      roughness: 0.72,
+      flatShading: true,
+    });
+    const scarpShadowMat = new THREE.MeshStandardMaterial({
+      color: 0x2a1a0e,
+      roughness: 0.94,
+      flatShading: true,
+    });
+    const shieldSunlitDomeMat = new THREE.MeshStandardMaterial({
+      color: 0xccb07e,
+      roughness: 0.84,
+      flatShading: true,
+    });
+    const shieldMidDomeMat = new THREE.MeshStandardMaterial({
+      color: 0x9b8052,
       roughness: 0.88,
       flatShading: true,
     });
-    const calderaFloorMat = new THREE.MeshStandardMaterial({
-      color: 0x431407,
-      emissive: 0x9a3412,
-      emissiveIntensity: 0.35,
-      roughness: 0.7,
+    const shieldShadowDomeMat = new THREE.MeshStandardMaterial({
+      color: 0x6b5635,
+      roughness: 0.9,
+      flatShading: true,
     });
-    const dustPlumeMat = new THREE.MeshStandardMaterial({
-      color: 0xf97316,
-      emissive: 0xc2410c,
-      emissiveIntensity: 0.25,
-      transparent: true,
-      opacity: 0.68,
+    const calderaFloorMat = new THREE.MeshStandardMaterial({
+      color: 0x3d2e1b,
+      roughness: 0.92,
       flatShading: true,
     });
 
-    // Part 1: Outer Basal Escarpment (8km cliff analog at 1:1 prop scale)
-    const basalScarp = new THREE.Mesh(
-      new THREE.CylinderGeometry(8.6, 10.2, 4.2, 12),
-      scarpCliffMat
+    // 1. LAYER 1: Tharsis Ochre Plains & Wrinkled Radial Aureole Landslide Aprons
+    const aureoleGroup = new THREE.Group();
+    aureoleGroup.name = 'aureole_plains_apron';
+
+    const basePlain = new THREE.Mesh(
+      new THREE.CylinderGeometry(11.4, 12.0, 0.45, 28),
+      tharsisPlainMat
     );
-    basalScarp.position.y = 2.1;
-    basalScarp.castShadow = !this.isSoftwareGl;
-    group.add(basalScarp);
+    basePlain.position.y = 0.22;
+    aureoleGroup.add(basePlain);
 
-    // Part 2: Mid Shield Slope
-    const midShield = new THREE.Mesh(
-      new THREE.CylinderGeometry(5.4, 8.5, 6.2, 12),
-      rustBasaltMat
-    );
-    midShield.position.y = 7.3;
-    midShield.castShadow = !this.isSoftwareGl;
-    group.add(midShield);
-
-    // Part 3: Upper Summit Shield Cone
-    const upperShield = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.2, 5.3, 4.4, 12),
-      upperOxideMat
-    );
-    upperShield.position.y = 12.6;
-    upperShield.castShadow = !this.isSoftwareGl;
-    group.add(upperShield);
-
-    // Part 4: Nested Summit Caldera Bowl
-    const calderaRim = new THREE.Mesh(
-      new THREE.TorusGeometry(2.85, 0.55, 7, 14),
-      scarpCliffMat
-    );
-    calderaRim.rotation.x = Math.PI / 2;
-    calderaRim.position.y = 14.8;
-    group.add(calderaRim);
-
-    const calderaFloor = new THREE.Mesh(
-      new THREE.CylinderGeometry(2.5, 2.3, 0.5, 10),
-      calderaFloorMat
-    );
-    calderaFloor.position.y = 14.55;
-    group.add(calderaFloor);
-
-    // Parts 5-8: Radial Martian Lava Channels & Flank Outcrops
-    for (let i = 0; i < 4; i++) {
-      const ang = (i / 4) * Math.PI * 2 + 0.35;
-      const ridge = new THREE.Mesh(new THREE.DodecahedronGeometry(1.85, 0), upperOxideMat);
-      ridge.scale.set(1.4, 0.7, 0.8);
-      ridge.position.set(Math.cos(ang) * 6.8, 5.2, Math.sin(ang) * 6.8);
-      ridge.rotation.y = -ang;
-      group.add(ridge);
-    }
-
-    // Part 9 & 10: Swirling Martian Red Dust Plume above Summit
-    const plumeGroup = new THREE.Group();
-    plumeGroup.position.y = 14.2;
-    plumeGroup.userData.isVolcanoPlume = true;
-    for (let p = 0; p < 3; p++) {
-      const dustCloud = new THREE.Mesh(
-        new THREE.DodecahedronGeometry(1.25 + p * 0.35, 0),
-        dustPlumeMat
+    for (let i = 0; i < 12; i++) {
+      const ang = (i / 12) * Math.PI * 2 + 0.15;
+      const dist = 9.8 + (i % 3) * 0.65;
+      const lobe = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(1.15 + (i % 2) * 0.35, 1),
+        i % 2 === 0 ? aureoleWrinkleMat : tharsisPlainMat
       );
-      dustCloud.scale.set(1.5, 0.65, 1.5);
-      dustCloud.position.set((p - 1) * 0.9, 1.6 + p * 1.15, 0);
-      plumeGroup.add(dustCloud);
+      lobe.scale.set(1.65, 0.32, 0.95);
+      lobe.position.set(Math.cos(ang) * dist, 0.48, Math.sin(ang) * dist);
+      lobe.rotation.y = -ang + 0.3;
+      aureoleGroup.add(lobe);
     }
-    group.add(plumeGroup);
+    group.add(aureoleGroup);
 
+    // 2. LAYER 2: Iconic Jagged 8km Vertical Basal Scarp Cliff Ring
+    const scarpGroup = new THREE.Group();
+    scarpGroup.name = 'basal_scarp_cliff_ring';
+
+    const scarpCore = new THREE.Mesh(
+      new THREE.CylinderGeometry(8.9, 9.6, 3.2, 24),
+      shieldMidDomeMat
+    );
+    scarpCore.position.y = 1.95;
+    scarpGroup.add(scarpCore);
+
+    const scarpSegments = 20;
+    for (let i = 0; i < scarpSegments; i++) {
+      const ang = (i / scarpSegments) * Math.PI * 2;
+      // Indentations / cliff bays matching the jagged perimeter in m8uek02co8l91_09cb37ea.png
+      const bayIndent =
+        i === 3 || i === 4 || i === 13 || i === 14
+          ? -0.75
+          : ((i * 7) % 5) * 0.16 - 0.25;
+      const r = 8.95 + bayIndent;
+      const isSunlitLeft = Math.cos(ang - 2.35) > -0.1;
+      const cliffBlock = new THREE.Mesh(
+        new THREE.BoxGeometry(2.95, 3.15 + (i % 3) * 0.22, 1.35),
+        isSunlitLeft ? scarpSunlitMat : scarpShadowMat
+      );
+      cliffBlock.position.set(Math.cos(ang) * r, 1.95, Math.sin(ang) * r);
+      cliffBlock.rotation.order = 'YXZ';
+      cliffBlock.rotation.y = -ang + Math.PI * 0.5 + ((i % 3) - 1) * 0.08;
+      cliffBlock.rotation.x = -0.14;
+      scarpGroup.add(cliffBlock);
+    }
+    group.add(scarpGroup);
+
+    // 3. LAYER 3: Broad Low-Angle Shield Dome & Radial Lava Flow Ribs
+    const domeGroup = new THREE.Group();
+    domeGroup.name = 'shield_gentle_dome';
+
+    const lowerShield = new THREE.Mesh(
+      new THREE.CylinderGeometry(6.8, 8.95, 2.6, 28),
+      shieldMidDomeMat
+    );
+    lowerShield.position.y = 4.65;
+    domeGroup.add(lowerShield);
+
+    const midShieldSunlit = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.6, 6.85, 2.2, 24, 1, false, Math.PI * 0.35, Math.PI * 1.15),
+      shieldSunlitDomeMat
+    );
+    midShieldSunlit.position.set(-0.15, 6.85, 0.1);
+    domeGroup.add(midShieldSunlit);
+
+    const midShieldShadow = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.55, 6.8, 2.18, 24),
+      shieldShadowDomeMat
+    );
+    midShieldShadow.position.y = 6.82;
+    domeGroup.add(midShieldShadow);
+
+    const upperPlateau = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.2, 4.65, 1.45, 24),
+      shieldSunlitDomeMat
+    );
+    upperPlateau.position.y = 8.55;
+    domeGroup.add(upperPlateau);
+
+    const ribsGroup = new THREE.Group();
+    ribsGroup.name = 'radial_flow_ribs';
+    for (let r = 0; r < 14; r++) {
+      const ang = (r / 14) * Math.PI * 2 + 0.12;
+      const isLit = Math.cos(ang - 2.35) > 0;
+      const rib = new THREE.Mesh(
+        new THREE.ConeGeometry(0.68, 5.4, 5),
+        isLit ? shieldSunlitDomeMat : shieldMidDomeMat
+      );
+      rib.scale.set(1.15, 1.0, 0.36);
+      rib.position.set(Math.cos(ang) * 5.8, 6.1, Math.sin(ang) * 5.8);
+      rib.rotation.order = 'YXZ';
+      rib.rotation.y = -ang + Math.PI * 0.5;
+      rib.rotation.x = -0.92;
+      ribsGroup.add(rib);
+    }
+    domeGroup.add(ribsGroup);
+    group.add(domeGroup);
+
+    // 4. LAYER 4: Sunken 6-Pit Nested Summit Caldera Complex + 2 Satellite Impact Craters
+    const calderaGroup = new THREE.Group();
+    calderaGroup.name = 'nested_caldera_complex';
+
+    const outerCalderaRim = new THREE.Mesh(
+      new THREE.TorusGeometry(2.15, 0.32, 8, 24),
+      scarpSunlitMat
+    );
+    outerCalderaRim.rotation.x = Math.PI / 2;
+    outerCalderaRim.scale.set(1.15, 0.92, 0.75);
+    outerCalderaRim.position.set(-0.15, 9.28, -0.1);
+    calderaGroup.add(outerCalderaRim);
+
+    const nestedPits = [
+      { x: -0.55, z: -0.15, r: 1.05 },
+      { x: 0.45, z: 0.12, r: 0.88 },
+      { x: 0.05, z: -0.48, r: 0.72 },
+      { x: -0.85, z: 0.32, r: 0.64 },
+      { x: 0.85, z: -0.22, r: 0.58 },
+      { x: -0.15, z: 0.48, r: 0.62 },
+    ];
+    for (const pit of nestedPits) {
+      const pitWall = new THREE.Mesh(
+        new THREE.TorusGeometry(pit.r, 0.14, 6, 16),
+        shieldShadowDomeMat
+      );
+      pitWall.rotation.x = Math.PI / 2;
+      pitWall.position.set(pit.x, 9.22, pit.z);
+      calderaGroup.add(pitWall);
+
+      const pitFloor = new THREE.Mesh(
+        new THREE.CylinderGeometry(pit.r * 0.92, pit.r * 0.85, 0.24, 14),
+        calderaFloorMat
+      );
+      pitFloor.position.set(pit.x, 9.12, pit.z);
+      calderaGroup.add(pitFloor);
+    }
+
+    // Two small circular impact craters on the upper shield plateau (visible left & right of caldera in photo)
+    for (const ic of [
+      { x: -2.55, z: -0.65, r: 0.36 },
+      { x: 1.95, z: -0.85, r: 0.32 },
+    ]) {
+      const craterRim = new THREE.Mesh(
+        new THREE.TorusGeometry(ic.r, 0.08, 6, 14),
+        scarpSunlitMat
+      );
+      craterRim.rotation.x = Math.PI / 2;
+      craterRim.position.set(ic.x, 8.95, ic.z);
+      calderaGroup.add(craterRim);
+    }
+
+    group.add(calderaGroup);
+    return group;
+  }
+
+  /**
+   * PLANETARY 1B. Núi Rãnh Sao Mithrim / Doom Mons (Vệ Tinh Titan — Ảnh NASA JPL images_1f7cdcc6.jpg)
+   * Reconstructed directly from the user's NASA Jet Propulsion Laboratory Cassini 3D radar/VIMS image:
+   * - Layer 1 (titan_dune_basin_floor): Dark golden-brown / amber-sepia organic tholin plain (#5c3812) with longitudinal dune waves & bright golden-orange left alluvial apron (#e09a48)
+   * - Layer 2 (titan_dendritic_ridges): Star-shaped spider-like cluster of 8 sharp, bifurcating rocky/icy ridges radiating outward with bright cream-gold sunlit ice crests (#f5d096) and deep dark-chocolate shadow flanks (#261405) separated by deep V-valleys
+   * - Layer 3 (titan_summit_peak_crater): Sharp jagged white-gold hydrocarbon-ice central apex (#fef3c7) adjacent to a deep cryovolcanic depression
+   */
+  private createTitanMithrimMontes(): THREE.Group {
+    const group = new THREE.Group();
+    group.name = 'titan_mithrim_montes_root';
+    this.addContactShadow(group, 11.4);
+
+    const tholinBasinMat = new THREE.MeshStandardMaterial({
+      color: 0x5c3812,
+      roughness: 0.88,
+      flatShading: true,
+    });
+    const duneWaveMat = new THREE.MeshStandardMaterial({
+      color: 0x784918,
+      roughness: 0.85,
+      flatShading: true,
+    });
+    const goldenApronMat = new THREE.MeshStandardMaterial({
+      color: 0xe09a48,
+      emissive: 0xb45309,
+      emissiveIntensity: 0.14,
+      roughness: 0.72,
+      flatShading: true,
+    });
+    const sunlitIceCrestMat = new THREE.MeshStandardMaterial({
+      color: 0xf5d096,
+      emissive: 0xd97706,
+      emissiveIntensity: 0.18,
+      roughness: 0.48,
+      flatShading: true,
+    });
+    const shadowBitumenFlankMat = new THREE.MeshStandardMaterial({
+      color: 0x261405,
+      roughness: 0.94,
+      flatShading: true,
+    });
+    const apexIceMat = new THREE.MeshStandardMaterial({
+      color: 0xfef3c7,
+      emissive: 0xf59e0b,
+      emissiveIntensity: 0.24,
+      roughness: 0.35,
+      flatShading: true,
+    });
+
+    // 1. LAYER 1: Dark Amber-Brown Tholin Dune Basin & Bright Golden Left Alluvial Apron
+    const basinGroup = new THREE.Group();
+    basinGroup.name = 'titan_dune_basin_floor';
+
+    const basinDisc = new THREE.Mesh(
+      new THREE.CylinderGeometry(10.8, 11.4, 0.55, 24),
+      tholinBasinMat
+    );
+    basinDisc.position.y = 0.28;
+    basinGroup.add(basinDisc);
+
+    // Bright golden-orange sunlit alluvial fan on the left side (as seen in images_1f7cdcc6.jpg)
+    const leftGoldenApron = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.8, 4.9, 0.75, 14),
+      goldenApronMat
+    );
+    leftGoldenApron.scale.set(1.15, 0.65, 1.55);
+    leftGoldenApron.position.set(-5.8, 0.52, -0.4);
+    basinGroup.add(leftGoldenApron);
+
+    // Longitudinal hydrocarbon dune waves in foreground & right background
+    for (let d = 0; d < 8; d++) {
+      const dune = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.45, 5.2, 4, 8),
+        d % 2 === 0 ? duneWaveMat : goldenApronMat
+      );
+      dune.rotation.z = Math.PI / 2;
+      dune.rotation.y = 0.28;
+      dune.scale.set(1.0, 0.38, 1.4);
+      dune.position.set(-2.5 + d * 1.35, 0.55, 5.8 - (d % 3) * 1.4);
+      basinGroup.add(dune);
+    }
+    group.add(basinGroup);
+
+    // 2. LAYER 2: Star-Shaped / Spider-Like Cluster of 8 Bifurcating Dendritic Mountain Ridges
+    const ridgesGroup = new THREE.Group();
+    ridgesGroup.name = 'titan_dendritic_ridges';
+
+    const ridgeSpecs = [
+      { ang: 1.95, len: 8.8, h: 9.2, width: 1.55 }, // Front-left sweeping bright ridge
+      { ang: 1.58, len: 8.2, h: 9.6, width: 1.45 }, // Front-center-left bifurcated ridge
+      { ang: 1.24, len: 7.9, h: 9.4, width: 1.45 }, // Front-center-right dark/bright ridge
+      { ang: 0.82, len: 8.4, h: 8.8, width: 1.5 },  // Front-right radiating ridge
+      { ang: 0.25, len: 8.6, h: 8.2, width: 1.65 }, // East-right massive dark/amber ridge
+      { ang: -0.45, len: 8.4, h: 8.5, width: 1.75 }, // Back-right wide corrugated ridge
+      { ang: -1.45, len: 6.4, h: 7.8, width: 1.4 },  // North-back ridge
+      { ang: 2.55, len: 7.6, h: 8.4, width: 1.45 },  // West-left ridge
+    ];
+
+    for (let i = 0; i < ridgeSpecs.length; i++) {
+      const rs = ridgeSpecs[i];
+      const ridgeArm = new THREE.Group();
+      const midDist = rs.len * 0.48;
+
+      // Dark-chocolate bitumen shadow flank (creating the high-contrast dark V-valleys)
+      const darkSpine = new THREE.Mesh(
+        new THREE.ConeGeometry(rs.width, rs.len * 1.18, 4),
+        shadowBitumenFlankMat
+      );
+      darkSpine.scale.set(0.85, 1.0, 0.52);
+      darkSpine.position.set(
+        Math.cos(rs.ang) * midDist,
+        rs.h * 0.46,
+        Math.sin(rs.ang) * midDist
+      );
+      darkSpine.rotation.order = 'YXZ';
+      darkSpine.rotation.y = -rs.ang + Math.PI * 0.5;
+      darkSpine.rotation.x = -0.68;
+      ridgeArm.add(darkSpine);
+
+      // Bright cream-gold sunlit hydrocarbon-ice crest offset along the sunlit edge of the arête
+      const litCrest = new THREE.Mesh(
+        new THREE.ConeGeometry(rs.width * 0.72, rs.len * 1.12, 4),
+        sunlitIceCrestMat
+      );
+      litCrest.scale.set(0.68, 1.0, 0.42);
+      litCrest.position.set(
+        Math.cos(rs.ang - 0.08) * (midDist - 0.15),
+        rs.h * 0.49 + 0.25,
+        Math.sin(rs.ang - 0.08) * (midDist - 0.15)
+      );
+      litCrest.rotation.order = 'YXZ';
+      litCrest.rotation.y = -rs.ang + Math.PI * 0.5;
+      litCrest.rotation.x = -0.68;
+      ridgeArm.add(litCrest);
+
+      // Secondary bifurcating distal spur at the foot of the ridge
+      const forkAng = rs.ang + (i % 2 === 0 ? 0.16 : -0.16);
+      const forkDist = rs.len * 0.76;
+      const spur = new THREE.Mesh(
+        new THREE.ConeGeometry(rs.width * 0.58, rs.len * 0.55, 4),
+        i % 2 === 0 ? sunlitIceCrestMat : goldenApronMat
+      );
+      spur.scale.set(0.75, 1.0, 0.45);
+      spur.position.set(
+        Math.cos(forkAng) * forkDist,
+        rs.h * 0.22,
+        Math.sin(forkAng) * forkDist
+      );
+      spur.rotation.order = 'YXZ';
+      spur.rotation.y = -forkAng + Math.PI * 0.5;
+      spur.rotation.x = -0.78;
+      ridgeArm.add(spur);
+
+      ridgesGroup.add(ridgeArm);
+    }
+    group.add(ridgesGroup);
+
+    // 3. LAYER 3: Central Jagged White-Gold Hydrocarbon-Ice Apex & Deep Cryo-Depression
+    const summitGroup = new THREE.Group();
+    summitGroup.name = 'titan_summit_peak_crater';
+
+    const mainApex = new THREE.Mesh(
+      new THREE.ConeGeometry(2.35, 11.8, 4),
+      apexIceMat
+    );
+    mainApex.position.set(-0.6, 5.9, -0.8);
+    mainApex.rotation.y = 0.45;
+    mainApex.rotation.z = -0.12;
+    summitGroup.add(mainApex);
+
+    const shadowApex = new THREE.Mesh(
+      new THREE.ConeGeometry(2.45, 11.2, 4),
+      shadowBitumenFlankMat
+    );
+    shadowApex.position.set(0.45, 5.6, -0.4);
+    shadowApex.rotation.y = 1.1;
+    shadowApex.rotation.z = 0.14;
+    summitGroup.add(shadowApex);
+
+    const cryoPit = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.65, 1.1, 1.4, 10),
+      shadowBitumenFlankMat
+    );
+    cryoPit.position.set(0.2, 6.2, 0.4);
+    summitGroup.add(cryoPit);
+
+    group.add(summitGroup);
     return group;
   }
 
@@ -1818,108 +2651,220 @@ export class ProceduralPrefabFactory {
   }
 
   /**
-   * PLANETARY 5. Núi Lửa Băng Wright Mons (Sao Diêm Vương - Pluto Cryovolcano)
-   * Hummocky nitrogen-water ice volcano stained with dark red Cthulhu tholins,
-   * deep glowing cyan cryomagma caldera, frozen nitrogen flows & erupting cryo-geyser plume.
+   * PLANETARY 5. Núi Lửa Băng Wright Mons (Sao Diêm Vương — Từ Ảnh Mẫu NASA/JHUAPL/SwRI images.jpg)
+   * Reconstructed directly from the user's "CRYOPLUME ERUPTION DETECTED" NASA/JHUAPL/SwRI image:
+   * - Layer 1 (tholin_hummocky_bedrock): Dark reddish-brown / mahogany organic tholin hummocky terrain (#57362b / #3e241b) with foreground boulders, fractures & small impact craters
+   * - Layer 2 (nitrogen_glacier_lobes): Massive cascading white & pale-cyan nitrogen/water-ice lava flows (#f1f5f9 / #bae6fd) spilling out of the breached front-right rim down into the valley
+   * - Layer 3 (wright_mons_conical_caldera): Broad terraced cryovolcanic cone (#64748b / #94a3b8) topped by a deep, circular striated sunken caldera bowl (#cbd5e1 sunlit rim, #475569 striated inner wall)
+   * - Layer 4 (cryoplume_eruption_jet): Towering multi-columnar white-and-cyan cryoplume geyser jet (#ffffff / #e0f2fe) shooting vertically from the caldera vent with ice crystal spray
    */
   private createPlutoCryoVolcano(): THREE.Group {
     const group = new THREE.Group();
-    this.addContactShadow(group, 10.2);
+    group.name = 'pluto_cryo_volcano_root';
+    this.addContactShadow(group, 11.6);
 
-    const tholinBaseMat = new THREE.MeshStandardMaterial({
-      color: 0x7f1d1d,
-      roughness: 0.84,
-      metalness: 0.08,
+    const tholinDarkMat = new THREE.MeshStandardMaterial({
+      color: 0x3e241b,
+      roughness: 0.9,
       flatShading: true,
     });
-    const nitrogenIceMat = new THREE.MeshStandardMaterial({
-      color: 0xbae6fd,
-      emissive: 0x0284c7,
+    const tholinRedBrownMat = new THREE.MeshStandardMaterial({
+      color: 0x57362b,
+      roughness: 0.86,
+      flatShading: true,
+    });
+    const cryoSlateConeMat = new THREE.MeshStandardMaterial({
+      color: 0x64748b,
+      roughness: 0.82,
+      flatShading: true,
+    });
+    const sunlitCalderaRimMat = new THREE.MeshStandardMaterial({
+      color: 0xe2e8f0,
+      emissive: 0xbae6fd,
+      emissiveIntensity: 0.16,
+      roughness: 0.38,
+      flatShading: true,
+    });
+    const nitrogenGlacierMat = new THREE.MeshStandardMaterial({
+      color: 0xdbeafe,
+      emissive: 0x38bdf8,
       emissiveIntensity: 0.22,
       roughness: 0.28,
-      metalness: 0.35,
+      metalness: 0.22,
       flatShading: true,
     });
-    const cryoMagmaMat = new THREE.MeshStandardMaterial({
-      color: 0x67e8f9,
-      emissive: 0x06b6d4,
-      emissiveIntensity: 1.05,
-      roughness: 0.14,
-      metalness: 0.55,
+    const cyanIceFlowMat = new THREE.MeshStandardMaterial({
+      color: 0x7dd3fc,
+      emissive: 0x0284c7,
+      emissiveIntensity: 0.34,
+      roughness: 0.22,
+      metalness: 0.25,
+      flatShading: true,
     });
-    const cryoPlumeMat = new THREE.MeshStandardMaterial({
+    const cryoPlumeWhiteMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0xbae6fd,
+      emissiveIntensity: 0.65,
+      transparent: true,
+      opacity: 0.88,
+      flatShading: true,
+    });
+    const cryoPlumeMistMat = new THREE.MeshStandardMaterial({
       color: 0xe0f2fe,
       emissive: 0x38bdf8,
-      emissiveIntensity: 0.55,
+      emissiveIntensity: 0.45,
       transparent: true,
-      opacity: 0.76,
+      opacity: 0.62,
       flatShading: true,
     });
 
-    // Part 1: Broad Hummocky Tholin-Stained Basal Massif
-    const basalCone = new THREE.Mesh(
-      new THREE.CylinderGeometry(7.2, 9.8, 5.2, 11),
-      tholinBaseMat
-    );
-    basalCone.position.y = 2.6;
-    basalCone.castShadow = !this.isSoftwareGl;
-    group.add(basalCone);
+    // 1. LAYER 1: Dark Reddish-Brown Tholin Hummocky Bedrock & Small Foreground Craters
+    const bedrockGroup = new THREE.Group();
+    bedrockGroup.name = 'tholin_hummocky_bedrock';
 
-    // Part 2: Upper Glacial Nitrogen-Ice Cone
-    const upperIceCone = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.8, 7.1, 7.6, 11),
-      nitrogenIceMat
+    const basalPlatform = new THREE.Mesh(
+      new THREE.CylinderGeometry(10.6, 11.4, 2.2, 18),
+      tholinDarkMat
     );
-    upperIceCone.position.y = 8.9;
-    upperIceCone.castShadow = !this.isSoftwareGl;
-    group.add(upperIceCone);
+    basalPlatform.position.y = 1.1;
+    bedrockGroup.add(basalPlatform);
 
-    // Part 3: Jagged Ice Caldera Crown Rim
-    for (let i = 0; i < 7; i++) {
-      const a = (i / 7) * Math.PI * 2;
-      const icePeak = new THREE.Mesh(
-        new THREE.ConeGeometry(1.3, 3.4, 5),
-        nitrogenIceMat
+    // Hummocky red-brown tholin mounds in foreground & left slope (matching NASA/JHUAPL/SwRI foreground)
+    for (let h = 0; h < 14; h++) {
+      const ang = (h / 14) * Math.PI * 2 + 0.2;
+      const dist = 6.8 + (h % 3) * 1.45;
+      const mound = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(1.45 + (h % 3) * 0.35, 1),
+        h % 2 === 0 ? tholinRedBrownMat : tholinDarkMat
       );
-      icePeak.position.set(Math.cos(a) * 3.7, 13.4, Math.sin(a) * 3.7);
-      group.add(icePeak);
+      mound.scale.set(1.35, 0.72, 1.15);
+      mound.position.set(Math.cos(ang) * dist, 1.85 + (h % 2) * 0.45, Math.sin(ang) * dist);
+      mound.rotation.y = h * 0.7;
+      bedrockGroup.add(mound);
     }
 
-    // Part 4: Glowing Liquid Nitrogen-Ammonia Cryomagma Caldera Pool
-    const cryoPool = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.3, 2.7, 0.8, 10),
-      cryoMagmaMat
-    );
-    cryoPool.position.y = 12.6;
-    group.add(cryoPool);
-
-    // Parts 5-7: 3 Frozen Cryo-Lava Streams Down the Slopes
-    for (let i = 0; i < 3; i++) {
-      const a = (i * Math.PI * 2) / 3 + 0.4;
-      const cryoStream = new THREE.Mesh(
-        new THREE.BoxGeometry(1.45, 11.8, 0.45),
-        cryoMagmaMat
+    // Small circular pockmark craters in foreground tholin crust
+    for (const cr of [
+      { x: -4.2, z: 7.4, r: 0.65 },
+      { x: -1.8, z: 8.2, r: 0.52 },
+    ]) {
+      const pock = new THREE.Mesh(
+        new THREE.TorusGeometry(cr.r, 0.14, 6, 14),
+        tholinRedBrownMat
       );
-      cryoStream.position.set(Math.cos(a) * 5.8, 6.0, Math.sin(a) * 5.8);
-      cryoStream.rotation.y = -a + Math.PI / 2;
-      cryoStream.rotation.x = 0.44;
-      group.add(cryoStream);
+      pock.rotation.x = Math.PI / 2;
+      pock.position.set(cr.x, 2.25, cr.z);
+      bedrockGroup.add(pock);
+    }
+    group.add(bedrockGroup);
+
+    // 2. LAYER 2: Cascading White & Pale-Cyan Nitrogen-Ice Glacier Lobes (Front-Right Spillway)
+    const glacierGroup = new THREE.Group();
+    glacierGroup.name = 'nitrogen_glacier_lobes';
+
+    // Main broad cascading glacier lobe spilling from caldera breach toward front-right (as in images.jpg)
+    for (let l = 0; l < 9; l++) {
+      const t = l / 8;
+      const lobeX = -0.5 + t * 6.4;
+      const lobeZ = 0.8 + t * 6.6;
+      const lobeY = 8.4 - t * 6.4;
+      const lobeR = 2.1 + Math.sin(t * Math.PI) * 1.15;
+      const lobe = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(lobeR, 1),
+        l % 3 === 0 ? cyanIceFlowMat : nitrogenGlacierMat
+      );
+      lobe.scale.set(1.35, 0.48, 1.15);
+      lobe.position.set(lobeX, lobeY, lobeZ);
+      lobe.rotation.y = 0.65;
+      glacierGroup.add(lobe);
     }
 
-    // Parts 8-11: Animated Erupting Cryovolcanic Plume & Ice Crystals
+    // Secondary frozen nitrogen-ice ribs down the upper cone flanks
+    for (let r = 0; r < 6; r++) {
+      const ang = -0.35 + r * 0.42;
+      const rib = new THREE.Mesh(
+        new THREE.ConeGeometry(0.95, 7.6, 5),
+        nitrogenGlacierMat
+      );
+      rib.scale.set(1.1, 1.0, 0.42);
+      rib.position.set(Math.cos(ang) * 5.2, 6.2, Math.sin(ang) * 5.2);
+      rib.rotation.order = 'YXZ';
+      rib.rotation.y = -ang + Math.PI * 0.5;
+      rib.rotation.x = -0.68;
+      glacierGroup.add(rib);
+    }
+    group.add(glacierGroup);
+
+    // 3. LAYER 3: Conical Wright Mons Cryovolcano & Deep Circular Striated Summit Caldera Bowl
+    const calderaGroup = new THREE.Group();
+    calderaGroup.name = 'wright_mons_conical_caldera';
+
+    const mainCone = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.4, 8.6, 7.8, 20),
+      cryoSlateConeMat
+    );
+    mainCone.position.set(-1.1, 5.8, -0.8);
+    calderaGroup.add(mainCone);
+
+    const upperFrostedShoulders = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.2, 6.4, 3.8, 20),
+      nitrogenGlacierMat
+    );
+    upperFrostedShoulders.position.set(-1.1, 8.1, -0.8);
+    calderaGroup.add(upperFrostedShoulders);
+
+    // Circular steep-walled sunken caldera rim (bright sunlit inner-left wall)
+    const calderaRim = new THREE.Mesh(
+      new THREE.TorusGeometry(3.65, 0.62, 10, 24),
+      sunlitCalderaRimMat
+    );
+    calderaRim.rotation.x = Math.PI / 2;
+    calderaRim.scale.set(1.12, 0.95, 0.85);
+    calderaRim.position.set(-1.1, 9.95, -0.8);
+    calderaGroup.add(calderaRim);
+
+    const calderaFloor = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.2, 2.4, 1.2, 18),
+      cryoSlateConeMat
+    );
+    calderaFloor.position.set(-1.1, 9.1, -0.8);
+    calderaGroup.add(calderaFloor);
+
+    group.add(calderaGroup);
+
+    // 4. LAYER 4: Towering Multi-Columnar Cryoplume Eruption Jet & Ice-Crystal Spray Halo
     const plumeGroup = new THREE.Group();
-    plumeGroup.position.y = 14.2;
+    plumeGroup.name = 'cryoplume_eruption_jet';
+    plumeGroup.position.set(-1.1, 14.2, -0.8);
     plumeGroup.userData.isVolcanoPlume = true;
 
-    for (let p = 0; p < 4; p++) {
+    // Dense central vertical white cryoplume column shooting out of the caldera
+    const coreJet = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.4, 0.85, 10.5, 14),
+      cryoPlumeWhiteMat
+    );
+    coreJet.position.y = 0.2;
+    plumeGroup.add(coreJet);
+
+    // Outer translucent ice-crystal spray cone & billowing cryo-cloud puffs
+    const sprayHalo = new THREE.Mesh(
+      new THREE.ConeGeometry(4.2, 11.8, 16),
+      cryoPlumeMistMat
+    );
+    sprayHalo.rotation.x = Math.PI; // inverted cone flaring upward like a geyser fountain
+    sprayHalo.position.y = 1.2;
+    plumeGroup.add(sprayHalo);
+
+    for (let p = 0; p < 6; p++) {
       const puff = new THREE.Mesh(
-        new THREE.DodecahedronGeometry(1.15 + p * 0.36, 0),
-        cryoPlumeMat
+        new THREE.DodecahedronGeometry(1.35 + (p % 3) * 0.45, 1),
+        p % 2 === 0 ? cryoPlumeWhiteMat : cryoPlumeMistMat
       );
+      const ang = (p / 6) * Math.PI * 2;
       puff.position.set(
-        Math.sin(p * 1.6) * 0.75,
-        p * 1.45,
-        Math.cos(p * 1.6) * 0.75
+        Math.cos(ang) * (0.9 + (p % 2) * 0.6),
+        -2.2 + p * 1.65,
+        Math.sin(ang) * (0.9 + (p % 2) * 0.6)
       );
       plumeGroup.add(puff);
     }
@@ -2022,70 +2967,240 @@ export class ProceduralPrefabFactory {
   }
 
   /**
-   * PLANETARY 7. Rừng Tháp Băng Penitentes & Rãnh Muối Đỏ (Pluto Tartarus Dorsa / Europa)
-   * Towering blade-like methane/nitrogen ice spires angled toward the sun over a red-salt Chaos ridge.
+   * PLANETARY 7. Mặt Cắt Rãnh Nứt Băng & Đại Dương Ngầm Europa (Từ Ảnh Mẫu image.png)
+   * Reconstructed directly from the user's 3D Europa geological block cutaway diagram:
+   * - Layer 1 (europa_mantle_magma_core): Rocky seafloor crust (#1c1917) with glowing red-orange tidal-heated magma chamber (#ea580c / #facc15) in the front cutaway face
+   * - Layer 2 (hydrothermal_seafloor_smokers): Craggy submarine hydrothermal vents (#475569) spewing 2 rising columns of white-cyan hydrothermal plumes (#99f6e4)
+   * - Layer 3 (subsurface_turquoise_ocean): Deep translucent turquoise-cyan subsurface liquid ocean block (#0891b2 / #06b6d4) with a vertical water conduit channel
+   * - Layer 4 (white_ice_shell_crust & chaos_ridge_surface): Split white floating ice shell (#e2e8f0) with a deep V-shaped fracture cleft, topped by golden-ochre & reddish-salt Chaos Terrain ridges (#d97706 / #b45309)
+   * - Layer 5 (europa_cryo_geyser_plume): Fan-shaped translucent white-and-cyan water-vapor geyser plume (#ffffff / #bae6fd) erupting from the surface fracture cleft
    */
   private createEuropaPenitentesSpire(): THREE.Group {
     const group = new THREE.Group();
-    this.addContactShadow(group, 6.8);
+    group.name = 'europa_ocean_rift_cutaway_root';
+    this.addContactShadow(group, 10.4);
 
-    const redSaltChaosMat = new THREE.MeshStandardMaterial({
-      color: 0x991b1b,
-      roughness: 0.82,
-      metalness: 0.12,
+    const mantleRockMat = new THREE.MeshStandardMaterial({
+      color: 0x1c1917,
+      roughness: 0.92,
       flatShading: true,
     });
-    const cyanBladeIceMat = new THREE.MeshStandardMaterial({
-      color: 0x67e8f9,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.52,
-      roughness: 0.15,
-      metalness: 0.55,
+    const magmaCoreMat = new THREE.MeshStandardMaterial({
+      color: 0xf97316,
+      emissive: 0xdc2626,
+      emissiveIntensity: 0.95,
+      roughness: 0.28,
       flatShading: true,
     });
-    const deepGlacierMat = new THREE.MeshStandardMaterial({
-      color: 0x38bdf8,
-      emissive: 0x0369a1,
+    const hydrothermalMountMat = new THREE.MeshStandardMaterial({
+      color: 0x475569,
+      roughness: 0.88,
+      flatShading: true,
+    });
+    const smokerPlumeMat = new THREE.MeshStandardMaterial({
+      color: 0xccfbf1,
+      emissive: 0x2dd4bf,
+      emissiveIntensity: 0.45,
+      transparent: true,
+      opacity: 0.85,
+      flatShading: true,
+    });
+    const subsurfaceOceanMat = new THREE.MeshStandardMaterial({
+      color: 0x0891b2,
+      emissive: 0x0e7490,
       emissiveIntensity: 0.38,
-      roughness: 0.22,
-      metalness: 0.45,
+      roughness: 0.16,
+      metalness: 0.15,
+      transparent: true,
+      opacity: 0.82,
+    });
+    const conduitCyanMat = new THREE.MeshStandardMaterial({
+      color: 0x22d3ee,
+      emissive: 0x06b6d4,
+      emissiveIntensity: 0.65,
+      roughness: 0.15,
+    });
+    const whiteIceShellMat = new THREE.MeshStandardMaterial({
+      color: 0xe2e8f0,
+      emissive: 0xbae6fd,
+      emissiveIntensity: 0.15,
+      roughness: 0.32,
+      flatShading: true,
+    });
+    const goldenChaosSurfaceMat = new THREE.MeshStandardMaterial({
+      color: 0xd97706,
+      emissive: 0x92400e,
+      emissiveIntensity: 0.18,
+      roughness: 0.65,
+      flatShading: true,
+    });
+    const creamSaltRidgeMat = new THREE.MeshStandardMaterial({
+      color: 0xfde68a,
+      roughness: 0.52,
+      flatShading: true,
+    });
+    const spaceGeyserMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0x7dd3fc,
+      emissiveIntensity: 0.65,
+      transparent: true,
+      opacity: 0.82,
       flatShading: true,
     });
 
-    // Part 1: Fractured Red-Salt Chaos Ice Base
-    const chaosBase = new THREE.Mesh(
-      new THREE.CylinderGeometry(4.8, 5.6, 2.2, 7),
-      redSaltChaosMat
-    );
-    chaosBase.position.y = 1.1;
-    chaosBase.castShadow = !this.isSoftwareGl;
-    group.add(chaosBase);
+    // 1. LAYER 1: Rocky Mantle Seafloor & Glowing Tidal-Heated Magma Chamber (y = 0..2.2m)
+    const mantleGroup = new THREE.Group();
+    mantleGroup.name = 'europa_mantle_magma_core';
 
-    // Part 2: Central Towering Penitentes Ice Blade (17.5m tall, flattened blade cross-section)
-    const centralBlade = new THREE.Mesh(
-      new THREE.ConeGeometry(2.2, 16.5, 4),
-      cyanBladeIceMat
+    const seafloorBlock = new THREE.Mesh(
+      new THREE.BoxGeometry(12.4, 2.2, 9.6),
+      mantleRockMat
     );
-    centralBlade.scale.set(1.25, 1.0, 0.48);
-    centralBlade.position.y = 9.5;
-    centralBlade.rotation.z = 0.12;
-    centralBlade.castShadow = !this.isSoftwareGl;
-    group.add(centralBlade);
+    seafloorBlock.position.y = 1.1;
+    mantleGroup.add(seafloorBlock);
 
-    // Parts 3-9: 7 Surrounding Parallel Angled Penitentes Ice Blades
-    for (let i = 0; i < 7; i++) {
-      const ang = (i / 7) * Math.PI * 2;
-      const dist = 2.6 + (i % 2) * 1.15;
-      const h = 8.2 + (i % 3) * 2.8;
-      const blade = new THREE.Mesh(
-        new THREE.ConeGeometry(1.35, h, 4),
-        i % 2 === 0 ? cyanBladeIceMat : deepGlacierMat
+    // Glowing red-orange magma chamber dome exposed on the front-left cutaway face
+    const magmaChamber = new THREE.Mesh(
+      new THREE.ConeGeometry(2.6, 2.1, 7),
+      magmaCoreMat
+    );
+    magmaChamber.scale.set(1.25, 1.0, 0.45);
+    magmaChamber.position.set(-1.6, 1.15, 4.35);
+    mantleGroup.add(magmaChamber);
+    group.add(mantleGroup);
+
+    // 2. LAYER 2: Submarine Hydrothermal Vents & 2 Rising White-Cyan Plume Columns (y = 2.2..7.5m)
+    const hydrothermalGroup = new THREE.Group();
+    hydrothermalGroup.name = 'hydrothermal_seafloor_smokers';
+
+    for (const vm of [
+      { x: -1.8, z: 3.8, r: 2.3, h: 2.6 },
+      { x: 1.4, z: 3.7, r: 1.9, h: 2.2 },
+      { x: 3.8, z: 3.6, r: 1.7, h: 1.8 },
+    ]) {
+      const ventMount = new THREE.Mesh(
+        new THREE.ConeGeometry(vm.r, vm.h, 6),
+        hydrothermalMountMat
       );
-      blade.scale.set(1.2, 1.0, 0.45);
-      blade.position.set(Math.cos(ang) * dist, h * 0.48 + 1.0, Math.sin(ang) * dist);
-      blade.rotation.z = 0.14; // All Penitentes blades tilt toward the same solar angle
-      group.add(blade);
+      ventMount.position.set(vm.x, 2.2 + vm.h * 0.45, vm.z);
+      hydrothermalGroup.add(ventMount);
     }
+
+    // Two turbulent rising white-cyan hydrothermal plumes inside the ocean cutaway
+    for (const sp of [
+      { x: -1.8, y: 5.8, r: 1.25 },
+      { x: 1.2, y: 5.5, r: 1.05 },
+    ]) {
+      for (let k = 0; k < 3; k++) {
+        const plumePuff = new THREE.Mesh(
+          new THREE.DodecahedronGeometry(sp.r * (0.75 + k * 0.2), 1),
+          smokerPlumeMat
+        );
+        plumePuff.position.set(sp.x, 3.8 + k * 1.15, 3.95);
+        hydrothermalGroup.add(plumePuff);
+      }
+    }
+    group.add(hydrothermalGroup);
+
+    // 3. LAYER 3: Deep Turquoise-Cyan Subsurface Liquid Ocean Block (y = 2.2..11.2m)
+    const oceanGroup = new THREE.Group();
+    oceanGroup.name = 'subsurface_turquoise_ocean';
+
+    const oceanBlock = new THREE.Mesh(
+      new THREE.BoxGeometry(12.2, 8.8, 9.4),
+      subsurfaceOceanMat
+    );
+    oceanBlock.position.y = 6.6;
+    oceanGroup.add(oceanBlock);
+
+    // Vertical cyan water conduit rising through the split ice shell
+    const waterConduit = new THREE.Mesh(
+      new THREE.BoxGeometry(0.95, 3.6, 9.5),
+      conduitCyanMat
+    );
+    waterConduit.position.set(-1.35, 12.4, 0);
+    oceanGroup.add(waterConduit);
+    group.add(oceanGroup);
+
+    // 4. LAYER 4: Split White Ice Shell Crust & Golden-Ochre Chaos Terrain Ridges (y = 11.0..14.8m)
+    const iceShellGroup = new THREE.Group();
+    iceShellGroup.name = 'white_ice_shell_crust';
+
+    // Left ice crust slab (to the left of the fracture cleft)
+    const leftIceSlab = new THREE.Mesh(
+      new THREE.BoxGeometry(4.2, 2.8, 9.6),
+      whiteIceShellMat
+    );
+    leftIceSlab.position.set(-4.0, 12.4, 0);
+    iceShellGroup.add(leftIceSlab);
+
+    // Right ice crust slab (to the right of the fracture cleft)
+    const rightIceSlab = new THREE.Mesh(
+      new THREE.BoxGeometry(7.2, 2.8, 9.6),
+      whiteIceShellMat
+    );
+    rightIceSlab.position.set(2.55, 12.4, 0);
+    iceShellGroup.add(rightIceSlab);
+
+    // Golden-ochre & reddish-salt irradiated Chaos Terrain & Linea ridges on top of the ice shell
+    const chaosSurfaceGroup = new THREE.Group();
+    chaosSurfaceGroup.name = 'chaos_ridge_surface';
+
+    const leftChaosTop = new THREE.Mesh(
+      new THREE.BoxGeometry(4.1, 0.55, 9.5),
+      goldenChaosSurfaceMat
+    );
+    leftChaosTop.position.set(-4.0, 14.05, 0);
+    chaosSurfaceGroup.add(leftChaosTop);
+
+    const rightChaosTop = new THREE.Mesh(
+      new THREE.BoxGeometry(7.1, 0.55, 9.5),
+      goldenChaosSurfaceMat
+    );
+    rightChaosTop.position.set(2.55, 14.05, 0);
+    chaosSurfaceGroup.add(rightChaosTop);
+
+    // Craggy golden & cream Chaos Terrain ridge mounds on the top surface
+    for (let c = 0; c < 8; c++) {
+      const cx = c < 3 ? -4.8 + c * 1.1 : 0.2 + (c - 3) * 1.15;
+      const cz = -2.8 + ((c * 3) % 5) * 1.35;
+      const ridgeMound = new THREE.Mesh(
+        new THREE.ConeGeometry(1.15, 1.45, 5),
+        c % 2 === 0 ? goldenChaosSurfaceMat : creamSaltRidgeMat
+      );
+      ridgeMound.scale.set(1.4, 0.75, 0.9);
+      ridgeMound.position.set(cx, 14.65, cz);
+      ridgeMound.rotation.y = c * 0.6;
+      chaosSurfaceGroup.add(ridgeMound);
+    }
+    iceShellGroup.add(chaosSurfaceGroup);
+    group.add(iceShellGroup);
+
+    // 5. LAYER 5: Erupting Fan-Shaped Space Cryo-Geyser Spray Plume (y = 14.2..22.5m)
+    const plumeGroup = new THREE.Group();
+    plumeGroup.name = 'europa_cryo_geyser_plume';
+    plumeGroup.position.set(-1.35, 14.2, 0.8);
+    plumeGroup.userData.isVolcanoPlume = true;
+
+    const geyserFan = new THREE.Mesh(
+      new THREE.ConeGeometry(3.6, 8.2, 14),
+      spaceGeyserMat
+    );
+    geyserFan.rotation.x = Math.PI; // Flaring upward from the ice-shell fracture cleft
+    geyserFan.scale.set(1.15, 1.0, 0.65);
+    geyserFan.position.y = 3.8;
+    plumeGroup.add(geyserFan);
+
+    for (let s = -1; s <= 1; s++) {
+      const jetRay = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.65, 0.18, 7.6, 8),
+        spaceGeyserMat
+      );
+      jetRay.position.set(s * 0.85, 3.6, 0);
+      jetRay.rotation.z = -s * 0.22;
+      plumeGroup.add(jetRay);
+    }
+    group.add(plumeGroup);
 
     return group;
   }
@@ -2095,112 +3210,392 @@ export class ProceduralPrefabFactory {
    * Sharp 4-faceted pyramidal horn spire (Matterhorn/Everest), hanging blue glacier seracs,
    * turquoise Andean glacial cirque tarn, and summit snow plume.
    */
+  /**
+   * EARTH 1A. Đỉnh Sừng Băng Matterhorn Dãy Anpơ (Thụy Sĩ — Từ Ảnh Mẫu images.jpg)
+   * Reconstructed directly from the user's Alps Matterhorn photograph:
+   * - Layer 1 (alpine_rhododendron_meadow): Lush yellow-green & emerald alpine meadow foreground slope (#65a30d / #84cc16) with pink alpine rhododendron flowers (#ec4899) & golden shrub tips (#d97706)
+   * - Layer 2 (glacier_saddle_col): Broad grey-brown alpine gneiss ridge (#57534e) draped with sweeping white snowfields & hanging glaciers (#f8fafc)
+   * - Layer 3 (matterhorn_horn_pyramid): Iconic crooked 4-sided pyramidal horn with sunlit grey-tan left East face (#a8a29e), steep dark navy-slate shadowed North face (#1e3a8a / #1e293b), and hooked snow-capped summit crest (#ffffff)
+   */
   private createHimalayaMatterhornPeak(): THREE.Group {
     const group = new THREE.Group();
-    this.addContactShadow(group, 10.2);
+    group.name = 'alps_matterhorn_peak_root';
+    this.addContactShadow(group, 11.2);
 
-    const gneissCliffMat = new THREE.MeshStandardMaterial({
-      color: 0x475569,
-      roughness: 0.88,
-      metalness: 0.08,
+    const meadowGreenMat = new THREE.MeshStandardMaterial({
+      color: 0x65a30d,
+      roughness: 0.78,
       flatShading: true,
     });
-    const snowCorniceMat = new THREE.MeshStandardMaterial({
+    const meadowBrightMat = new THREE.MeshStandardMaterial({
+      color: 0x84cc16,
+      roughness: 0.72,
+      flatShading: true,
+    });
+    const goldenBushMat = new THREE.MeshStandardMaterial({
+      color: 0xd97706,
+      roughness: 0.75,
+      flatShading: true,
+    });
+    const pinkRhododendronMat = new THREE.MeshStandardMaterial({
+      color: 0xec4899,
+      emissive: 0xdb2777,
+      emissiveIntensity: 0.22,
+      roughness: 0.45,
+      flatShading: true,
+    });
+    const gneissBaseMat = new THREE.MeshStandardMaterial({
+      color: 0x57534e,
+      roughness: 0.88,
+      flatShading: true,
+    });
+    const sunlitEastRockMat = new THREE.MeshStandardMaterial({
+      color: 0xa8a29e,
+      roughness: 0.82,
+      flatShading: true,
+    });
+    const shadowNorthSlateMat = new THREE.MeshStandardMaterial({
+      color: 0x1e3a8a,
+      roughness: 0.86,
+      flatShading: true,
+    });
+    const deepCliffMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.9,
+      flatShading: true,
+    });
+    const alpineSnowMat = new THREE.MeshStandardMaterial({
       color: 0xf8fafc,
       emissive: 0xe0f2fe,
       emissiveIntensity: 0.16,
-      roughness: 0.35,
+      roughness: 0.32,
       flatShading: true,
     });
-    const blueGlacierMat = new THREE.MeshStandardMaterial({
-      color: 0x7dd3fc,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.28,
-      roughness: 0.2,
-      metalness: 0.35,
-      flatShading: true,
-    });
-    const tarnLakeMat = new THREE.MeshStandardMaterial({
-      color: 0x06b6d4,
-      emissive: 0x0891b2,
-      emissiveIntensity: 0.35,
-      roughness: 0.12,
-      metalness: 0.45,
-    });
 
-    // Part 1: Broad Alpine Basal Ridge
-    const basalMassif = new THREE.Mesh(
-      new THREE.CylinderGeometry(6.8, 9.4, 5.2, 7),
-      gneissCliffMat
+    // 1. LAYER 1: Lush Green Alpine Meadow Foreground with Pink Rhododendron Blossoms
+    const meadowGroup = new THREE.Group();
+    meadowGroup.name = 'alpine_rhododendron_meadow';
+
+    const foregroundRightHill = new THREE.Mesh(
+      new THREE.CylinderGeometry(5.6, 7.2, 2.8, 16),
+      meadowBrightMat
     );
-    basalMassif.position.y = 2.6;
-    basalMassif.castShadow = !this.isSoftwareGl;
-    group.add(basalMassif);
+    foregroundRightHill.scale.set(1.25, 1.0, 0.85);
+    foregroundRightHill.position.set(3.2, 1.35, 5.2);
+    meadowGroup.add(foregroundRightHill);
 
-    // Part 2: Iconic 4-Sided Pyramidal Horn Spire (Matterhorn / Everest)
-    const hornSpire = new THREE.Mesh(
-      new THREE.ConeGeometry(5.6, 17.5, 4),
-      gneissCliffMat
+    const foregroundLeftHill = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.8, 6.4, 2.1, 14),
+      meadowGreenMat
     );
-    hornSpire.position.set(-0.6, 12.2, -0.4);
-    hornSpire.rotation.y = Math.PI * 0.22;
-    hornSpire.rotation.z = -0.09; // Classic Matterhorn summit tilt
-    hornSpire.castShadow = !this.isSoftwareGl;
-    group.add(hornSpire);
+    foregroundLeftHill.scale.set(1.2, 1.0, 0.85);
+    foregroundLeftHill.position.set(-3.4, 1.05, 5.4);
+    meadowGroup.add(foregroundLeftHill);
 
-    // Part 3: Snow-Clad Summit Crown & Arête Cornice
-    const snowCap = new THREE.Mesh(
-      new THREE.ConeGeometry(3.4, 9.8, 4),
-      snowCorniceMat
-    );
-    snowCap.position.set(-0.9, 16.4, -0.4);
-    snowCap.rotation.y = Math.PI * 0.22;
-    snowCap.rotation.z = -0.11;
-    group.add(snowCap);
-
-    // Part 4 & 5: Flanking Andean / Himalayan Sub-Peaks
-    const eastPeak = new THREE.Mesh(
-      new THREE.ConeGeometry(3.8, 12.6, 5),
-      snowCorniceMat
-    );
-    eastPeak.position.set(4.2, 7.8, 1.4);
-    eastPeak.rotation.z = 0.14;
-    group.add(eastPeak);
-
-    const westCrag = new THREE.Mesh(
-      new THREE.ConeGeometry(3.2, 10.5, 5),
-      gneissCliffMat
-    );
-    westCrag.position.set(-4.8, 6.5, 1.8);
-    westCrag.rotation.z = -0.16;
-    group.add(westCrag);
-
-    // Part 6 & 7: Hanging Blue Glacier Icefalls (Khumbu / Aletsch Glacier)
-    for (let i = 0; i < 2; i++) {
-      const glacier = new THREE.Mesh(
-        new THREE.BoxGeometry(2.4, 9.5, 1.2),
-        blueGlacierMat
+    // Golden-ochre alpine bushes & pink rhododendron flower clusters in foreground
+    for (let b = 0; b < 16; b++) {
+      const bx = -6.2 + (b / 15) * 12.8;
+      const bz = 4.6 + ((b * 7) % 5) * 0.72;
+      const by = bx > 0 ? 2.45 - Math.abs(bx - 3.2) * 0.12 : 1.95 - Math.abs(bx + 3.4) * 0.1;
+      const bush = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(0.65 + (b % 3) * 0.18, 0),
+        b % 3 === 0 ? goldenBushMat : meadowBrightMat
       );
-      glacier.position.set(i === 0 ? -1.4 : 2.1, 6.2, 3.8);
-      glacier.rotation.x = 0.45;
-      group.add(glacier);
+      bush.scale.set(1.3, 0.68, 1.1);
+      bush.position.set(bx, by, bz);
+      meadowGroup.add(bush);
+
+      if (b % 2 === 0) {
+        const blossom = new THREE.Mesh(
+          new THREE.DodecahedronGeometry(0.32, 0),
+          pinkRhododendronMat
+        );
+        blossom.position.set(bx + 0.15, by + 0.36, bz + 0.25);
+        meadowGroup.add(blossom);
+      }
+    }
+    group.add(meadowGroup);
+
+    // 2. LAYER 2: Broad Alpine Gneiss Saddle Col & Sweeping White Glacier Snowfields
+    const saddleGroup = new THREE.Group();
+    saddleGroup.name = 'glacier_saddle_col';
+
+    const basalMassif = new THREE.Mesh(
+      new THREE.CylinderGeometry(6.8, 9.8, 6.2, 10),
+      gneissBaseMat
+    );
+    basalMassif.scale.set(1.25, 1.0, 0.88);
+    basalMassif.position.set(0, 3.1, -0.6);
+    saddleGroup.add(basalMassif);
+
+    // Left & right sweeping snowfields across the col (Hörnli & Furgg glaciers)
+    const leftSnowfield = new THREE.Mesh(
+      new THREE.ConeGeometry(4.6, 8.2, 5),
+      alpineSnowMat
+    );
+    leftSnowfield.scale.set(1.25, 1.0, 0.55);
+    leftSnowfield.position.set(-4.6, 5.4, 0.6);
+    leftSnowfield.rotation.z = 0.48;
+    leftSnowfield.rotation.x = 0.25;
+    saddleGroup.add(leftSnowfield);
+
+    const rightSnowShoulder = new THREE.Mesh(
+      new THREE.ConeGeometry(4.8, 9.4, 5),
+      alpineSnowMat
+    );
+    rightSnowShoulder.scale.set(1.3, 1.0, 0.58);
+    rightSnowShoulder.position.set(3.8, 6.2, 0.5);
+    rightSnowShoulder.rotation.z = -0.52;
+    rightSnowShoulder.rotation.x = 0.28;
+    saddleGroup.add(rightSnowShoulder);
+
+    group.add(saddleGroup);
+
+    // 3. LAYER 3: Iconic Crooked 4-Sided Pyramidal Matterhorn Horn Spire
+    const hornGroup = new THREE.Group();
+    hornGroup.name = 'matterhorn_horn_pyramid';
+
+    // Sunlit Left/East Face (warm grey-tan granite strata)
+    const sunlitLeftHorn = new THREE.Mesh(
+      new THREE.ConeGeometry(4.8, 17.8, 4),
+      sunlitEastRockMat
+    );
+    sunlitLeftHorn.position.set(-0.65, 13.8, -0.8);
+    sunlitLeftHorn.rotation.y = Math.PI * 0.24;
+    sunlitLeftHorn.rotation.z = -0.08;
+    hornGroup.add(sunlitLeftHorn);
+
+    // Dramatic Dark Navy-Slate North/Right Shadow Face (signature feature of user's Matterhorn photo)
+    const shadowRightFace = new THREE.Mesh(
+      new THREE.ConeGeometry(4.3, 16.8, 4),
+      shadowNorthSlateMat
+    );
+    shadowRightFace.position.set(0.45, 13.4, -0.55);
+    shadowRightFace.rotation.y = Math.PI * 0.32;
+    shadowRightFace.rotation.z = 0.06;
+    hornGroup.add(shadowRightFace);
+
+    // Central Hörnli Arête Crest Spine
+    const centralArete = new THREE.Mesh(
+      new THREE.ConeGeometry(2.6, 15.6, 4),
+      deepCliffMat
+    );
+    centralArete.scale.set(0.65, 1.0, 1.15);
+    centralArete.position.set(-0.15, 12.2, 0.65);
+    centralArete.rotation.x = 0.22;
+    hornGroup.add(centralArete);
+
+    // Hooked Snow-Capped Summit Crest (curving slightly to the left/east at y = 23.5..24.5m)
+    const hookedSummit = new THREE.Mesh(
+      new THREE.ConeGeometry(2.15, 5.8, 4),
+      alpineSnowMat
+    );
+    hookedSummit.name = 'matterhorn_hooked_summit';
+    hookedSummit.position.set(-0.95, 21.6, -0.75);
+    hookedSummit.rotation.y = Math.PI * 0.24;
+    hookedSummit.rotation.z = -0.18;
+    hornGroup.add(hookedSummit);
+
+    // Horizontal snow ledges & couloir bands on the horn
+    for (let s = 0; s < 3; s++) {
+      const snowBand = new THREE.Mesh(
+        new THREE.BoxGeometry(3.8 - s * 0.7, 0.55, 2.2 - s * 0.3),
+        alpineSnowMat
+      );
+      snowBand.position.set(-0.5, 11.2 + s * 3.1, 0.4 - s * 0.25);
+      snowBand.rotation.z = -0.18;
+      snowBand.rotation.y = 0.35;
+      hornGroup.add(snowBand);
     }
 
-    // Part 8 & 9: Turquoise Andean Glacial Cirque Tarn at Foot of Peak
-    const tarnRim = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.4, 3.8, 0.45, 14),
-      snowCorniceMat
-    );
-    tarnRim.position.set(0.5, 0.22, 5.8);
-    group.add(tarnRim);
+    group.add(hornGroup);
+    return group;
+  }
 
-    const tarnWater = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.1, 3.0, 0.52, 14),
-      tarnLakeMat
-    );
-    tarnWater.position.set(0.5, 0.26, 5.8);
-    group.add(tarnWater);
+  /**
+   * EARTH 1B. Đỉnh Đuôi Cá Machapuchare / Everest (Dãy Himalaya — Từ Ảnh Mẫu image.png)
+   * Reconstructed directly from the user's Nepal Annapurna / Machapuchare ("Fishtail" Peak) photograph:
+   * - Layer 1 (himalaya_golden_foothill): Warm golden-brown & russet-ochre Himalayan sub-alpine ridge on the front-left (#92400e / #78350f / #b45309) + dark silhouette rhododendron foliage on front-right (#1c1917)
+   * - Layer 2 (annapurna_fluted_buttresses): Massive steep white snow slopes (#f8fafc) heavily ribbed with craggy dark slate-blue granite buttresses (#334155 / #1e293b) & sweeping diagonal glacier avalanche chute on lower right
+   * - Layer 3 (machapuchare_fishtail_summit): Soaring ultra-steep granite-and-ice spire splitting at the top into TWO distinct jagged twin horns (the iconic "Fishtail" notch / Đỉnh Đuôi Cá) with a sheer sunlit triangular rock face (#cbd5e1)
+   */
+  private createHimalayaFishtailPeak(): THREE.Group {
+    const group = new THREE.Group();
+    group.name = 'himalaya_fishtail_peak_root';
+    this.addContactShadow(group, 11.6);
 
+    const russetFoothillMat = new THREE.MeshStandardMaterial({
+      color: 0x92400e,
+      roughness: 0.88,
+      flatShading: true,
+    });
+    const goldenOchreGrassMat = new THREE.MeshStandardMaterial({
+      color: 0xb45309,
+      roughness: 0.84,
+      flatShading: true,
+    });
+    const darkFoothillShadowMat = new THREE.MeshStandardMaterial({
+      color: 0x451a03,
+      roughness: 0.92,
+      flatShading: true,
+    });
+    const silhouetteFoliageMat = new THREE.MeshStandardMaterial({
+      color: 0x1c1917,
+      roughness: 0.9,
+      flatShading: true,
+    });
+    const himalayaSnowMat = new THREE.MeshStandardMaterial({
+      color: 0xf8fafc,
+      emissive: 0xe0f2fe,
+      emissiveIntensity: 0.18,
+      roughness: 0.3,
+      flatShading: true,
+    });
+    const slateGraniteMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      roughness: 0.86,
+      flatShading: true,
+    });
+    const darkNavyCragMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.9,
+      flatShading: true,
+    });
+    const sunlitGraniteTriangleMat = new THREE.MeshStandardMaterial({
+      color: 0xcbd5e1,
+      roughness: 0.72,
+      flatShading: true,
+    });
+
+    // 1. LAYER 1: Warm Golden-Brown & Russet Himalayan Foreground Foothill Ridge (Front-Left)
+    const foothillGroup = new THREE.Group();
+    foothillGroup.name = 'himalaya_golden_foothill';
+
+    const leftRussetRidge = new THREE.Mesh(
+      new THREE.ConeGeometry(6.2, 8.8, 6),
+      russetFoothillMat
+    );
+    leftRussetRidge.scale.set(1.35, 1.0, 0.85);
+    leftRussetRidge.position.set(-4.8, 3.8, 4.8);
+    leftRussetRidge.rotation.z = -0.35;
+    foothillGroup.add(leftRussetRidge);
+
+    const centerGoldenMound = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.2, 6.4, 3.6, 9),
+      goldenOchreGrassMat
+    );
+    centerGoldenMound.scale.set(1.3, 1.0, 0.82);
+    centerGoldenMound.position.set(-1.4, 1.8, 5.6);
+    foothillGroup.add(centerGoldenMound);
+
+    const shadowOutcrop = new THREE.Mesh(
+      new THREE.DodecahedronGeometry(2.6, 0),
+      darkFoothillShadowMat
+    );
+    shadowOutcrop.scale.set(1.4, 0.75, 0.9);
+    shadowOutcrop.position.set(-5.6, 1.9, 5.9);
+    foothillGroup.add(shadowOutcrop);
+
+    // Dark silhouette sub-alpine rhododendron/oak branches on the front-right (matching image.png bottom-right)
+    for (let t = 0; t < 5; t++) {
+      const tree = new THREE.Mesh(
+        new THREE.ConeGeometry(0.75 + (t % 2) * 0.2, 2.8 + (t % 3) * 0.6, 6),
+        silhouetteFoliageMat
+      );
+      tree.position.set(4.2 + t * 0.95, 1.4 + (t % 2) * 0.3, 5.8 - (t % 2) * 0.5);
+      foothillGroup.add(tree);
+    }
+    group.add(foothillGroup);
+
+    // 2. LAYER 2: Fluted White Snow Slopes, Craggy Slate-Blue Granite Ribs & Diagonal Glacier Chute
+    const buttressGroup = new THREE.Group();
+    buttressGroup.name = 'annapurna_fluted_buttresses';
+
+    const mainSnowMassif = new THREE.Mesh(
+      new THREE.ConeGeometry(9.6, 16.5, 8),
+      himalayaSnowMat
+    );
+    mainSnowMassif.scale.set(1.18, 1.0, 0.88);
+    mainSnowMassif.position.set(0.4, 8.2, -0.6);
+    buttressGroup.add(mainSnowMassif);
+
+    // Craggy dark slate-blue granite ribs & sub-peaks protruding through the snow face
+    const cragSpecs = [
+      { x: -5.4, y: 8.6, z: -0.4, r: 2.8, h: 11.2, tiltZ: 0.28, mat: darkNavyCragMat },
+      { x: 4.8, y: 9.8, z: -0.5, r: 3.6, h: 12.8, tiltZ: -0.22, mat: slateGraniteMat },
+      { x: 7.2, y: 7.4, z: 0.4, r: 2.9, h: 9.6, tiltZ: -0.35, mat: darkNavyCragMat },
+      { x: -1.6, y: 9.2, z: 1.8, r: 2.4, h: 10.4, tiltZ: 0.12, mat: slateGraniteMat },
+      { x: 2.2, y: 8.8, z: 2.1, r: 2.5, h: 9.8, tiltZ: -0.15, mat: darkNavyCragMat },
+      { x: 0.2, y: 6.4, z: 3.2, r: 2.8, h: 7.8, tiltZ: 0.05, mat: slateGraniteMat },
+    ];
+    for (const cs of cragSpecs) {
+      const crag = new THREE.Mesh(
+        new THREE.ConeGeometry(cs.r, cs.h, 5),
+        cs.mat
+      );
+      crag.scale.set(1.1, 1.0, 0.65);
+      crag.position.set(cs.x, cs.y, cs.z);
+      crag.rotation.z = cs.tiltZ;
+      buttressGroup.add(crag);
+    }
+
+    // Sweeping white diagonal glacier avalanche chute on the lower-right slope (as seen in image.png)
+    const glacierChute = new THREE.Mesh(
+      new THREE.BoxGeometry(2.6, 9.8, 0.95),
+      himalayaSnowMat
+    );
+    glacierChute.position.set(4.6, 4.8, 3.1);
+    glacierChute.rotation.z = 0.58;
+    glacierChute.rotation.x = 0.42;
+    buttressGroup.add(glacierChute);
+
+    group.add(buttressGroup);
+
+    // 3. LAYER 3: Iconic Twin-Horned "Fishtail" (Machapuchare) Summit Spire
+    const summitGroup = new THREE.Group();
+    summitGroup.name = 'machapuchare_fishtail_summit';
+
+    // Sheer sunlit triangular upper rock face (#cbd5e1) below the twin horns
+    const triangularFace = new THREE.Mesh(
+      new THREE.ConeGeometry(4.4, 14.2, 4),
+      sunlitGraniteTriangleMat
+    );
+    triangularFace.scale.set(1.05, 1.0, 0.72);
+    triangularFace.position.set(-0.6, 16.2, -0.8);
+    triangularFace.rotation.y = Math.PI * 0.25;
+    summitGroup.add(triangularFace);
+
+    // Left Horn of the Fishtail Notch (sharp white-and-slate tooth at y = 24.2m)
+    const leftFishtailHorn = new THREE.Mesh(
+      new THREE.ConeGeometry(1.85, 7.6, 4),
+      himalayaSnowMat
+    );
+    leftFishtailHorn.name = 'fishtail_left_horn';
+    leftFishtailHorn.position.set(-2.15, 20.4, -0.85);
+    leftFishtailHorn.rotation.z = 0.14;
+    summitGroup.add(leftFishtailHorn);
+
+    // Right Main Horn of the Fishtail Notch (higher sharp spire at y = 25.5m)
+    const rightFishtailHorn = new THREE.Mesh(
+      new THREE.ConeGeometry(2.15, 9.2, 4),
+      himalayaSnowMat
+    );
+    rightFishtailHorn.name = 'fishtail_right_horn';
+    rightFishtailHorn.position.set(-0.25, 21.2, -0.75);
+    rightFishtailHorn.rotation.z = -0.09;
+    summitGroup.add(rightFishtailHorn);
+
+    // Knife-edge West Ice Arête sweeping down to the left
+    const westIceArete = new THREE.Mesh(
+      new THREE.ConeGeometry(1.9, 13.5, 4),
+      himalayaSnowMat
+    );
+    westIceArete.scale.set(0.65, 1.0, 0.85);
+    westIceArete.position.set(-3.2, 14.5, -0.6);
+    westIceArete.rotation.z = 0.36;
+    summitGroup.add(westIceArete);
+
+    group.add(summitGroup);
     return group;
   }
 

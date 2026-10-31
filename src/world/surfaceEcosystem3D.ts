@@ -4,8 +4,9 @@ import {
   FLOWER_SPECIES_CATALOG,
   FlowerSpeciesId,
   MicroStrokeStamp,
+  TextureBrushId,
   TEXTURE_BRUSHES,
-} from './terrainEngine';
+} from './registry';
 
 // Deterministic pseudo-random helper from seed integer
 function seededRandom(seed: number): number {
@@ -169,14 +170,15 @@ function populate3DGrassBlades(
   radius: number,
   grassHeightCm: number,
   seedBase: number,
-  densityMultiplier = 1.0
+  densityMultiplier = 1.0,
+  tintHex?: number
 ) {
   const clampedCm = Math.max(3.0, Math.min(5.0, grassHeightCm || DEFAULT_GRASS_HEIGHT_CM));
   // Scale factor strictly proportional to 3cm..5cm setting (0.75x at 3cm -> 1.25x at 5cm)
   const cmRatio = clampedCm / 4.0;
 
   const bladeMatDark = new THREE.MeshStandardMaterial({
-    color: 0x16a34a,
+    color: tintHex ?? 0x16a34a,
     roughness: 0.68,
     flatShading: true,
   });
@@ -250,94 +252,95 @@ function populate3DGrassBlades(
   }
 }
 
+function populate3DFlowers(
+  targetGroup: THREE.Group,
+  radius: number,
+  species: FlowerSpeciesId,
+  colorHex: string,
+  seedBase: number,
+  countMultiplier = 1.0
+) {
+  const flowerCount = Math.min(
+    28,
+    Math.max(8, Math.round(Math.sqrt(radius) * 6.5 * countMultiplier))
+  );
+  const flowerScale = Math.min(1.55, Math.max(0.85, radius / 7));
+
+  for (let i = 0; i < flowerCount; i++) {
+    const rNorm = Math.sqrt(seededRandom(seedBase + i * 23 + 9)) * 0.84;
+    const angle = seededRandom(seedBase + i * 41 + 3) * Math.PI * 2;
+    const fx = Math.cos(angle) * rNorm * radius;
+    const fz = Math.sin(angle) * rNorm * radius;
+
+    const flower = build3DFlowerModel(
+      species,
+      colorHex,
+      flowerScale * (0.85 + seededRandom(seedBase + i * 11) * 0.35)
+    );
+    flower.position.set(fx, 0.02, fz);
+    flower.rotation.y = seededRandom(seedBase + i * 59) * Math.PI * 2;
+    flower.userData.isFlowerStem = true;
+    flower.userData.swayPhase = i * 0.9;
+    targetGroup.add(flower);
+  }
+}
+
+export interface PatchBuildContext {
+  root: THREE.Group;
+  st: MicroStrokeStamp;
+  radius: number;
+  seedBase: number;
+  grassHeightCm: number;
+  flowerSpecies: FlowerSpeciesId;
+  flowerColorHex: string;
+}
+
+export type PatchBuilder = (ctx: PatchBuildContext) => void;
+
 /**
- * Builds a complete, animated 3D surface ecosystem patch for a MicroStrokeStamp:
- * - `emerald_grass`: Real 3D grass blades (`3-5 cm` adjustable height) swaying in the wind
- * - `flower_meadow`: Real 3D multi-petal flowers (customizable species & color) on a 3-5cm 3D grass bed
- * - `desert_sand`: 3D sculpted golden sand dunes, wind-ripple ridges & swirling sand particles
- * - `volcanic_lava`: Glowing flowing molten magma veins + rising 3D volcanic smoke plumes & glowing embers
- * - `river_stream` / `lake_water`: Animated 3D water current ripples & whitewater foam rings
- * - `dirt_cobble_road`: 3D cobblestone pavers & roadside grass tufts
- * - `limestone_cliff`: 3D craggy rock boulders
- * - `glacier_snow`: 3D snowdrifts, ice crystals & falling snowflakes
+ * Exhaustive compile-time registry of all 18 TextureBrushId surface builders.
+ * If a new TextureBrushId is added to terrainEngine.ts without registering here,
+ * TypeScript will immediately fail compilation (`tsc --noEmit`).
  */
-export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1): THREE.Group {
-  const root = new THREE.Group();
-  const radius = Math.max(1, st.radius);
-  const bCfg = TEXTURE_BRUSHES[st.brushId] || TEXTURE_BRUSHES.emerald_grass;
-  const seedBase = Math.round(Math.abs(st.x * 37 + st.z * 53 + indexSeed * 19));
-
-  root.userData.strokeId = st.id;
-  root.userData.brushId = st.brushId;
-  root.userData.grassHeightCm = st.grassHeightCm ?? DEFAULT_GRASS_HEIGHT_CM;
-  root.userData.flowerSpecies = st.flowerSpecies ?? 'sakura_bloom';
-  root.userData.flowerColorHex = st.flowerColorHex ?? '#f472b6';
-
-  // 1. Smooth 64-segment Vector Base Disc
-  const discGeo = new THREE.CircleGeometry(radius, 64);
-  discGeo.rotateX(-Math.PI / 2);
-
-  const isWater = st.brushId === 'river_stream' || st.brushId === 'lake_water';
-  const isLava = st.brushId === 'volcanic_lava';
-
-  const baseMat = new THREE.MeshStandardMaterial({
-    color: bCfg.swatchHex,
-    emissive: isLava ? 0xdc2626 : 0x000000,
-    emissiveIntensity: isLava ? 0.45 : 0,
-    roughness: bCfg.roughness,
-    metalness: isWater ? 0.28 : 0.04,
-    polygonOffset: true,
-    polygonOffsetFactor: -1,
-    polygonOffsetUnits: -1,
-  });
-  const baseDisc = new THREE.Mesh(discGeo, baseMat);
-  baseDisc.position.y = 0.02;
-  root.add(baseDisc);
-
-  // 2. Specialized 3D Physical Details by Surface Type
-  if (st.brushId === 'emerald_grass') {
-    populate3DGrassBlades(
-      root,
-      radius,
-      st.grassHeightCm ?? DEFAULT_GRASS_HEIGHT_CM,
-      seedBase,
-      1.15
-    );
-  } else if (st.brushId === 'flower_meadow') {
-    // Underlying 3-5cm 3D grass bed
-    populate3DGrassBlades(
-      root,
-      radius,
-      st.grassHeightCm ?? DEFAULT_GRASS_HEIGHT_CM,
-      seedBase,
-      0.85
-    );
-
-    // 3D Flowers with user-selected species & petal color
-    const species: FlowerSpeciesId = st.flowerSpecies || 'sakura_bloom';
-    const colorHex: string = st.flowerColorHex || '#f472b6';
-    const flowerCount = Math.min(28, Math.max(12, Math.round(Math.sqrt(radius) * 6.5)));
-    const flowerScale = Math.min(1.55, Math.max(0.85, radius / 7));
-
-    for (let i = 0; i < flowerCount; i++) {
-      const rNorm = Math.sqrt(seededRandom(seedBase + i * 23 + 9)) * 0.84;
-      const angle = seededRandom(seedBase + i * 41 + 3) * Math.PI * 2;
-      const fx = Math.cos(angle) * rNorm * radius;
-      const fz = Math.sin(angle) * rNorm * radius;
-
-      const flower = build3DFlowerModel(
-        species,
-        colorHex,
-        flowerScale * (0.85 + seededRandom(seedBase + i * 11) * 0.35)
+export const PATCH_BUILDERS: Record<TextureBrushId, PatchBuilder> = {
+  earth_soil: ({ root, radius, seedBase }) => {
+    const soilClodMat = new THREE.MeshStandardMaterial({
+      color: 0x785532,
+      roughness: 0.92,
+      flatShading: true,
+    });
+    const pebbleMat = new THREE.MeshStandardMaterial({
+      color: 0x57534e,
+      roughness: 0.88,
+      flatShading: true,
+    });
+    const clodCount = Math.min(12, Math.max(5, Math.round(radius * 0.85)));
+    for (let i = 0; i < clodCount; i++) {
+      const rNorm = Math.sqrt(seededRandom(seedBase + i * 17)) * 0.78;
+      const ang = seededRandom(seedBase + i * 31) * Math.PI * 2;
+      const cSize = Math.max(0.22, Math.min(0.75, radius * 0.08));
+      const clod = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(cSize, 0),
+        i % 3 === 0 ? pebbleMat : soilClodMat
       );
-      flower.position.set(fx, 0.02, fz);
-      flower.rotation.y = seededRandom(seedBase + i * 59) * Math.PI * 2;
-      flower.userData.isFlowerStem = true;
-      flower.userData.swayPhase = i * 0.9;
-      root.add(flower);
+      clod.scale.set(1.3, 0.45, 1.1);
+      clod.position.set(
+        Math.cos(ang) * rNorm * radius,
+        cSize * 0.18,
+        Math.sin(ang) * rNorm * radius
+      );
+      clod.rotation.y = i * 0.7;
+      root.add(clod);
     }
-  } else if (st.brushId === 'desert_sand') {
-    // 3D Sculpted Sand Dunes, Wind-Ripple Ridges & Swirling Sand Grains
+  },
+  emerald_grass: ({ root, radius, grassHeightCm, seedBase }) => {
+    populate3DGrassBlades(root, radius, grassHeightCm, seedBase, 1.15);
+  },
+  flower_meadow: ({ root, radius, grassHeightCm, flowerSpecies, flowerColorHex, seedBase }) => {
+    populate3DGrassBlades(root, radius, grassHeightCm, seedBase, 0.85);
+    populate3DFlowers(root, radius, flowerSpecies, flowerColorHex, seedBase, 1.0);
+  },
+  desert_sand: ({ root, radius, seedBase }) => {
     const duneMatMain = new THREE.MeshStandardMaterial({
       color: 0xf59e0b,
       roughness: 0.86,
@@ -367,7 +370,6 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       root.add(dune);
     }
 
-    // Concentric 3D Wind-Ripple Sand Rings
     for (let rIdx = 1; rIdx <= 3; rIdx++) {
       const innerR = radius * (rIdx * 0.24);
       const outerR = innerR + Math.max(0.18, radius * 0.035);
@@ -378,7 +380,6 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       root.add(ripple);
     }
 
-    // Swirling 3D Desert Sand Grains
     const grainGeo = new THREE.OctahedronGeometry(Math.max(0.08, Math.min(0.22, radius * 0.025)), 0);
     const grainMat = new THREE.MeshBasicMaterial({
       color: 0xfef08a,
@@ -396,8 +397,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       grain.userData.baseHeight = 0.3 + (g % 4) * 0.25;
       root.add(grain);
     }
-  } else if (st.brushId === 'volcanic_lava') {
-    // 1) Dark Volcanic Basalt Crust Rim
+  },
+  volcanic_lava: ({ root, radius, seedBase }) => {
     const rimGeo = new THREE.RingGeometry(radius * 0.86, radius * 1.03, 48);
     rimGeo.rotateX(-Math.PI / 2);
     const rimMat = new THREE.MeshStandardMaterial({
@@ -409,13 +410,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
     rimMesh.position.y = 0.06;
     root.add(rimMesh);
 
-    // 2) Animated Flowing Molten Magma Currents / Waves
-    const flowMatOrange = new THREE.MeshBasicMaterial({
-      color: 0xf97316,
-    });
-    const flowMatYellow = new THREE.MeshBasicMaterial({
-      color: 0xfacc15,
-    });
+    const flowMatOrange = new THREE.MeshBasicMaterial({ color: 0xf97316 });
+    const flowMatYellow = new THREE.MeshBasicMaterial({ color: 0xfacc15 });
 
     for (let w = 0; w < 6; w++) {
       const waveRadius = radius * (0.16 + w * 0.12);
@@ -433,7 +429,6 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       root.add(waveMesh);
     }
 
-    // 3) Rising 3D Volcanic Smoke Plumes & Glowing Embers
     const smokeMatDark = new THREE.MeshStandardMaterial({
       color: 0x3f3f46,
       roughness: 0.95,
@@ -448,9 +443,7 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       opacity: 0.58,
       flatShading: true,
     });
-    const emberMat = new THREE.MeshBasicMaterial({
-      color: 0xfb923c,
-    });
+    const emberMat = new THREE.MeshBasicMaterial({ color: 0xfb923c });
 
     const basePuffSize = Math.max(0.28, Math.min(1.2, radius * 0.11));
     const smokeGeo = new THREE.DodecahedronGeometry(basePuffSize, 0);
@@ -491,8 +484,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       ember.userData.maxRiseHeight = maxRise * 0.9;
       root.add(ember);
     }
-  } else if (st.brushId === 'river_stream' || st.brushId === 'lake_water') {
-    // Animated Water Ripples & Whitewater Current Rings
+  },
+  river_stream: ({ root, radius }) => {
     const foamMat = new THREE.MeshBasicMaterial({
       color: 0xe0f2fe,
       transparent: true,
@@ -508,8 +501,25 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       ripple.userData.rippleIndex = r;
       root.add(ripple);
     }
-  } else if (st.brushId === 'dirt_cobble_road') {
-    // 3D Cobblestone Pavers + Roadside Grass Tufts
+  },
+  lake_water: ({ root, radius }) => {
+    const foamMat = new THREE.MeshBasicMaterial({
+      color: 0xe0f2fe,
+      transparent: true,
+      opacity: 0.65,
+    });
+    for (let r = 0; r < 4; r++) {
+      const rInner = radius * (0.2 + r * 0.18);
+      const ringGeo = new THREE.RingGeometry(rInner, rInner + Math.max(0.14, radius * 0.03), 48);
+      ringGeo.rotateX(-Math.PI / 2);
+      const ripple = new THREE.Mesh(ringGeo, foamMat);
+      ripple.position.y = 0.06 + r * 0.004;
+      ripple.userData.isWaterRipple = true;
+      ripple.userData.rippleIndex = r;
+      root.add(ripple);
+    }
+  },
+  dirt_cobble_road: ({ root, radius, seedBase }) => {
     const stoneMat1 = new THREE.MeshStandardMaterial({
       color: 0xa8a29e,
       roughness: 0.85,
@@ -536,8 +546,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       stone.rotation.y = i * 0.6;
       root.add(stone);
     }
-  } else if (st.brushId === 'limestone_cliff') {
-    // 3D Craggy Limestone Boulders
+  },
+  limestone_cliff: ({ root, radius, seedBase }) => {
     const rockMat = new THREE.MeshStandardMaterial({
       color: 0x64748b,
       roughness: 0.88,
@@ -557,8 +567,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       rock.rotation.set(i * 0.4, i * 0.8, 0);
       root.add(rock);
     }
-  } else if (st.brushId === 'glacier_snow') {
-    // 3D Snow Mounds & Sparkling Ice Crystals
+  },
+  glacier_snow: ({ root, radius, seedBase }) => {
     const iceMat = new THREE.MeshStandardMaterial({
       color: 0xe0f2fe,
       emissive: 0x38bdf8,
@@ -578,8 +588,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       );
       root.add(shard);
     }
-  } else if (st.brushId === 'mars_regolith') {
-    // 3D Martian Iron-Oxide Hematite Rocks + Swirling Red Dust Particles
+  },
+  mars_regolith: ({ root, radius, seedBase }) => {
     const marsRockMat = new THREE.MeshStandardMaterial({
       color: 0xc2410c,
       roughness: 0.9,
@@ -615,8 +625,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       dustGrain.userData.baseHeight = 0.45 + (p % 3) * 0.35;
       root.add(dustGrain);
     }
-  } else if (st.brushId === 'venus_sulfur') {
-    // 3D Venusian Sulfur Fumarole Vents + Rising Sulfuric Gas Puffs
+  },
+  venus_sulfur: ({ root, radius, seedBase }) => {
     const sulfurConeMat = new THREE.MeshStandardMaterial({
       color: 0xca8a04,
       roughness: 0.82,
@@ -662,8 +672,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       puff.userData.maxRiseHeight = Math.max(3.5, radius * 0.5);
       root.add(puff);
     }
-  } else if (st.brushId === 'exoplanet_basalt') {
-    // 3D Alien Silicate Crystal Shards & Dark Basalt Hex Columns
+  },
+  exoplanet_basalt: ({ root, radius, seedBase }) => {
     const basaltMat = new THREE.MeshStandardMaterial({
       color: 0x3b0764,
       roughness: 0.72,
@@ -691,8 +701,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       shard.rotation.z = (i % 2 === 0 ? 1 : -1) * 0.18;
       root.add(shard);
     }
-  } else if (st.brushId === 'pluto_nitrogen_ice') {
-    // 3D Pluto Nitrogen-Ice Penitentes Spikes + Dark Red Cthulhu Tholin Frost & Cryo Vapor
+  },
+  pluto_nitrogen_ice: ({ root, radius, seedBase }) => {
     const cryoSpikeMat = new THREE.MeshStandardMaterial({
       color: 0x67e8f9,
       emissive: 0x0284c7,
@@ -721,8 +731,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       blade.rotation.z = 0.15;
       root.add(blade);
     }
-  } else if (st.brushId === 'titan_methane_liquid') {
-    // 3D Titan Liquid Methane-Ethane Waves + Rounded Huygens Ice Pebbles + Bubbling Methane Gas
+  },
+  titan_methane_liquid: ({ root, radius, seedBase }) => {
     const methaneWaveMat = new THREE.MeshBasicMaterial({
       color: 0xfbbf24,
       transparent: true,
@@ -775,8 +785,8 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       bubble.userData.maxRiseHeight = Math.max(3.2, radius * 0.45);
       root.add(bubble);
     }
-  } else if (brushId === 'atacama_salt_crust') {
-    // Atacama Salar Polygonal Salt Crust Ridges + Gobi Desert Pebbles & Swirling Salt Dust
+  },
+  atacama_salt_crust: ({ root, radius, seedBase }) => {
     const saltRidgeMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       emissive: 0xfef2f2,
@@ -816,10 +826,10 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       pebble.position.set(Math.cos(ang) * dist, pSize * 0.22, Math.sin(ang) * dist);
       root.add(pebble);
     }
-  } else if (brushId === 'tropical_rainforest_floor') {
-    // Amazon & Congo Tropical Rainforest Floor: Dense 3-5cm emerald grass + broadleaf tropical ferns & orchids
-    populate3DGrassBlades(root, radius, grassHeightCm, 0x059669, seedBase, 0.85);
-    populate3DFlowers(root, radius, 'lotus_water', '#fb7185', seedBase + 303);
+  },
+  tropical_rainforest_floor: ({ root, radius, grassHeightCm, seedBase }) => {
+    populate3DGrassBlades(root, radius, grassHeightCm, seedBase, 0.85, 0x059669);
+    populate3DFlowers(root, radius, 'lotus_waterlily', '#fb7185', seedBase + 303);
 
     const fernMat = new THREE.MeshStandardMaterial({
       color: 0x10b981,
@@ -851,9 +861,9 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
       }
       root.add(frondGroup);
     }
-  } else if (brushId === 'taiga_moss_needles') {
-    // Boreal Taiga Coniferous Floor: Deep pine moss blades + fallen pine cones & snow-frosted granite stones
-    populate3DGrassBlades(root, radius, grassHeightCm * 0.85, 0x15803d, seedBase, 0.72);
+  },
+  taiga_moss_needles: ({ root, radius, grassHeightCm, seedBase }) => {
+    populate3DGrassBlades(root, radius, grassHeightCm * 0.85, seedBase, 0.72, 0x15803d);
 
     const coneMat = new THREE.MeshStandardMaterial({
       color: 0x78350f,
@@ -896,7 +906,91 @@ export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1)
         root.add(pineCone);
       }
     }
-  }
+  },
+};
+
+/**
+ * Recursively disposes geometries and materials of a 3D Group/Object3D
+ * to prevent GPU memory leaks when surface patches or prefabs are removed.
+ */
+export function disposeObject3DTree(root: THREE.Object3D): void {
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+    if (mesh.material) {
+      if (Array.isArray(mesh.material)) {
+        for (const m of mesh.material) {
+          m.dispose();
+        }
+      } else {
+        mesh.material.dispose();
+      }
+    }
+  });
+}
+
+
+/**
+ * Builds a complete, animated 3D surface ecosystem patch for a MicroStrokeStamp:
+ * - `emerald_grass`: Real 3D grass blades (`3-5 cm` adjustable height) swaying in the wind
+ * - `flower_meadow`: Real 3D multi-petal flowers (customizable species & color) on a 3-5cm 3D grass bed
+ * - `desert_sand`: 3D sculpted golden sand dunes, wind-ripple ridges & swirling sand particles
+ * - `volcanic_lava`: Glowing flowing molten magma veins + rising 3D volcanic smoke plumes & glowing embers
+ * - `river_stream` / `lake_water`: Animated 3D water current ripples & whitewater foam rings
+ * - `dirt_cobble_road`: 3D cobblestone pavers & roadside grass tufts
+ * - `limestone_cliff`: 3D craggy rock boulders
+ * - `glacier_snow`: 3D snowdrifts, ice crystals & falling snowflakes
+ */
+export function createSurfaceEcosystemPatch(st: MicroStrokeStamp, indexSeed = 1): THREE.Group {
+  const root = new THREE.Group();
+  const radius = Math.max(1, st.radius);
+  const bCfg = TEXTURE_BRUSHES[st.brushId] || TEXTURE_BRUSHES.emerald_grass;
+  const seedBase = Math.round(Math.abs(st.x * 37 + st.z * 53 + indexSeed * 19));
+
+  root.userData.strokeId = st.id;
+  root.userData.brushId = st.brushId;
+  root.userData.grassHeightCm = st.grassHeightCm ?? DEFAULT_GRASS_HEIGHT_CM;
+  root.userData.flowerSpecies = st.flowerSpecies ?? 'sakura_bloom';
+  root.userData.flowerColorHex = st.flowerColorHex ?? '#f472b6';
+
+  // 1. Smooth 64-segment Vector Base Disc
+  const discGeo = new THREE.CircleGeometry(radius, 64);
+  discGeo.rotateX(-Math.PI / 2);
+
+  const isWater = st.brushId === 'river_stream' || st.brushId === 'lake_water';
+  const isLava = st.brushId === 'volcanic_lava';
+
+  const baseMat = new THREE.MeshStandardMaterial({
+    color: bCfg.swatchHex,
+    emissive: isLava ? 0xdc2626 : 0x000000,
+    emissiveIntensity: isLava ? 0.45 : 0,
+    roughness: bCfg.roughness,
+    metalness: isWater ? 0.28 : 0.04,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  const baseDisc = new THREE.Mesh(discGeo, baseMat);
+  baseDisc.position.y = 0.02;
+  root.add(baseDisc);
+
+  // 2. Specialized 3D Physical Details via exhaustive PATCH_BUILDERS registry
+  const grassHeightCm = st.grassHeightCm ?? DEFAULT_GRASS_HEIGHT_CM;
+  const flowerSpecies: FlowerSpeciesId = st.flowerSpecies ?? 'sakura_bloom';
+  const flowerColorHex = st.flowerColorHex ?? '#f472b6';
+
+  const builder = PATCH_BUILDERS[st.brushId] || PATCH_BUILDERS.earth_soil;
+  builder({
+    root,
+    st,
+    radius,
+    seedBase,
+    grassHeightCm,
+    flowerSpecies,
+    flowerColorHex,
+  });
 
   return root;
 }

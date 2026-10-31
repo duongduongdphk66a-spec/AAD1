@@ -16,11 +16,13 @@ import {
   PlacedObject,
   PrefabId,
   PREFAB_CATALOG,
+  WORLD_SIZE,
+} from '../world/registry';
+import { getGroundHeightAt } from '../world/sculpting';
+import {
   reconstructFromRgbaBuffer,
   ReconstructedWorldData,
-  WORLD_SIZE,
-  getGroundHeightAt,
-} from '../world/terrainEngine';
+} from '../world/generation';
 import {
   SAMPLE_PHOTO_PRESETS,
   SamplePhotoPreset,
@@ -46,7 +48,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   onClose,
   onApplyReconstruction,
 }) => {
-  const [selectedPresetId, setSelectedPresetId] = useState<string>('alpine_valley');
+  const [selectedPresetId, setSelectedPresetId] = useState<string>('island_volcano_ref');
   const [customImageName, setCustomImageName] = useState<string | null>(null);
   const [previewDataUrl, setPreviewDataUrl] = useState<string>('');
   const [heightmapPreviewUrl, setHeightmapPreviewUrl] = useState<string>('');
@@ -135,28 +137,71 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     return result;
   };
 
-  // Load initial preset when modal opens
-  useEffect(() => {
-    if (!isOpen) return;
-    const preset = SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
+  const loadPresetWithOptionalImage = (
+    preset: SamplePhotoPreset,
+    nextRelief: number,
+    nextTerrace: number,
+    nextBiome: BiomeId | 'auto',
+    nextMode: 'both' | 'terrain' | 'object'
+  ) => {
     const rendered = renderSamplePresetToDataUrl(preset, 160);
     rgbaBufferRef.current = {
       rgba: rendered.rgba,
       width: rendered.width,
       height: rendered.height,
     };
-    setPreviewDataUrl(rendered.dataUrl);
+    setPreviewDataUrl(preset.imageUrl || rendered.dataUrl);
     setRegionTitle(preset.title);
     setSummaryText(preset.description);
     runLocalReconstruction(
       rendered.rgba,
       rendered.width,
       rendered.height,
-      reliefScale,
-      terraceSteps,
-      overrideBiome,
-      mode
+      nextRelief,
+      nextTerrace,
+      nextBiome,
+      nextMode
     );
+
+    if (preset.imageUrl) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const targetSize = 160;
+        canvas.width = targetSize;
+        canvas.height = targetSize;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillRect(0, 0, targetSize, targetSize);
+        ctx.drawImage(img, 0, 0, targetSize, targetSize);
+        const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
+        rgbaBufferRef.current = {
+          rgba: imgData.data,
+          width: targetSize,
+          height: targetSize,
+        };
+        runLocalReconstruction(
+          imgData.data,
+          targetSize,
+          targetSize,
+          nextRelief,
+          nextTerrace,
+          nextBiome,
+          nextMode
+        );
+      };
+      img.src = preset.imageUrl;
+    }
+  };
+
+  // Load initial preset when modal opens
+  useEffect(() => {
+    if (!isOpen) return;
+    const preset =
+      SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
+    loadPresetWithOptionalImage(preset, reliefScale, terraceSteps, overrideBiome, mode);
   }, [isOpen]);
 
   // Re-run local pixel heightfield whenever sliders change
@@ -187,19 +232,8 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     setSelectedPresetId(preset.id);
     setCustomImageName(null);
     setMode(preset.mode);
-    const rendered = renderSamplePresetToDataUrl(preset, 160);
-    rgbaBufferRef.current = {
-      rgba: rendered.rgba,
-      width: rendered.width,
-      height: rendered.height,
-    };
-    setPreviewDataUrl(rendered.dataUrl);
-    setRegionTitle(preset.title);
-    setSummaryText(preset.description);
-    runLocalReconstruction(
-      rendered.rgba,
-      rendered.width,
-      rendered.height,
+    loadPresetWithOptionalImage(
+      preset,
       reliefScale,
       terraceSteps,
       overrideBiome,
@@ -217,7 +251,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        const targetSize = 160;
+        const targetSize = 256;
         canvas.width = targetSize;
         canvas.height = targetSize;
         const ctx = canvas.getContext('2d')!;
@@ -231,7 +265,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         };
         setCustomImageName(file.name);
         setSelectedPresetId('custom');
-        setPreviewDataUrl(canvas.toDataURL('image/jpeg', 0.9));
+        setPreviewDataUrl(canvas.toDataURL('image/jpeg', 0.92));
 
         const localResult = runLocalReconstruction(
           imgData.data,
@@ -271,12 +305,16 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         mode
       );
 
+      const detectedMime = previewDataUrl.startsWith('data:image/jpeg')
+        ? 'image/jpeg'
+        : 'image/png';
+
       const response = await fetch('/api/reconstruct', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           imageBase64: previewDataUrl,
-          mimeType: 'image/png',
+          mimeType: detectedMime,
           mode,
           clientMetrics: localResult.metrics,
         }),
@@ -285,13 +323,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       const data = await response.json();
       if (data?.analysis) {
         const ai = data.analysis;
-        const validBiomes: BiomeId[] = [
-          'mondstadt_meadow',
-          'inazuma_sakura',
-          'liyue_amber',
-          'paldea_coast',
-          'snowpeak_glacier',
-        ];
+        const validBiomes = Object.keys(BIOMES) as BiomeId[];
         const aiBiome: BiomeId = validBiomes.includes(ai.biome)
           ? ai.biome
           : localResult.metrics.suggestedBiome;
@@ -325,11 +357,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                 : 'windmill_cottage';
               const rawX = Number(item.x) || 0;
               const rawZ = Number(item.z) || 0;
-              // Support either normalized (-50..50) or meter (-4000..4000) coordinates from AI
-              const scaledX = Math.abs(rawX) <= 60 ? rawX * 70 : rawX;
-              const scaledZ = Math.abs(rawZ) <= 60 ? rawZ * 70 : rawZ;
-              const wx = Math.max(-3800, Math.min(3800, scaledX));
-              const wz = Math.max(-3800, Math.min(3800, scaledZ));
+              // Keep placed objects within the visible 1:1 village/basin (-55m..+55m)
+              const normX = Math.abs(rawX) > 60 ? (rawX / 3600) * 45 : rawX;
+              const normZ = Math.abs(rawZ) > 60 ? (rawZ / 3600) * 45 : rawZ;
+              const wx = Math.max(-55, Math.min(55, normX));
+              const wz = Math.max(-55, Math.min(55, normZ));
               const wy = getGroundHeightAt(
                 updatedLocal.heightMap,
                 GRID_SIZE,
@@ -341,9 +373,9 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                 id: `ai-${i}-${pId}`,
                 prefabId: pId,
                 label: String(item.label || pId),
-                x: Math.round(wx),
-                y: Math.round(wy),
-                z: Math.round(wz),
+                x: Number(wx.toFixed(1)),
+                y: Number(wy.toFixed(2)),
+                z: Number(wz.toFixed(1)),
                 scale: Math.max(0.75, Math.min(1.6, Number(item.scale) || 1.05)),
                 rotationY: Number(item.rotationY) || 0,
               };

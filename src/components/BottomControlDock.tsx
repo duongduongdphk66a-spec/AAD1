@@ -20,6 +20,10 @@ import {
   Sprout,
   Wand2,
   Play,
+  Pause,
+  Moon,
+  Sparkles,
+  Upload,
   Check,
   X,
 } from 'lucide-react';
@@ -27,10 +31,10 @@ import {
   BiomeId,
   BIOMES,
   BRUSH_SCALE_PAGES,
+  DAY_NIGHT_PRESETS,
   FLOWER_COLOR_PALETTE,
   FLOWER_SPECIES_CATALOG,
   FlowerSpeciesId,
-  formatTerrainRuleFormula,
   getBrushPageIndexForRadius,
   MAX_GRASS_HEIGHT_CM,
   MIN_GRASS_HEIGHT_CM,
@@ -45,7 +49,11 @@ import {
   TEXTURE_BRUSHES,
   WeatherId,
   WEATHER_CATALOG,
-} from '../world/terrainEngine';
+} from '../world/registry';
+import {
+  formatTerrainRuleFormula,
+  formatTimeOfDayClock,
+} from '../world/generation';
 
 export type ActiveTabId = 'sculpt' | 'paint' | 'rules' | 'prefabs' | 'atmosphere';
 
@@ -111,13 +119,22 @@ interface BottomControlDockProps {
   onSetSelectedObjectScale: (scale: number) => void;
   onDeleteSelectedObject: () => void;
 
-  // World, Planetary Biomes & Weather state
+  // World, Planetary Biomes, Weather & Day/Night Cycle state
   activeBiome: BiomeId;
   onSelectBiome: (biome: BiomeId) => void;
   activeWeather: WeatherId;
   onSelectWeather: (weather: WeatherId) => void;
   sunElevation: number;
   onChangeSunElevation: (val: number) => void;
+  sunAzimuth?: number;
+  onChangeSunAzimuth?: (val: number) => void;
+  timeOfDay?: number;
+  onChangeTimeOfDay?: (val: number) => void;
+  isDayNightAuto?: boolean;
+  onToggleDayNightAuto?: () => void;
+  starlightMode?: boolean;
+  onToggleStarlightMode?: () => void;
+  onApplyDayNightPreset?: (presetId: string) => void;
   waterLevel: number;
   onChangeWaterLevel: (val: number) => void;
 
@@ -131,6 +148,7 @@ interface BottomControlDockProps {
   onOpenReconstructModal: () => void;
   onResetWorld: () => void;
   onExportWorldJson: () => void;
+  onImportWorldJson?: (file: File) => void;
 }
 
 const SCULPT_TOOLS: Array<{ id: SculptToolId; name: string }> = [
@@ -154,16 +172,19 @@ const SCULPT_TOOLS: Array<{ id: SculptToolId; name: string }> = [
 ];
 
 const RULE_PREFAB_OPTIONS: Array<{ id: PrefabId; label: string; defaultTex: TextureBrushId }> = [
+  { id: 'pluto_cryo_volcano', label: 'Núi Lửa Băng Wright Mons (Sao Diêm Vương — Từ Ảnh Mẫu)', defaultTex: 'pluto_nitrogen_ice' },
+  { id: 'europa_penitentes_spire', label: 'Mặt Cắt Rãnh Nứt Băng & Đại Dương Ngầm Europa (Từ Ảnh Mẫu)', defaultTex: 'pluto_nitrogen_ice' },
+  { id: 'himalaya_matterhorn_peak', label: 'Đỉnh Sừng Băng Matterhorn (Dãy Anpơ — Từ Ảnh Mẫu)', defaultTex: 'glacier_snow' },
+  { id: 'himalaya_fishtail_peak', label: 'Đỉnh Đuôi Cá Machapuchare / Everest (Himalaya — Từ Ảnh Mẫu)', defaultTex: 'glacier_snow' },
+  { id: 'mars_olympus_shield', label: 'Núi Lửa Khiên Olympus Mons (Sao Hỏa — Từ Ảnh Mẫu)', defaultTex: 'mars_regolith' },
+  { id: 'titan_mithrim_montes', label: 'Núi Rãnh Sao Mithrim / Doom Mons (Titan — Ảnh NASA JPL)', defaultTex: 'titan_methane_liquid' },
+  { id: 'island_volcano_icon', label: 'Núi Lửa Đảo Nhiệt Đới (Từ Ảnh Mẫu)', defaultTex: 'volcanic_lava' },
   { id: 'karst_mountain', label: 'Đá Nhọn (Đỉnh Đá Thạch Anh)', defaultTex: 'limestone_cliff' },
-  { id: 'himalaya_matterhorn_peak', label: 'Đỉnh Tuyết Himalaya / Anpơ / Andes', defaultTex: 'glacier_snow' },
   { id: 'sahara_atacama_oasis', label: 'Ốc Đảo Sahara & Tháp Đá Atacama', defaultTex: 'atacama_salt_crust' },
   { id: 'hawaii_kilauea_shield', label: 'Núi Lửa Khiên Kīlauea (Hawaii)', defaultTex: 'volcanic_lava' },
   { id: 'amazon_congo_canopy_tree', label: 'Đại Thụ Rừng Mưa Amazon / Trung Phi', defaultTex: 'tropical_rainforest_floor' },
   { id: 'taiga_spruce_grove', label: 'Rừng Lá Kim Taiga Tuyết Phủ', defaultTex: 'taiga_moss_needles' },
-  { id: 'pluto_cryo_volcano', label: 'Núi Lửa Băng Wright Mons (Sao Diêm Vương)', defaultTex: 'pluto_nitrogen_ice' },
   { id: 'titan_methane_geyser', label: 'Đảo Đá & Mạch Phun Metan (Titan)', defaultTex: 'titan_methane_liquid' },
-  { id: 'europa_penitentes_spire', label: 'Tháp Băng Penitentes (Vệ Tinh Europa)', defaultTex: 'pluto_nitrogen_ice' },
-  { id: 'mars_olympus_shield', label: 'Núi Lửa Olympus Mons (Sao Hỏa)', defaultTex: 'mars_regolith' },
   { id: 'venus_pancake_dome', label: 'Vòm Lưu Huỳnh (Sao Kim)', defaultTex: 'venus_sulfur' },
   { id: 'meteor_impact_crater', label: 'Hố Thiên Thạch & Lõi Sao Băng', defaultTex: 'exoplanet_basalt' },
   { id: 'exoplanet_crystal_spire', label: 'Tháp Tinh Thể Ngoại Hành Tinh', defaultTex: 'exoplanet_basalt' },
@@ -229,6 +250,15 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
   onSelectWeather,
   sunElevation,
   onChangeSunElevation,
+  sunAzimuth = 135,
+  onChangeSunAzimuth,
+  timeOfDay = 10.5,
+  onChangeTimeOfDay,
+  isDayNightAuto = false,
+  onToggleDayNightAuto,
+  starlightMode = false,
+  onToggleStarlightMode,
+  onApplyDayNightPreset,
   waterLevel,
   onChangeWaterLevel,
   canUndo,
@@ -237,10 +267,12 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
   onUndo,
   onResetWorld,
   onExportWorldJson,
+  onImportWorldJson,
 }) => {
   const [brushPageIndex, setBrushPageIndex] = useState<number>(() =>
     getBrushPageIndexForRadius(brushRadius)
   );
+  const jsonImportInputRef = useRef<HTMLInputElement | null>(null);
 
   // Quick Rule Builder state inside BottomControlDock
   const [newRuleOperator, setNewRuleOperator] = useState<RuleOperator>('>');
@@ -405,7 +437,7 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
                 }`}
               >
                 <Trees className="w-3 h-3" />
-                Công Trình & Hành Tinh (28)
+                Công Trình &amp; Hành Tinh ({PREFAB_CATALOG.length})
               </button>
               <button
                 type="button"
@@ -546,11 +578,39 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
                 type="button"
                 onClick={onExportWorldJson}
                 aria-label="Xuất dữ liệu bản đồ JSON"
+                data-testid="export-world-json-btn"
                 className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
               >
                 <Download className="w-3 h-3" />
-                JSON
+                Xuất JSON
               </button>
+              {onImportWorldJson && (
+                <>
+                  <input
+                    ref={jsonImportInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) {
+                        onImportWorldJson(f);
+                        e.target.value = '';
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => jsonImportInputRef.current?.click()}
+                    aria-label="Nhập dữ liệu bản đồ JSON"
+                    data-testid="import-world-json-btn"
+                    className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                  >
+                    <Upload className="w-3 h-3" />
+                    Nhập JSON
+                  </button>
+                </>
+              )}
               <button
                 type="button"
                 onClick={onToggleCollapse}
@@ -1102,7 +1162,7 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
                 <span className="text-pink-200 font-semibold whitespace-nowrap shrink-0">
                   Thời tiết (13):
                 </span>
-                <div className="flex items-center gap-1 pr-2 border-r border-slate-700/80 overflow-x-auto no-scrollbar max-w-[310px] xl:max-w-[400px]">
+                <div className="flex items-center gap-1 pr-2 border-r border-slate-700/80 overflow-x-auto no-scrollbar max-w-[270px] xl:max-w-[350px]">
                   {WEATHER_CATALOG.map((w) => {
                     const active = activeWeather === w.id;
                     return (
@@ -1128,18 +1188,21 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
                   })}
                 </div>
                 <div className="flex items-center gap-1">
-                  <span className="text-slate-300">Nắng:</span>
+                  <span className="text-slate-300">Cao nắng:</span>
                   <input
                     id="sun-angle-slider"
+                    data-testid="sun-elevation-slider"
                     type="range"
-                    min={15}
+                    min={-55}
                     max={80}
                     step={1}
-                    value={sunElevation}
+                    value={Math.round(sunElevation)}
                     onChange={(e) => onChangeSunElevation(Number(e.target.value))}
                     className="w-12 h-1 accent-amber-400 cursor-pointer"
                   />
-                  <span className="font-mono text-amber-300 text-[10px]">{sunElevation}°</span>
+                  <span className="font-mono text-amber-300 text-[10px]">
+                    {Math.round(sunElevation)}°
+                  </span>
                 </div>
                 <div className="flex items-center gap-1">
                   <span className="text-slate-300">Mực nước:</span>
@@ -1159,7 +1222,116 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
             )}
           </div>
 
-          {/* ROW 3 (Only in Paint Mode, ultra-slim 24px bar): Grass 3-5cm + Flower Species + Flower Colors + Fill Map */}
+          {/* ROW 3A (Atmosphere Mode): Day/Night Cycle (00:00–24:00), Sun Azimuth Shadows (0°–360°), Presets & Starlight Mode */}
+          {activeTab === 'atmosphere' && (
+            <div
+              data-testid="day-night-cycle-bar"
+              className="flex flex-nowrap items-center justify-between gap-2 px-2 py-0.5 rounded-lg bg-[#0b111c] border border-indigo-500/40 overflow-x-auto no-scrollbar text-[10px]"
+            >
+              {/* 1. Time of Day Slider + Auto Day/Night Cycle Play/Pause */}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <Sun className="w-3 h-3 text-amber-400 shrink-0" />
+                <span className="text-slate-300 font-medium whitespace-nowrap">
+                  Chu kỳ Ngày/Đêm:
+                </span>
+                <input
+                  id="time-of-day-slider"
+                  data-testid="time-of-day-slider"
+                  aria-label="Chu kỳ ngày đêm từ 0h đến 24h"
+                  type="range"
+                  min={0}
+                  max={24}
+                  step={0.25}
+                  value={timeOfDay}
+                  onChange={(e) => onChangeTimeOfDay?.(Number(e.target.value))}
+                  className="w-20 h-1 accent-amber-400 cursor-pointer"
+                />
+                <span
+                  data-testid="time-of-day-readout"
+                  className="font-mono font-bold text-amber-300 tabular-nums w-10"
+                >
+                  {formatTimeOfDayClock(timeOfDay)}
+                </span>
+                <button
+                  type="button"
+                  data-testid="toggle-day-night-auto"
+                  onClick={onToggleDayNightAuto}
+                  title="Tự động xoay chu kỳ ngày đêm thời gian thực"
+                  className={`px-1.5 py-0.5 rounded border flex items-center gap-1 whitespace-nowrap cursor-pointer transition-colors ${
+                    isDayNightAuto
+                      ? 'bg-amber-400 text-slate-950 border-amber-300 font-bold'
+                      : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                  }`}
+                >
+                  {isDayNightAuto ? (
+                    <Pause className="w-2.5 h-2.5" />
+                  ) : (
+                    <Play className="w-2.5 h-2.5" />
+                  )}
+                  <span>{isDayNightAuto ? 'Đang chạy' : 'Tự động'}</span>
+                </button>
+              </div>
+
+              {/* 2. Sun Azimuth Direction (0°–360°) for Real-Time Directional Shadows */}
+              <div className="flex items-center gap-1.5 shrink-0 pl-2 border-l border-slate-800">
+                <RotateCw className="w-3 h-3 text-cyan-400 shrink-0" />
+                <span className="text-slate-300 whitespace-nowrap">Hướng Mặt Trời (Bóng đổ):</span>
+                <input
+                  id="sun-azimuth-slider"
+                  data-testid="sun-azimuth-slider"
+                  aria-label="Hướng mặt trời tạo bóng đổ từ 0 đến 360 độ"
+                  type="range"
+                  min={0}
+                  max={360}
+                  step={5}
+                  value={Math.round(sunAzimuth)}
+                  onChange={(e) => onChangeSunAzimuth?.(Number(e.target.value))}
+                  className="w-20 h-1 accent-cyan-400 cursor-pointer"
+                />
+                <span
+                  data-testid="sun-azimuth-readout"
+                  className="font-mono font-bold text-cyan-300 tabular-nums w-8"
+                >
+                  {Math.round(sunAzimuth)}°
+                </span>
+              </div>
+
+              {/* 3. Quick Day/Night Presets */}
+              <div className="flex items-center gap-1 shrink-0 pl-2 border-l border-slate-800">
+                {DAY_NIGHT_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    data-testid={`day-night-preset-${preset.id}`}
+                    onClick={() => onApplyDayNightPreset?.(preset.id)}
+                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 whitespace-nowrap cursor-pointer"
+                  >
+                    {preset.shortLabel}
+                  </button>
+                ))}
+              </div>
+
+              {/* 4. Nocturnal Starlight Mode Toggle ("Chế Độ Ánh Sao Ban Đêm") */}
+              <div className="flex items-center gap-1 shrink-0 pl-2 border-l border-slate-800">
+                <button
+                  type="button"
+                  data-testid="toggle-starlight-mode"
+                  onClick={onToggleStarlightMode}
+                  className={`px-2 py-0.5 rounded-md border flex items-center gap-1 whitespace-nowrap cursor-pointer transition-colors ${
+                    starlightMode
+                      ? 'bg-indigo-500 text-white border-indigo-300 font-bold shadow-sm'
+                      : 'bg-indigo-950/60 border-indigo-500/40 text-indigo-200 hover:bg-indigo-900/70'
+                  }`}
+                >
+                  <Moon className="w-3 h-3 text-indigo-200" />
+                  <Sparkles className="w-2.5 h-2.5 text-amber-300" />
+                  <span>{starlightMode ? '★ Ánh Sao Đêm: BẬT' : 'Chế Độ Ánh Sao Đêm'}</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ROW 3B (Only in Paint Mode, ultra-slim 24px bar): Grass 3-5cm + Flower Species + Flower Colors + Fill Map */}
           {activeTab === 'paint' && (
             <div
               data-testid="surface-ecosystem-bar"

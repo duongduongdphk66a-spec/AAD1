@@ -5,21 +5,18 @@ import {
   Compass,
   CheckCircle2,
   Undo2,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import {
   BiomeId,
   BIOMES,
+  DAY_NIGHT_PRESETS,
   DEFAULT_GRASS_HEIGHT_CM,
   DEFAULT_TERRAIN_RULES,
-  executeTerrainRules,
   FLOWER_SPECIES_CATALOG,
   FlowerSpeciesId,
-  formatTerrainRuleFormula,
-  generateBiomeTerrain,
-  generateFlatEarthTerrain,
   generateInitialSurfaceShowcaseStrokes,
-  getGroundHeightAt,
-  getTerrainElevationStats,
   getTextureIndex,
   GRID_SIZE,
   MAX_ELEVATION,
@@ -32,7 +29,6 @@ import {
   PREFAB_CATALOG,
   PrefabCategory,
   PrefabId,
-  recomputeTerrainColors,
   RuleOperator,
   SculptToolId,
   TerrainRule,
@@ -44,13 +40,31 @@ import {
   WEATHER_CATALOG,
   WORLD_SIZE,
   WORLD_SIZE_KM,
-  applySculptBrush,
+} from './world/registry';
+import {
   applyTextureBrush,
-} from './world/terrainEngine';
+  recomputeTerrainColors,
+} from './world/brushes';
+import {
+  applySculptBrush,
+  getGroundHeightAt,
+  getTerrainElevationStats,
+} from './world/sculpting';
+import {
+  deserializeWorldFromSavePayload,
+  executeTerrainRules,
+  formatTerrainRuleFormula,
+  formatTimeOfDayClock,
+  generateBiomeTerrain,
+  generateFlatEarthTerrain,
+  serializeWorldToSavePayload,
+  timeOfDayToSunElevation,
+} from './world/generation';
 import { WorldViewport3D, CameraPresetId, ScaleMetrics } from './components/WorldViewport3D';
 import { BottomControlDock, ActiveTabId } from './components/BottomControlDock';
 import { ImageReconstructModal } from './components/ImageReconstructModal';
 import { DistanceScaleBar } from './components/DistanceScaleBar';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 interface WorldHistorySnapshot {
   actionLabel: string;
@@ -100,7 +114,7 @@ export default function App() {
 
   // Unified Bottom Dock State (calibrated for 10x10 km / 10,000,000,000 px / min 1m brush / 1:1 scale)
   const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<ActiveTabId>('paint');
+  const [activeTab, setActiveTab] = useState<ActiveTabId>('prefabs');
   const [sculptTool, setSculptTool] = useState<SculptToolId>('sheer_cliff');
   const [brushRadius, setBrushRadius] = useState<number>(15); // 15m default brush radius on Page 2 (Thang 25m)
   const [brushStrength, setBrushStrength] = useState<number>(45);
@@ -115,24 +129,34 @@ export default function App() {
   const [autoRuleOnSculpt, setAutoRuleOnSculpt] = useState<boolean>(true);
 
   // Prefab Placement & Transform State (Orientation 0°-360° & Scale 0.3x-3.0x on top of 1:1 real scale)
-  const [selectedPrefab, setSelectedPrefab] = useState<PrefabId>('floating_sky_island');
+  const [selectedPrefab, setSelectedPrefab] = useState<PrefabId>('pluto_cryo_volcano');
   const [prefabCategoryFilter, setPrefabCategoryFilter] = useState<PrefabCategory | 'all'>('all');
   const [placementRotationDeg, setPlacementRotationDeg] = useState<number>(0);
-  const [placementScale, setPlacementScale] = useState<number>(1.0);
+  const [placementScale, setPlacementScale] = useState<number>(1.35);
 
-  // Atmosphere, Planetary Weather & Camera State (default to 'village' 1:1 real-scale view)
+  // Atmosphere, Planetary Weather, Day/Night Cycle & Camera State
   const [activeWeather, setActiveWeather] = useState<WeatherId>('clear_sky');
   const [sunElevation, setSunElevation] = useState<number>(48);
+  const [sunAzimuth, setSunAzimuth] = useState<number>(135);
+  const [timeOfDay, setTimeOfDay] = useState<number>(10.5);
+  const [isDayNightAuto, setIsDayNightAuto] = useState<boolean>(false);
+  const [starlightMode, setStarlightMode] = useState<boolean>(false);
   const [waterLevel, setWaterLevel] = useState<number>(BIOMES.mondstadt_meadow.waterLevel);
-  const [cameraPreset, setCameraPreset] = useState<CameraPresetId>('village');
+  const [cameraPreset, setCameraPreset] = useState<CameraPresetId>('mountain_gallery');
   const [cameraPresetTrigger, setCameraPresetTrigger] = useState<number>(0);
+  const [showVolcanoRefCard, setShowVolcanoRefCard] = useState<boolean>(true);
+  const [activeRefModelIdx, setActiveRefModelIdx] = useState<number>(0);
 
   // Live Vector Scale Bar & Cursor Coordinates State (Bottom-Right Corner)
   const [scaleMetrics, setScaleMetrics] = useState<ScaleMetrics>({
     metersPerPixel: 0.08,
     cameraDistanceMeters: 62,
   });
-  const [hoverCoords, setHoverCoords] = useState<{ x: number; z: number } | null>({ x: 0, z: 0 });
+  const [hoverCoords, setHoverCoords] = useState<{ x: number; y: number; z: number } | null>({
+    x: 0,
+    y: 0,
+    z: 0,
+  });
 
   // Image Reconstruction Modal State
   const [isReconstructModalOpen, setIsReconstructModalOpen] = useState<boolean>(false);
@@ -683,53 +707,163 @@ export default function App() {
     showToast('Đã kiến tạo mẫu địa hình đồi núi Vector 10×10km (cao độ tối đa 1km).');
   }, [biomeId, pushUndoSnapshot, showToast]);
 
+  // Auto Day/Night Cycle progression timer when isDayNightAuto is active
+  useEffect(() => {
+    if (!isDayNightAuto) return;
+    const timer = window.setInterval(() => {
+      setTimeOfDay((prev) => {
+        const next = Number(((prev + 0.25) % 24).toFixed(2));
+        setSunElevation(timeOfDayToSunElevation(next));
+        setSunAzimuth(Math.round((next / 24) * 360));
+        return next;
+      });
+    }, 180);
+    return () => clearInterval(timer);
+  }, [isDayNightAuto]);
+
+  const handleChangeTimeOfDay = useCallback((nextHour: number) => {
+    const norm = ((nextHour % 24) + 24) % 24;
+    setTimeOfDay(norm);
+    const elev = timeOfDayToSunElevation(norm);
+    setSunElevation(elev);
+    setSunAzimuth(Math.round((norm / 24) * 360));
+  }, []);
+
+  const handleChangeSunElevation = useCallback((nextElev: number) => {
+    setSunElevation(nextElev);
+    if (nextElev <= -6) {
+      setTimeOfDay(22.5);
+    } else if (nextElev <= 14) {
+      setTimeOfDay((prev) => (prev < 12 ? 6.5 : 17.75));
+    }
+  }, []);
+
+  const handleChangeSunAzimuth = useCallback((nextAzim: number) => {
+    const clamped = ((nextAzim % 360) + 360) % 360;
+    setSunAzimuth(clamped);
+  }, []);
+
+  const handleToggleStarlightMode = useCallback(() => {
+    setStarlightMode((prev) => {
+      const next = !prev;
+      if (next && sunElevation > 15) {
+        setTimeOfDay(23.0);
+        setSunElevation(-52);
+        setSunAzimuth(320);
+      }
+      showToast(
+        next
+          ? 'Đã bật Chế Độ Ánh Sao Ban Đêm (Vòm sao Ngân Hà 3D, sao băng & bóng đổ ánh trăng).'
+          : 'Đã tắt khóa Chế Độ Ánh Sao Ban Đêm (Tự động theo chu kỳ mặt trời).'
+      );
+      return next;
+    });
+  }, [sunElevation, showToast]);
+
+  const handleApplyDayNightPreset = useCallback(
+    (presetId: string) => {
+      const preset = DAY_NIGHT_PRESETS.find((p) => p.id === presetId);
+      if (!preset) return;
+      setIsDayNightAuto(false);
+      setTimeOfDay(preset.timeOfDayHours);
+      setSunElevation(preset.sunElevationDeg);
+      setSunAzimuth(preset.sunAzimuthDeg);
+      setStarlightMode(preset.starlightMode);
+      showToast(
+        `Đã chuyển chu kỳ ánh sáng sang "${preset.label}" (Hướng mặt trời ${preset.sunAzimuthDeg}°, Cao độ ${preset.sunElevationDeg}°).`
+      );
+    },
+    [showToast]
+  );
+
   const handleExportWorldJson = useCallback(() => {
-    const payload = {
+    const payload = serializeWorldToSavePayload({
       regionTitle,
       biomeId,
-      graphicsEngine: 'Vector 3D Mesh + Physical 3D Surface Ecosystems',
-      buildingScaleMode: '1:1 Real-World Dimensions (1 unit = 1m)',
+      activeWeather,
+      waterLevel,
+      sunElevation,
+      sunAzimuth,
+      timeOfDay,
+      starlightMode,
       grassHeightCm,
       flowerSpecies,
       flowerColorHex,
-      dimensionsKm: `${WORLD_SIZE_KM}x${WORLD_SIZE_KM}km`,
-      areaSqKm: WORLD_SIZE_KM * WORLD_SIZE_KM,
-      resolutionPx: VIRTUAL_RESOLUTION_PX,
-      virtualGridDimensions: `${VIRTUAL_SIDE_PX}x${VIRTUAL_SIDE_PX}px (${PIXEL_SIZE_CM}cm/px)`,
-      minBrushRadiusMeters: MIN_BRUSH_RADIUS,
-      maxElevationMeters: MAX_ELEVATION,
-      currentPeakMeters: elevationStats.maxElevation,
-      waterLevel,
-      sunElevation,
-      gridSize: GRID_SIZE,
-      worldSizeMeters: WORLD_SIZE,
+      heightMap: heightMapRef.current,
+      splatMap: splatMapRef.current,
       placedObjects,
       microStrokes,
-      exportedAt: new Date().toISOString(),
-    };
+    });
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `aetherterra-vector-10x10km-${biomeId}.json`;
+    a.download = `aetherterra-v2-${biomeId}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    showToast('Đã xuất tệp thiết kế bản đồ Vector 10×10km (.JSON).');
+    showToast(
+      `Đã xuất tệp bản đồ 3D đầy đủ (.JSON v2: lưới độ cao ${GRID_SIZE + 1}×${GRID_SIZE + 1}, bảng màu bề mặt & ${placedObjects.length} vật thể).`
+    );
   }, [
     regionTitle,
     biomeId,
+    activeWeather,
+    waterLevel,
+    sunElevation,
+    sunAzimuth,
+    timeOfDay,
+    starlightMode,
     grassHeightCm,
     flowerSpecies,
     flowerColorHex,
-    elevationStats.maxElevation,
-    waterLevel,
-    sunElevation,
     placedObjects,
     microStrokes,
     showToast,
   ]);
+
+  const handleImportWorldJson = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(String(reader.result || '{}'));
+          const restored = deserializeWorldFromSavePayload(parsed);
+          if (!restored) {
+            showToast('Tệp JSON không hợp lệ hoặc thiếu dữ liệu bản đồ.');
+            return;
+          }
+          pushUndoSnapshot(`Nhập bản đồ JSON (${restored.regionTitle})`);
+          heightMapRef.current = restored.heightMap;
+          splatMapRef.current = restored.splatMap;
+          colorMapRef.current = restored.colorMap;
+          setRegionTitle(restored.regionTitle);
+          setBiomeId(restored.biomeId);
+          setActiveWeather(restored.activeWeather);
+          setWaterLevel(restored.waterLevel);
+          setSunElevation(restored.sunElevation);
+          setSunAzimuth(restored.sunAzimuth);
+          setTimeOfDay(restored.timeOfDay);
+          setStarlightMode(restored.starlightMode);
+          setGrassHeightCm(restored.grassHeightCm);
+          setFlowerSpecies(restored.flowerSpecies);
+          setFlowerColorHex(restored.flowerColorHex);
+          setPlacedObjects(restored.placedObjects);
+          setMicroStrokes(restored.microStrokes);
+          setSelectedObjectId(restored.placedObjects[0]?.id ?? null);
+          setTerrainVersion((v) => v + 1);
+          showToast(
+            `Đã tải bản đồ "${restored.regionTitle}" (${restored.placedObjects.length} vật thể 3D).`
+          );
+        } catch {
+          showToast('Không thể đọc tệp JSON. Vui lòng kiểm tra định dạng tệp.');
+        }
+      };
+      reader.readAsText(file);
+    },
+    [pushUndoSnapshot, showToast]
+  );
 
   const selectedObject =
     placedObjects.find((o) => o.id === selectedObjectId) || null;
@@ -804,36 +938,41 @@ export default function App() {
 
   return (
     <main className="relative w-screen h-screen overflow-hidden bg-[#0f1722] select-none">
-      {/* Full-Bleed Vector 3D Open-World Canvas (10x10 km, 10 Billion Vector Points, 1:1 Building Scale, Real 3D Grass/Flowers/Sand/Lava) */}
-      <WorldViewport3D
-        heightMap={heightMapRef.current}
-        splatMap={splatMapRef.current}
-        colorMap={colorMapRef.current}
-        terrainVersion={terrainVersion}
-        biomeId={biomeId}
-        activeWeather={activeWeather}
-        sunElevation={sunElevation}
-        waterLevel={waterLevel}
-        placedObjects={placedObjects}
-        microStrokes={microStrokes}
-        selectedObjectId={selectedObjectId}
-        activeTab={activeTab}
-        sculptTool={sculptTool}
-        textureBrush={textureBrush}
-        selectedPrefab={selectedPrefab}
-        placementRotationDeg={placementRotationDeg}
-        placementScale={placementScale}
-        brushRadius={brushRadius}
-        brushStrength={brushStrength}
-        cameraPreset={cameraPreset}
-        cameraPresetTrigger={cameraPresetTrigger}
-        onTerrainStrokeStart={handleTerrainStrokeStart}
-        onTerrainStroke={handleTerrainStroke}
-        onPlacePrefabAt={(x, z) => handlePlacePrefabAt(x, z)}
-        onSelectObject={setSelectedObjectId}
-        onHoverCoordsChange={setHoverCoords}
-        onScaleMetricsChange={setScaleMetrics}
-      />
+      {/* Full-Bleed Vector 3D Open-World Canvas (10x10 km, 1:1 Building Scale, Real-Time Day/Night & Starlight Sky) */}
+      <ErrorBoundary label="Khung nhìn 3D" inline>
+        <WorldViewport3D
+          heightMap={heightMapRef.current}
+          splatMap={splatMapRef.current}
+          colorMap={colorMapRef.current}
+          terrainVersion={terrainVersion}
+          biomeId={biomeId}
+          activeWeather={activeWeather}
+          sunElevation={sunElevation}
+          sunAzimuth={sunAzimuth}
+          timeOfDay={timeOfDay}
+          starlightMode={starlightMode}
+          waterLevel={waterLevel}
+          placedObjects={placedObjects}
+          microStrokes={microStrokes}
+          selectedObjectId={selectedObjectId}
+          activeTab={activeTab}
+          sculptTool={sculptTool}
+          textureBrush={textureBrush}
+          selectedPrefab={selectedPrefab}
+          placementRotationDeg={placementRotationDeg}
+          placementScale={placementScale}
+          brushRadius={brushRadius}
+          brushStrength={brushStrength}
+          cameraPreset={cameraPreset}
+          cameraPresetTrigger={cameraPresetTrigger}
+          onTerrainStrokeStart={handleTerrainStrokeStart}
+          onTerrainStroke={handleTerrainStroke}
+          onPlacePrefabAt={(x, z) => handlePlacePrefabAt(x, z)}
+          onSelectObject={setSelectedObjectId}
+          onHoverCoordsChange={setHoverCoords}
+          onScaleMetricsChange={setScaleMetrics}
+        />
+      </ErrorBoundary>
 
       {/* Ultra-Compact Single-Line Top Bar */}
       <header className="fixed top-2.5 left-2.5 right-2.5 z-20 pointer-events-none flex flex-nowrap items-center justify-between gap-2">
@@ -854,8 +993,12 @@ export default function App() {
               10×10 km
             </span>
             <span>·</span>
-            <span className="text-amber-300 font-semibold" data-testid="world-resolution-spec">
-              Vector 10.000.000.000 px (10cm)
+            <span
+              className="text-amber-300 font-semibold"
+              data-testid="world-resolution-spec"
+              title="Lưới địa hình thực tế 161×161 đỉnh (25.921 đỉnh, 62.5m/ô) kết hợp hệ tọa độ Vector 10cm"
+            >
+              Lưới 161×161 (Vector 10cm)
             </span>
             <span>·</span>
             <span className="text-cyan-300 font-semibold" data-testid="world-scale-spec">
@@ -866,6 +1009,10 @@ export default function App() {
               Cỏ {grassHeightCm.toFixed(1)}cm
             </span>
             <span>·</span>
+            <span data-testid="world-time-spec" className="text-indigo-300 font-semibold">
+              {formatTimeOfDayClock(timeOfDay)} ({Math.round(sunAzimuth)}°)
+            </span>
+            <span>·</span>
             <span data-testid="world-weather-spec" className="text-pink-300 font-semibold">
               {WEATHER_CATALOG.find((w) => w.id === activeWeather)?.shortName || 'Quang Đãng'}
             </span>
@@ -874,8 +1021,32 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right: Compact Undo + Camera Presets + Photo-to-3D Button */}
+        {/* Right: Quick Starlight Toggle + Compact Undo + Camera Presets + Photo-to-3D Button */}
         <div className="pointer-events-auto flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            data-testid="top-starlight-quick-toggle"
+            onClick={handleToggleStarlightMode}
+            title="Chuyển nhanh Chế Độ Ánh Sao Ban Đêm / Chu kỳ Mặt Trời"
+            className={`px-2.5 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1 shadow-lg transition-colors whitespace-nowrap cursor-pointer ${
+              starlightMode || sunElevation <= -4
+                ? 'bg-indigo-600 hover:bg-indigo-500 border-indigo-400 text-white'
+                : 'bg-[#111927]/95 hover:bg-slate-800 border-slate-700/90 text-amber-300'
+            }`}
+          >
+            {starlightMode || sunElevation <= -4 ? (
+              <>
+                <Moon className="w-3.5 h-3.5 text-indigo-200" />
+                <span>Đêm Sao ({formatTimeOfDayClock(timeOfDay)})</span>
+              </>
+            ) : (
+              <>
+                <Sun className="w-3.5 h-3.5 text-amber-400" />
+                <span>Ngày ({formatTimeOfDayClock(timeOfDay)})</span>
+              </>
+            )}
+          </button>
+
           <button
             type="button"
             data-testid="top-undo-button"
@@ -900,12 +1071,15 @@ export default function App() {
             <Camera className="w-3 h-3 text-slate-400 ml-1.5 mr-0.5" />
             {(
               [
-                { id: 'village', label: 'Làng 1:1' },
-                { id: 'sky_volcano', label: 'Đảo Bay & Núi Lửa' },
-                { id: 'closeup', label: 'Soi Cỏ 3–5cm' },
-                { id: 'valley', label: 'Thung Lũng' },
+                { id: 'mountain_gallery', label: '7 Núi Ảnh Mẫu' },
+                { id: 'pluto_cryo', label: 'Pluto' },
+                { id: 'europa_rift', label: 'Europa' },
+                { id: 'alps_matterhorn', label: 'Alps' },
+                { id: 'himalaya_fishtail', label: 'Himalaya' },
+                { id: 'olympus_mons', label: 'Olympus' },
+                { id: 'titan_mountain', label: 'Titan' },
+                { id: 'volcano_icon', label: 'Núi Lửa' },
                 { id: 'overview', label: '10km' },
-                { id: 'topdown', label: '90°' },
               ] as const
             ).map((cam) => (
               <button
@@ -938,6 +1112,187 @@ export default function App() {
         </div>
       </header>
 
+      {/* Reference Image -> 7-Model 3D Showcase Card (Pluto, Europa, Alps, Himalaya, Mars Olympus, Titan, Volcano) */}
+      {showVolcanoRefCard && (() => {
+        const refGallery = [
+          {
+            prefabId: 'pluto_cryo_volcano' as PrefabId,
+            preset: 'pluto_cryo' as CameraPresetId,
+            testId: 'focus-pluto-btn',
+            shortTab: 'Pluto',
+            title: 'Núi Lửa Băng Wright Mons (Sao Diêm Vương)',
+            img: '/assets/aistudio/pluto_cryovolcano_ref.svg',
+            desc: 'Nền tholin nâu đỏ gồ ghề · Sông băng nitơ trắng xanh tràn miệng caldera sụt lún · Cột phun Cryoplume thẳng đứng (NASA/JHUAPL/SwRI)',
+          },
+          {
+            prefabId: 'europa_penitentes_spire' as PrefabId,
+            preset: 'europa_rift' as CameraPresetId,
+            testId: 'focus-europa-btn',
+            shortTab: 'Europa',
+            title: 'Mặt Cắt Rãnh Nứt Băng & Đại Dương Europa',
+            img: '/assets/aistudio/europa_ocean_rifts_ref.svg',
+            desc: 'Buồng magma đáy biển · Thủy nhiệt khói trắng · Đại dương ngầm xanh ngọc · Vỏ băng nứt rãnh vàng cam & cột phun hơi nước',
+          },
+          {
+            prefabId: 'himalaya_matterhorn_peak' as PrefabId,
+            preset: 'alps_matterhorn' as CameraPresetId,
+            testId: 'focus-alps-btn',
+            shortTab: 'Alps',
+            title: 'Đỉnh Sừng Băng Matterhorn (Dãy Anpơ)',
+            img: '/assets/aistudio/alps_matterhorn_ref.svg',
+            desc: 'Thảm cỏ hoa đỗ quyên xanh mướt ở tiền cảnh · Yên ngựa tuyết trắng · Chóp sừng kim tự tháp nghiêng (mặt sáng xám + vách tối xanh lam)',
+          },
+          {
+            prefabId: 'himalaya_fishtail_peak' as PrefabId,
+            preset: 'himalaya_fishtail' as CameraPresetId,
+            testId: 'focus-himalaya-btn',
+            shortTab: 'Himalaya',
+            title: 'Đỉnh Đuôi Cá Machapuchare (Dãy Himalaya)',
+            img: '/assets/aistudio/himalaya_fishtail_ref.svg',
+            desc: 'Đồi tiền cảnh nâu vàng bên trái · Vách tuyết dựng đứng đan xen sống đá xanh đen · Máng tuyết lở chéo & đỉnh đôi Đuôi Cá (Fishtail)',
+          },
+          {
+            prefabId: 'mars_olympus_shield' as PrefabId,
+            preset: 'olympus_mons' as CameraPresetId,
+            testId: 'focus-olympus-btn',
+            shortTab: 'Olympus',
+            title: 'Núi Lửa Khiên Olympus Mons (Sao Hỏa)',
+            img: '/assets/aistudio/m8uek02co8l91_09cb37ea.png',
+            desc: 'Vách đá Basal Scarp 8km bao quanh vòm khiên vàng đất · Sườn dung nham tỏa tròn & cụm 6 miệng caldera lồng nhau (Ảnh NASA MOLA)',
+          },
+          {
+            prefabId: 'titan_mithrim_montes' as PrefabId,
+            preset: 'titan_mountain' as CameraPresetId,
+            testId: 'focus-titan-btn',
+            shortTab: 'Titan',
+            title: 'Núi Rãnh Sao Mithrim / Doom Mons (Titan)',
+            img: '/assets/aistudio/images_1f7cdcc6.jpg',
+            desc: 'Cụm 8 sống núi băng-hydrocarbon phân nhánh hình sao (sườn sáng vàng kem & thung lũng chữ V nâu đen) trên bình nguyên cồn cát tholin',
+          },
+          {
+            prefabId: 'island_volcano_icon' as PrefabId,
+            preset: 'volcano_icon' as CameraPresetId,
+            testId: 'focus-volcano-model-btn',
+            shortTab: 'Núi Lửa',
+            title: 'Núi Lửa Đảo Nhiệt Đới (14 Bộ Phận)',
+            img: '/assets/aistudio/image_19e38ffa.png',
+            desc: 'Bãi cát vàng uốn lượn · Vành đai cây xanh · Nón đá nâu rãnh sâu · Dung nham vàng cam & cột khói 2 đám mây trôi',
+          },
+        ];
+        const currentRef = refGallery[activeRefModelIdx] || refGallery[0];
+
+        return (
+          <aside
+            data-testid="volcano-reference-card"
+            className="fixed top-14 left-2.5 z-20 w-80 rounded-xl bg-[#111927]/95 border border-amber-500/60 shadow-2xl p-2.5 text-slate-100 pointer-events-auto"
+          >
+            <div className="flex items-center justify-between gap-1 mb-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400">
+                7 Mô Hình 3D Từ Ảnh Mẫu
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  data-testid="focus-gallery-btn"
+                  onClick={() => {
+                    setCameraPreset('mountain_gallery');
+                    setCameraPresetTrigger((t) => t + 1);
+                  }}
+                  className="text-[10px] text-cyan-300 hover:text-white px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 cursor-pointer"
+                >
+                  Toàn Cảnh 7 Núi
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowVolcanoRefCard(false)}
+                  className="text-[10px] text-slate-400 hover:text-white px-1 cursor-pointer"
+                  title="Thu gọn thẻ đối chiếu ảnh mẫu"
+                >
+                  Ẩn
+                </button>
+              </div>
+            </div>
+
+            {/* 7 Quick Selector Tabs */}
+            <div className="grid grid-cols-7 gap-1 mb-2">
+              {refGallery.map((item, idx) => (
+                <button
+                  key={item.prefabId}
+                  type="button"
+                  data-testid={item.testId}
+                  onClick={() => {
+                    setActiveRefModelIdx(idx);
+                    setSelectedPrefab(item.prefabId);
+                    const found = placedObjects.find((o) => o.prefabId === item.prefabId);
+                    if (found) {
+                      setSelectedObjectId(found.id);
+                    }
+                    setCameraPreset(item.preset);
+                    setCameraPresetTrigger((t) => t + 1);
+                    showToast(`Đang căn góc nhìn 3D: ${item.title}`);
+                  }}
+                  className={`px-1 py-1 rounded text-[9px] font-bold truncate transition-colors cursor-pointer ${
+                    activeRefModelIdx === idx
+                      ? 'bg-amber-400 text-slate-950'
+                      : 'bg-slate-800/90 text-slate-300 hover:bg-slate-700 hover:text-white'
+                  }`}
+                  title={item.title}
+                >
+                  {item.shortTab}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-start gap-2.5">
+              <img
+                src={currentRef.img}
+                alt={currentRef.title}
+                data-testid="volcano-reference-img"
+                className="w-16 h-16 rounded-lg object-cover bg-slate-800/90 border border-slate-700 shrink-0"
+              />
+              <div className="min-w-0 flex-1">
+                <h2 className="text-xs font-bold text-white leading-tight">
+                  {currentRef.title}
+                </h2>
+                <p className="text-[10px] text-slate-300 leading-snug mt-0.5">
+                  {currentRef.desc}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-2 flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  const found = placedObjects.find((o) => o.prefabId === currentRef.prefabId);
+                  if (found) {
+                    setSelectedObjectId(found.id);
+                  }
+                  setCameraPreset(currentRef.preset);
+                  setCameraPresetTrigger((t) => t + 1);
+                  showToast(`Đang căn góc nhìn trực diện: ${currentRef.title}`);
+                }}
+                className="flex-1 px-2 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-bold transition-colors cursor-pointer"
+              >
+                Soi Cận Cảnh 3D
+              </button>
+              <button
+                type="button"
+                data-testid="spawn-volcano-model-btn"
+                onClick={() => {
+                  setSelectedPrefab(currentRef.prefabId);
+                  setActiveTab('prefabs');
+                  handleSpawnPrefabAtCenter(currentRef.prefabId);
+                }}
+                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-amber-300 text-[10px] font-semibold transition-colors cursor-pointer"
+              >
+                + Đặt Thêm
+              </button>
+            </div>
+          </aside>
+        );
+      })()}
+
       {/* Action Status Feedback Banner */}
       {statusBanner && (
         <div
@@ -949,7 +1304,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Unified Collapsible Bottom Control Dock (Single-Row Tools + Multi-Page Brush Scales + 3-5cm Grass & Flower Customizer + Undo) */}
+      {/* Unified Collapsible Bottom Control Dock (Single-Row Tools + Multi-Page Brush Scales + Day/Night & Starlight + Undo) */}
       <BottomControlDock
         isCollapsed={isDockCollapsed}
         onToggleCollapse={() => setIsDockCollapsed((prev) => !prev)}
@@ -1000,7 +1355,16 @@ export default function App() {
         activeWeather={activeWeather}
         onSelectWeather={handleSelectWeather}
         sunElevation={sunElevation}
-        onChangeSunElevation={setSunElevation}
+        onChangeSunElevation={handleChangeSunElevation}
+        sunAzimuth={sunAzimuth}
+        onChangeSunAzimuth={handleChangeSunAzimuth}
+        timeOfDay={timeOfDay}
+        onChangeTimeOfDay={handleChangeTimeOfDay}
+        isDayNightAuto={isDayNightAuto}
+        onToggleDayNightAuto={() => setIsDayNightAuto((prev) => !prev)}
+        starlightMode={starlightMode}
+        onToggleStarlightMode={handleToggleStarlightMode}
+        onApplyDayNightPreset={handleApplyDayNightPreset}
         waterLevel={waterLevel}
         onChangeWaterLevel={setWaterLevel}
         canUndo={canUndo}
@@ -1010,6 +1374,7 @@ export default function App() {
         onOpenReconstructModal={() => setIsReconstructModalOpen(true)}
         onResetWorld={handleResetWorld}
         onExportWorldJson={handleExportWorldJson}
+        onImportWorldJson={handleImportWorldJson}
       />
 
       {/* Bottom-Right Live Vector Distance Scale Bar / Ruler (1:1 Real-World Scale) */}

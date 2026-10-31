@@ -15,17 +15,33 @@ import {
   WeatherId,
   WEATHER_CATALOG,
   WORLD_SIZE,
-  getGroundHeightAt,
-} from '../world/terrainEngine';
+} from '../world/registry';
+import { getGroundHeightAt } from '../world/sculpting';
+import { computeDayNightLightingState } from '../world/generation';
 import { createTerrainDetailTextures } from '../world/materialsAndTextures';
 import { ProceduralPrefabFactory } from '../world/proceduralModels';
 import {
   createSurfaceEcosystemPatch,
   animateSurfaceEcosystems,
+  disposeObject3DTree,
 } from '../world/surfaceEcosystem3D';
 import { ActiveTabId } from './BottomControlDock';
 
-export type CameraPresetId = 'village' | 'sky_volcano' | 'closeup' | 'valley' | 'overview' | 'topdown';
+export type CameraPresetId =
+  | 'mountain_gallery'
+  | 'pluto_cryo'
+  | 'europa_rift'
+  | 'alps_matterhorn'
+  | 'himalaya_fishtail'
+  | 'olympus_mons'
+  | 'titan_mountain'
+  | 'volcano_icon'
+  | 'village'
+  | 'sky_volcano'
+  | 'closeup'
+  | 'valley'
+  | 'overview'
+  | 'topdown';
 
 export interface ScaleMetrics {
   metersPerPixel: number;
@@ -43,6 +59,9 @@ interface WorldViewport3DProps {
   biomeId: BiomeId;
   activeWeather?: WeatherId;
   sunElevation: number;
+  sunAzimuth?: number;
+  timeOfDay?: number;
+  starlightMode?: boolean;
   waterLevel: number;
   placedObjects: PlacedObject[];
   microStrokes?: MicroStrokeStamp[];
@@ -592,6 +611,206 @@ function buildPlanetaryWeatherGroup(weatherId: WeatherId): THREE.Group {
   return group;
 }
 
+function buildCelestialSkySystem(): {
+  celestialRoot: THREE.Group;
+  starDomeMat: THREE.PointsMaterial;
+  milkyWayMat: THREE.PointsMaterial;
+  constellationGroup: THREE.Group;
+  sunOrbGroup: THREE.Group;
+  moonOrbGroup: THREE.Group;
+} {
+  const celestialRoot = new THREE.Group();
+  celestialRoot.name = 'celestial_day_night_sky';
+
+  // 1. Multi-spectral Starfield Dome (1,800 stars spanning horizon to zenith so visible from village camera)
+  const starCount = 1800;
+  const starPositions = new Float32Array(starCount * 3);
+  const starColors = new Float32Array(starCount * 3);
+  const palette = [
+    new THREE.Color(0xffffff), // Pure white
+    new THREE.Color(0x93c5fd), // Sirius blue-white
+    new THREE.Color(0xfde68a), // Capella gold
+    new THREE.Color(0xfdba74), // Betelgeuse warm amber
+    new THREE.Color(0xc4b5fd), // Vega violet-white
+  ];
+
+  for (let i = 0; i < starCount; i++) {
+    const theta = ((i * 2.3999632) % (Math.PI * 2));
+    // Bias elevation toward low-to-mid sky (1° to 75°) so stars fill the viewport behind buildings & mountains
+    const u = (i + 0.5) / starCount;
+    const phi = THREE.MathUtils.degToRad(1.5 + Math.pow(u, 1.35) * 82);
+    const radius = 260 + (i % 7) * 45;
+
+    starPositions[i * 3] = Math.cos(phi) * Math.cos(theta) * radius;
+    starPositions[i * 3 + 1] = Math.sin(phi) * radius - 14;
+    starPositions[i * 3 + 2] = Math.cos(phi) * Math.sin(theta) * radius;
+
+    const c = palette[i % palette.length];
+    const brightness = 0.75 + (i % 5) * 0.06;
+    starColors[i * 3] = c.r * brightness;
+    starColors[i * 3 + 1] = c.g * brightness;
+    starColors[i * 3 + 2] = c.b * brightness;
+  }
+
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+  starGeo.setAttribute('color', new THREE.BufferAttribute(starColors, 3));
+
+  const starDomeMat = new THREE.PointsMaterial({
+    size: 2.6,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    fog: false,
+  });
+  const starDomePoints = new THREE.Points(starGeo, starDomeMat);
+  starDomePoints.name = 'star_dome_points';
+  celestialRoot.add(starDomePoints);
+
+  // 2. Milky Way Galactic Band (900 concentrated nebula/star particles arching across the sky)
+  const mwCount = 900;
+  const mwPositions = new Float32Array(mwCount * 3);
+  const mwColors = new Float32Array(mwCount * 3);
+  for (let i = 0; i < mwCount; i++) {
+    const t = (i / mwCount) * Math.PI * 2;
+    const bandSpread = (((i * 73) % 100) / 100 - 0.5) * 0.32;
+    const radius = 240 + (i % 5) * 20;
+    const x = Math.cos(t) * radius;
+    const y = Math.abs(Math.sin(t)) * 135 + 10 + bandSpread * 45;
+    const z = Math.sin(t) * radius;
+    // Tilt galactic plane
+    mwPositions[i * 3] = x * 0.88 - y * 0.22;
+    mwPositions[i * 3 + 1] = Math.max(4, y * 0.88 + Math.abs(x) * 0.12);
+    mwPositions[i * 3 + 2] = z;
+
+    const isCyan = i % 3 === 0;
+    const col = isCyan ? new THREE.Color(0x38bdf8) : new THREE.Color(0xe879f9);
+    mwColors[i * 3] = col.r;
+    mwColors[i * 3 + 1] = col.g;
+    mwColors[i * 3 + 2] = col.b;
+  }
+  const mwGeo = new THREE.BufferGeometry();
+  mwGeo.setAttribute('position', new THREE.BufferAttribute(mwPositions, 3));
+  mwGeo.setAttribute('color', new THREE.BufferAttribute(mwColors, 3));
+  const milkyWayMat = new THREE.PointsMaterial({
+    size: 3.4,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    fog: false,
+  });
+  const milkyWayPoints = new THREE.Points(mwGeo, milkyWayMat);
+  milkyWayPoints.name = 'milky_way_band';
+  celestialRoot.add(milkyWayPoints);
+
+  // 3. 3D Luminous Constellation Stars, Nocturnal Shooting Stars & Bioluminescent Starlight Motes
+  const constellationGroup = new THREE.Group();
+  constellationGroup.name = 'constellation_and_shooting_stars';
+  const brightStarGeo = new THREE.OctahedronGeometry(0.95, 0);
+  const brightStarColors = [0xfef08a, 0x7dd3fc, 0xf5d0fe, 0xffffff];
+
+  for (let i = 0; i < 68; i++) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: brightStarColors[i % brightStarColors.length],
+      transparent: true,
+      opacity: 0.98,
+      fog: false,
+    });
+    const starMesh = new THREE.Mesh(brightStarGeo, mat);
+    // Distribute half across the primary camera horizon window (-X/-Z) and half 360° around
+    const angle =
+      i < 34
+        ? Math.PI * 1.02 + ((i / 34) - 0.5) * 1.15
+        : ((i - 34) / 34) * Math.PI * 2;
+    const dist = 78 + (i % 5) * 18;
+    const height = 21 + (i % 8) * 2.8;
+    starMesh.position.set(Math.cos(angle) * dist, height, Math.sin(angle) * dist);
+    const baseScale = 0.55 + (i % 4) * 0.28;
+    starMesh.scale.setScalar(baseScale);
+    starMesh.userData.isTwinkleStar = true;
+    starMesh.userData.baseScale = baseScale;
+    starMesh.userData.phase = i * 0.65;
+    constellationGroup.add(starMesh);
+  }
+
+  // 4 Nocturnal Shooting Stars (Sao băng đêm)
+  const shootingGeo = new THREE.ConeGeometry(0.32, 8.5, 6);
+  shootingGeo.rotateZ(Math.PI / 2);
+  const shootingMat = new THREE.MeshBasicMaterial({
+    color: 0xe0f2fe,
+    transparent: true,
+    opacity: 0.95,
+    fog: false,
+  });
+  for (let s = 0; s < 4; s++) {
+    const streak = new THREE.Mesh(shootingGeo, shootingMat);
+    const ox = -55 + s * 22;
+    const oy = 25 + (s % 3) * 4;
+    const oz = -68 - s * 14;
+    streak.position.set(ox, oy, oz);
+    streak.rotation.z = -0.28;
+    streak.userData.isNightShootingStar = true;
+    streak.userData.originX = ox;
+    streak.userData.originY = oy;
+    streak.userData.originZ = oz;
+    streak.userData.speed = 32 + s * 8;
+    constellationGroup.add(streak);
+  }
+  constellationGroup.visible = false;
+  celestialRoot.add(constellationGroup);
+
+  // 4. 3D Solar Disc & Corona Halo
+  const sunOrbGroup = new THREE.Group();
+  sunOrbGroup.name = 'solar_orb_group';
+  const sunCore = new THREE.Mesh(
+    new THREE.SphereGeometry(9.5, 24, 16),
+    new THREE.MeshBasicMaterial({ color: 0xfef08a, fog: false })
+  );
+  const sunHalo = new THREE.Mesh(
+    new THREE.RingGeometry(10.5, 19.5, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      transparent: true,
+      opacity: 0.55,
+      side: THREE.DoubleSide,
+      fog: false,
+    })
+  );
+  sunOrbGroup.add(sunCore, sunHalo);
+  celestialRoot.add(sunOrbGroup);
+
+  // 5. 3D Lunar Sphere & Silver Moon Halo
+  const moonOrbGroup = new THREE.Group();
+  moonOrbGroup.name = 'lunar_orb_group';
+  const moonCore = new THREE.Mesh(
+    new THREE.SphereGeometry(7.8, 24, 16),
+    new THREE.MeshBasicMaterial({ color: 0xe0f2fe, fog: false })
+  );
+  const moonHalo = new THREE.Mesh(
+    new THREE.RingGeometry(8.6, 16.0, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.42,
+      side: THREE.DoubleSide,
+      fog: false,
+    })
+  );
+  moonOrbGroup.add(moonCore, moonHalo);
+  celestialRoot.add(moonOrbGroup);
+
+  return {
+    celestialRoot,
+    starDomeMat,
+    milkyWayMat,
+    constellationGroup,
+    sunOrbGroup,
+    moonOrbGroup,
+  };
+}
+
 export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   heightMap,
   colorMap,
@@ -599,6 +818,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   biomeId,
   activeWeather = 'clear_sky',
   sunElevation,
+  sunAzimuth = 135,
+  timeOfDay = 10.5,
+  starlightMode = false,
   waterLevel,
   placedObjects,
   microStrokes = [],
@@ -648,12 +870,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   });
 
   const sceneHandlesRef = useRef<{
+    renderer: THREE.WebGLRenderer;
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls;
     terrainGeo: THREE.PlaneGeometry;
     terrainMesh: THREE.Mesh;
     waterMesh: THREE.Mesh;
+    distantMat: THREE.MeshStandardMaterial;
     sunLight: THREE.DirectionalLight;
     hemiLight: THREE.HemisphereLight;
     fog: THREE.FogExp2;
@@ -662,6 +886,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     propsRoot: THREE.Group;
     microStrokesRoot: THREE.Group;
     weatherRoot: THREE.Group;
+    celestialRoot: THREE.Group;
+    starDomeMat: THREE.PointsMaterial;
+    milkyWayMat: THREE.PointsMaterial;
+    constellationGroup: THREE.Group;
+    sunOrbGroup: THREE.Group;
+    moonOrbGroup: THREE.Group;
     microCircleGeo: THREE.CircleGeometry;
     prefabFactory: ProceduralPrefabFactory;
     objectMeshMap: Map<string, THREE.Group>;
@@ -699,7 +929,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       container.clientHeight || window.innerHeight
     );
     renderer.shadowMap.enabled = !isSoftwareGl;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
 
     renderer.domElement.setAttribute('data-testid', 'world-3d-canvas');
     renderer.domElement.style.display = 'block';
@@ -725,8 +955,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       0.4,
       40000
     );
-    // Start at 1:1 Real-World Village View so buildings (8m-12m tall) are seen at true scale
-    camera.position.set(38, 24, 48);
+    // Start framing the 7-Mountain Reference Gallery (Pluto, Europa, Alps, Himalaya, Mars, Titan, Volcano)
+    camera.position.set(0, 28, 52);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = !isSoftwareGl;
@@ -734,9 +964,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     controls.maxPolarAngle = Math.PI * 0.485;
     controls.minDistance = 2;
     controls.maxDistance = 14500;
-    controls.target.set(0, 4, 0);
+    controls.target.set(0, 10, -12);
 
-    // 3-Point Warm/Cool Lighting Rig
+    // 3-Point Warm/Cool Lighting Rig with Real-Time Directional Shadows
     const hemiLight = new THREE.HemisphereLight(
       initialBiome.hemiSkyHex,
       initialBiome.hemiGroundHex,
@@ -748,18 +978,20 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const sunLight = new THREE.DirectionalLight(initialBiome.sunHex, 1.35);
     sunLight.position.set(380, 480, 290);
     sunLight.castShadow = !isSoftwareGl;
-    sunLight.shadow.mapSize.width = 1024;
-    sunLight.shadow.mapSize.height = 1024;
-    const d = 120;
+    const shadowMapDim = isSoftwareGl ? 512 : 1024;
+    sunLight.shadow.mapSize.width = shadowMapDim;
+    sunLight.shadow.mapSize.height = shadowMapDim;
+    const d = 95;
     sunLight.shadow.camera.left = -d;
     sunLight.shadow.camera.right = d;
     sunLight.shadow.camera.top = d;
     sunLight.shadow.camera.bottom = -d;
     sunLight.shadow.camera.near = 5;
-    sunLight.shadow.camera.far = 2000;
+    sunLight.shadow.camera.far = 1600;
     sunLight.shadow.bias = -0.0005;
     sunLight.shadow.normalBias = 0.02;
     scene.add(sunLight);
+    scene.add(sunLight.target);
 
     const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.35);
     rimLight.position.set(-420, 250, -380);
@@ -795,7 +1027,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     });
 
     const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
-    terrainMesh.receiveShadow = !isSoftwareGl;
+    terrainMesh.receiveShadow = true;
+    terrainMesh.castShadow = true;
     terrainMesh.name = 'playable_terrain';
     scene.add(terrainMesh);
 
@@ -840,10 +1073,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     for (let i = 0; i < 16; i++) {
       const angle = (i / 16) * Math.PI * 2;
       const dist = 9400 + (i % 3) * 1250;
-      const h = 1650 + (i % 4) * 580;
-      const r = 1250 + (i % 3) * 420;
+      const h = 340 + (i % 4) * 140;
+      const r = 950 + (i % 3) * 320;
       const peak = new THREE.Mesh(new THREE.ConeGeometry(r, h, 6), distantMat);
-      peak.position.set(Math.cos(angle) * dist, h * 0.42 - 180, Math.sin(angle) * dist);
+      peak.position.set(Math.cos(angle) * dist, h * 0.32 - 55, Math.sin(angle) * dist);
       peak.rotation.y = angle;
       distantRingGroup.add(peak);
     }
@@ -908,8 +1141,19 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     scene.add(microStrokesRoot);
 
     const weatherRoot = new THREE.Group();
+    weatherRoot.userData.activeWeather = activeWeather;
     weatherRoot.add(buildPlanetaryWeatherGroup(activeWeather));
     scene.add(weatherRoot);
+
+    const {
+      celestialRoot,
+      starDomeMat,
+      milkyWayMat,
+      constellationGroup,
+      sunOrbGroup,
+      moonOrbGroup,
+    } = buildCelestialSkySystem();
+    scene.add(celestialRoot);
 
     // 64-segment smooth Vector Circle Geometry for infinite-sharpness surface strokes
     const microCircleGeo = new THREE.CircleGeometry(1, 64);
@@ -954,7 +1198,31 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     const triggerCameraPreset = (preset: CameraPresetId) => {
       camTransitionActive = true;
-      if (preset === 'village') {
+      if (preset === 'mountain_gallery') {
+        _camPosGoal.set(0, 28, 52);
+        _camTargetGoal.set(0, 10, -12);
+      } else if (preset === 'pluto_cryo') {
+        _camPosGoal.set(-15, 20, 32);
+        _camTargetGoal.set(-16, 10.5, -8);
+      } else if (preset === 'europa_rift') {
+        _camPosGoal.set(17, 19, 30);
+        _camTargetGoal.set(16, 10, -8);
+      } else if (preset === 'alps_matterhorn') {
+        _camPosGoal.set(-44, 18.5, 32);
+        _camTargetGoal.set(-45, 12.5, -10);
+      } else if (preset === 'himalaya_fishtail') {
+        _camPosGoal.set(46, 19.5, 32);
+        _camTargetGoal.set(45, 13, -10);
+      } else if (preset === 'olympus_mons') {
+        _camPosGoal.set(-74, 21, 26);
+        _camTargetGoal.set(-76, 6.5, -12);
+      } else if (preset === 'titan_mountain') {
+        _camPosGoal.set(78, 21, 26);
+        _camTargetGoal.set(76, 6.5, -12);
+      } else if (preset === 'volcano_icon') {
+        _camPosGoal.set(0, 18.5, 14);
+        _camTargetGoal.set(0, 9.6, -26);
+      } else if (preset === 'village') {
         _camPosGoal.set(38, 24, 48);
         _camTargetGoal.set(0, 6, 0);
       } else if (preset === 'sky_volcano') {
@@ -973,6 +1241,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         _camPosGoal.set(0, 95, 6);
         _camTargetGoal.set(0, 0, 0);
       }
+      // Advance 78% immediately so software-WebGL viewports frame the target right away
+      camera.position.lerp(_camPosGoal, 0.78);
+      controls.target.lerp(_camTargetGoal, 0.78);
+      controls.update();
     };
 
     // Compute and report live ground scale (metersPerPixel) for the bottom-right DistanceScaleBar
@@ -1214,6 +1486,16 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         } else if (obj.userData.isFloatingIsland) {
           const baseY = typeof obj.userData.baseY === 'number' ? obj.userData.baseY : 14.5;
           obj.position.y = baseY + Math.sin(elapsed * 1.35) * 0.42;
+        } else if (obj.userData.isStylizedVolcanoPlume) {
+          const baseY = typeof obj.userData.baseY === 'number' ? obj.userData.baseY : 12.25;
+          obj.position.y = baseY + Math.sin(elapsed * 2.1) * 0.24;
+          obj.rotation.z = Math.sin(elapsed * 1.45) * 0.035;
+        } else if (obj.userData.isDetachedSmokeCloud) {
+          const ph = typeof obj.userData.phase === 'number' ? obj.userData.phase : 0;
+          const bx = typeof obj.userData.baseX === 'number' ? obj.userData.baseX : 5.45;
+          const by = typeof obj.userData.baseY === 'number' ? obj.userData.baseY : 3.65;
+          obj.position.x = bx + Math.sin(elapsed * 1.6 + ph) * 0.28;
+          obj.position.y = by + Math.cos(elapsed * 2.0 + ph) * 0.22;
         } else if (obj.userData.isVolcanoPlume) {
           obj.rotation.y += dt * 0.55;
           obj.position.y = 14.2 + Math.sin(elapsed * 2.6) * 0.35;
@@ -1223,8 +1505,35 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
       });
 
-      // Keep weather effects centered around the camera target so storms/meteors/aurora remain vivid anywhere on the 10x10km planet
+      // Keep weather & celestial star dome centered around the camera target
       weatherRoot.position.set(controls.target.x, 0, controls.target.z);
+      celestialRoot.position.set(controls.target.x, 0, controls.target.z);
+      sunOrbGroup.lookAt(camera.position);
+      moonOrbGroup.lookAt(camera.position);
+
+      if (constellationGroup.visible) {
+        if (celestialRoot.children[0]) {
+          celestialRoot.children[0].rotation.y = elapsed * 0.015;
+        }
+        constellationGroup.traverse((obj) => {
+          if (obj.userData.isTwinkleStar) {
+            const ph = obj.userData.phase || 0;
+            const baseS = obj.userData.baseScale || 0.6;
+            const pulse = 0.72 + Math.sin(elapsed * 3.4 + ph) * 0.34;
+            obj.scale.setScalar(baseS * pulse);
+            obj.rotation.y += dt * 1.1;
+          } else if (obj.userData.isNightShootingStar) {
+            const spd = obj.userData.speed || 42;
+            obj.position.x += spd * 0.92 * dt;
+            obj.position.y -= spd * 0.34 * dt;
+            if (obj.position.y < 6 || obj.position.x > 95) {
+              obj.position.x = obj.userData.originX || -65;
+              obj.position.y = obj.userData.originY || 42;
+              obj.position.z = obj.userData.originZ || -80;
+            }
+          }
+        });
+      }
 
       weatherRoot.traverse((obj) => {
         if (obj.userData.isMarsStormParticle) {
@@ -1333,12 +1642,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     }
 
     sceneHandlesRef.current = {
+      renderer,
       scene,
       camera,
       controls,
       terrainGeo,
       terrainMesh,
       waterMesh,
+      distantMat,
       sunLight,
       hemiLight,
       fog,
@@ -1347,6 +1658,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       propsRoot,
       microStrokesRoot,
       weatherRoot,
+      celestialRoot,
+      starDomeMat,
+      milkyWayMat,
+      constellationGroup,
+      sunOrbGroup,
+      moonOrbGroup,
       microCircleGeo,
       prefabFactory,
       objectMeshMap,
@@ -1368,6 +1685,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);
       controls.dispose();
+      disposeObject3DTree(scene);
       renderer.dispose();
     };
   }, []);
@@ -1416,6 +1734,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     objectMeshMap.forEach((group, id) => {
       if (!incomingIds.has(id)) {
         propsRoot.remove(group);
+        disposeObject3DTree(group);
         objectMeshMap.delete(id);
       }
     });
@@ -1463,6 +1782,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     microMeshMap.forEach((group, id) => {
       if (!incomingIds.has(id)) {
         microStrokesRoot.remove(group);
+        disposeObject3DTree(group);
         microMeshMap.delete(id);
       }
     });
@@ -1481,14 +1801,20 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
       if (needsRebuild && patchGroup) {
         microStrokesRoot.remove(patchGroup);
+        disposeObject3DTree(patchGroup);
         microMeshMap.delete(st.id);
         patchGroup = undefined;
       }
 
       if (!patchGroup) {
-        patchGroup = createSurfaceEcosystemPatch(st, idx + 1);
-        microStrokesRoot.add(patchGroup);
-        microMeshMap.set(st.id, patchGroup);
+        try {
+          patchGroup = createSurfaceEcosystemPatch(st, idx + 1);
+          microStrokesRoot.add(patchGroup);
+          microMeshMap.set(st.id, patchGroup);
+        } catch (err) {
+          console.error(`[WorldViewport3D] Failed to create surface patch for brush "${st.brushId}":`, err);
+          continue;
+        }
       }
 
       const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, st.x, st.z);
@@ -1496,7 +1822,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     }
   }, [microStrokes, heightMap, terrainVersion]);
 
-  // 4. Sync Biome Atmosphere, Planetary Weather, Sun Angle & Water Level
+  // 4. Sync Biome Atmosphere, Planetary Weather, Day/Night Cycle, Sun Azimuth Shadows & Starry Sky
   useEffect(() => {
     const handles = sceneHandlesRef.current;
     if (!handles) return;
@@ -1505,21 +1831,37 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const weatherMeta =
       WEATHER_CATALOG.find((w) => w.id === activeWeather) || WEATHER_CATALOG[0];
 
-    // Rebuild 3D weather group when activeWeather changes
-    handles.weatherRoot.clear();
-    handles.weatherRoot.add(buildPlanetaryWeatherGroup(activeWeather));
+    const lightingState = computeDayNightLightingState({
+      timeOfDayHours: timeOfDay,
+      sunElevationDeg: sunElevation,
+      sunAzimuthDeg: sunAzimuth,
+      starlightMode,
+      biomeId,
+    });
+
+    // Rebuild 3D weather group only when activeWeather changes
+    if (handles.weatherRoot.userData.activeWeather !== activeWeather) {
+      disposeObject3DTree(handles.weatherRoot);
+      handles.weatherRoot.clear();
+      handles.weatherRoot.userData.activeWeather = activeWeather;
+      handles.weatherRoot.add(buildPlanetaryWeatherGroup(activeWeather));
+    }
 
     if (activeWeather === 'clear_sky') {
-      handles.scene.background = new THREE.Color(biome.skyHorizonHex);
-      handles.fog.color.set(biome.fogHex);
-      handles.fog.density = 0.000032;
+      handles.scene.background = new THREE.Color(lightingState.skyBackgroundHex);
+      handles.fog.color.set(lightingState.fogHex);
+      handles.fog.density = lightingState.isNightOrStarlight ? 0.000045 : 0.000032;
     } else {
-      const fogHex = weatherMeta.fogOverrideHex || biome.fogHex;
-      handles.scene.background = new THREE.Color(biome.skyHorizonHex).lerp(
+      const fogHex = weatherMeta.fogOverrideHex || lightingState.fogHex;
+      const blendedFog = new THREE.Color(lightingState.fogHex).lerp(
         new THREE.Color(fogHex),
-        0.45
+        lightingState.isNightOrStarlight ? 0.35 : 0.65
       );
-      handles.fog.color.set(fogHex);
+      handles.scene.background = new THREE.Color(lightingState.skyBackgroundHex).lerp(
+        blendedFog,
+        0.42
+      );
+      handles.fog.color.copy(blendedFog);
       handles.fog.density =
         activeWeather === 'mars_dust_storm' ||
         activeWeather === 'supersonic_mars_storm' ||
@@ -1535,22 +1877,109 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           : 0.000045;
     }
 
-    handles.hemiLight.color.set(biome.hemiSkyHex);
-    handles.hemiLight.groundColor.set(biome.hemiGroundHex);
-    handles.sunLight.color.set(biome.sunHex);
-
-    const rad = THREE.MathUtils.degToRad(sunElevation);
-    const dist = 520;
-    handles.sunLight.position.set(
-      Math.cos(rad) * dist * 0.8,
-      Math.sin(rad) * dist,
-      Math.cos(rad) * dist * 0.6
+    // Scale IBL environmentIntensity and toneMappingExposure so Nocturnal Starlight Mode
+    // and Golden Hour visibly transform terrain, buildings, and horizon silhouettes
+    handles.scene.environmentIntensity = lightingState.isNightOrStarlight
+      ? 0.14
+      : lightingState.phase === 'dawn' || lightingState.phase === 'dusk'
+      ? 0.45
+      : 0.92;
+    handles.renderer.toneMappingExposure = lightingState.isNightOrStarlight
+      ? 0.68
+      : lightingState.phase === 'dawn' || lightingState.phase === 'dusk'
+      ? 0.94
+      : 1.12;
+    handles.distantMat.color.set(
+      lightingState.isNightOrStarlight
+        ? '#090f24'
+        : lightingState.phase === 'dawn' || lightingState.phase === 'dusk'
+        ? '#7c2d12'
+        : '#475569'
     );
+
+    handles.hemiLight.color.set(lightingState.hemiSkyHex);
+    handles.hemiLight.groundColor.set(lightingState.hemiGroundHex);
+    handles.hemiLight.intensity = lightingState.hemiIntensity;
+
+    handles.sunLight.color.set(lightingState.directionalLightHex);
+    handles.sunLight.intensity = lightingState.directionalLightIntensity;
+    handles.sunLight.position.set(
+      lightingState.shadowCasterPosition.x,
+      lightingState.shadowCasterPosition.y,
+      lightingState.shadowCasterPosition.z
+    );
+    handles.sunLight.target.position.set(0, 0, 0);
+    handles.sunLight.target.updateMatrixWorld();
+
+    // Update 3D Celestial Sun & Moon orbs along solar/lunar trajectory
+    const orbDist = 115;
+    handles.sunOrbGroup.position.set(
+      lightingState.sunDirection.x * orbDist,
+      Math.max(18, lightingState.sunDirection.y * 42),
+      lightingState.sunDirection.z * orbDist
+    );
+    handles.sunOrbGroup.visible =
+      !lightingState.isNightOrStarlight && lightingState.sunElevationDeg >= -4;
+
+    handles.moonOrbGroup.position.set(
+      -42 + lightingState.moonDirection.x * 28,
+      27,
+      -96 + lightingState.moonDirection.z * 24
+    );
+    handles.moonOrbGroup.visible =
+      lightingState.isNightOrStarlight || lightingState.sunElevationDeg <= 14;
+
+    // Update Starry Night Sky Dome & Milky Way visibility
+    handles.starDomeMat.opacity = lightingState.starlightIntensity * 0.98;
+    handles.milkyWayMat.opacity = lightingState.starlightIntensity * 0.85;
+    handles.constellationGroup.visible = lightingState.starlightIntensity > 0.12;
+
+    // Dynamically stretch & orient ground contact shadows on every placed 3D object
+    // opposite the active sun/moon azimuth & elevation for crisp real-time shadow feedback
+    const activeAzimRad = THREE.MathUtils.degToRad(lightingState.sunAzimuthDeg);
+    const stretchFactor = THREE.MathUtils.clamp(
+      1.85 - Math.abs(lightingState.sunElevationDeg) / 65,
+      1.05,
+      2.15
+    );
+    const shadowOffsetDist = (stretchFactor - 1.0) * 1.85;
+    const shadowDirX = -Math.cos(activeAzimRad);
+    const shadowDirZ = -Math.sin(activeAzimRad);
+
+    handles.objectMeshMap.forEach((group) => {
+      const contactDisc = group.getObjectByName('contact_shadow') as THREE.Mesh | undefined;
+      if (contactDisc) {
+        // Counter-rotate local parent rotation so shadow always points away from world sun azimuth
+        const localAngle = -activeAzimRad - group.rotation.y;
+        contactDisc.rotation.z = localAngle;
+        contactDisc.scale.set(stretchFactor, 1.0, 1.0);
+        const worldOffX = shadowDirX * shadowOffsetDist;
+        const worldOffZ = shadowDirZ * shadowOffsetDist;
+        const cosR = Math.cos(-group.rotation.y);
+        const sinR = Math.sin(-group.rotation.y);
+        contactDisc.position.set(
+          worldOffX * cosR - worldOffZ * sinR,
+          0.03,
+          worldOffX * sinR + worldOffZ * cosR
+        );
+      }
+    });
 
     const waterMat = handles.waterMesh.material as THREE.MeshStandardMaterial;
     waterMat.color.set(biome.waterHex);
     handles.waterMesh.position.y = waterLevel;
-  }, [biomeId, activeWeather, sunElevation, waterLevel]);
+
+    handles.renderer.render(handles.scene, handles.camera);
+  }, [
+    biomeId,
+    activeWeather,
+    sunElevation,
+    sunAzimuth,
+    timeOfDay,
+    starlightMode,
+    waterLevel,
+    placedObjects,
+  ]);
 
   // 5. Trigger smooth camera preset transitions
   useEffect(() => {
