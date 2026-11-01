@@ -23,7 +23,7 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
     subtitle: 'Ảnh gốc NASA/JHUAPL/SwRI: nền tholin nâu đỏ, sông băng nitơ tràn miệng caldera & cột phun Cryoplume',
     mode: 'both',
     suggestedBiome: 'pluto_cryovolcano',
-    imageUrl: '/assets/aistudio/pluto_cryovolcano_ref.svg',
+    imageUrl: '/assets/aistudio/pluto_cryovolcano_ref.webp',
     description:
       'Tái tạo trực tiếp từ ảnh mẫu CRYOPLUME ERUPTION DETECTED (NASA/JHUAPL/SwRI): nền đá tholin nâu đỏ gồ ghề, dòng băng nitơ trắng xanh tràn khỏi miệng caldera sụt lún và cột phun băng Cryoplume thẳng đứng.',
     drawPhoto: (ctx, w, h) => {
@@ -51,7 +51,7 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
     subtitle: 'Ảnh gốc: khối địa chất 5 tầng (magma đáy biển, thủy nhiệt khói trắng, đại dương xanh ngọc, vỏ băng nứt & geyser)',
     mode: 'both',
     suggestedBiome: 'europa_chaos_ridge',
-    imageUrl: '/assets/aistudio/europa_ocean_rifts_ref.svg',
+    imageUrl: '/assets/aistudio/europa_ocean_rifts_ref.webp',
     description:
       'Tái tạo trực tiếp từ sơ đồ mặt cắt địa chất 3D vệ tinh Europa: buồng magma đáy biển, miệng phun thủy nhiệt khói trắng, đại dương ngầm xanh ngọc, vỏ băng nứt rãnh vàng cam và cột phun hơi nước.',
     drawPhoto: (ctx, w, h) => {
@@ -75,7 +75,7 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
     subtitle: 'Ảnh gốc: thảm cỏ hoa đỗ quyên xanh mướt, yên ngựa tuyết trắng & chóp sừng Matterhorn nghiêng (mặt sáng xám + vách tối xanh lam)',
     mode: 'both',
     suggestedBiome: 'himalaya_alps_andes',
-    imageUrl: '/assets/aistudio/alps_matterhorn_ref.svg',
+    imageUrl: '/assets/aistudio/alps_matterhorn_ref.webp',
     description:
       'Tái tạo trực tiếp từ ảnh mẫu Đỉnh Matterhorn (Dãy Anpơ): thảm cỏ hoa đỗ quyên núi Anpơ xanh mướt ở tiền cảnh, yên ngựa tuyết trắng và chóp sừng kim tự tháp 4 mặt nghiêng đặc trưng.',
     drawPhoto: (ctx, w, h) => {
@@ -127,7 +127,7 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
     subtitle: 'Ảnh gốc: đồi tiền cảnh nâu vàng, vách tuyết đan xen sống đá xanh đen, máng tuyết lở chéo & đỉnh đôi Đuôi Cá',
     mode: 'both',
     suggestedBiome: 'himalaya_alps_andes',
-    imageUrl: '/assets/aistudio/himalaya_fishtail_ref.svg',
+    imageUrl: '/assets/aistudio/himalaya_fishtail_ref.webp',
     description:
       'Tái tạo trực tiếp từ ảnh mẫu Đỉnh Machapuchare (Annapurna Himalaya): đồi tiền cảnh nâu vàng bên trái, vách tuyết dựng đứng đan xen các sống đá xanh đen và chóp đôi Đuôi Cá (Fishtail Spire).',
     drawPhoto: (ctx, w, h) => {
@@ -170,12 +170,12 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
   {
     id: 'mars_olympus_ref',
     title: 'Núi Lửa Khiên Olympus Mons (Ảnh Quỹ Đạo Sao Hỏa)',
-    subtitle: 'Ảnh gốc: vách đá Basal Scarp 8km, vòm khiên vàng đất & 6 miệng caldera lồng nhau (m8uek02co8l91_09cb37ea.png)',
+    subtitle: 'Ảnh gốc: vách đá Basal Scarp 8km, vòm khiên vàng đất & 6 miệng caldera lồng nhau (m8uek02co8l91_09cb37ea.webp)',
     mode: 'both',
     suggestedBiome: 'mars_olympus',
-    imageUrl: '/assets/aistudio/m8uek02co8l91_09cb37ea.png',
+    imageUrl: '/assets/aistudio/m8uek02co8l91_09cb37ea.webp',
     description:
-      'Tái tạo trực tiếp từ ảnh quỹ đạo Olympus Mons (m8uek02co8l91_09cb37ea.png): vách đá dựng đứng Basal Scarp 8km, vòm khiên thoải màu vàng đất và cụm 6 miệng caldera lồng nhau.',
+      'Tái tạo trực tiếp từ ảnh quỹ đạo Olympus Mons (m8uek02co8l91_09cb37ea.webp): vách đá dựng đứng Basal Scarp 8km, vòm khiên thoải màu vàng đất và cụm 6 miệng caldera lồng nhau.',
     drawPhoto: (ctx, w, h) => {
       ctx.fillStyle = '#09090b';
       ctx.fillRect(0, 0, w, h * 0.42);
@@ -194,12 +194,12 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
   {
     id: 'titan_mountain_ref',
     title: 'Núi Rãnh Sao Mithrim / Doom Mons (Ảnh NASA JPL Titan)',
-    subtitle: 'Ảnh gốc: cụm 8 sống núi băng-hydrocarbon phân nhánh hình sao & cồn cát tholin (images_1f7cdcc6.jpg)',
+    subtitle: 'Ảnh gốc: cụm 8 sống núi băng-hydrocarbon phân nhánh hình sao & cồn cát tholin (images_1f7cdcc6.webp)',
     mode: 'both',
     suggestedBiome: 'titan_methane_sea',
-    imageUrl: '/assets/aistudio/images_1f7cdcc6.jpg',
+    imageUrl: '/assets/aistudio/images_1f7cdcc6.webp',
     description:
-      'Tái tạo trực tiếp từ ảnh radar/VIMS tàu Cassini NASA JPL (images_1f7cdcc6.jpg): cụm sống núi băng-hydrocarbon phân nhánh hình sao với sườn sáng vàng kem và thung lũng chữ V nâu đen.',
+      'Tái tạo trực tiếp từ ảnh radar/VIMS tàu Cassini NASA JPL (images_1f7cdcc6.webp): cụm sống núi băng-hydrocarbon phân nhánh hình sao với sườn sáng vàng kem và thung lũng chữ V nâu đen.',
     drawPhoto: (ctx, w, h) => {
       ctx.fillStyle = '#5c3812';
       ctx.fillRect(0, 0, w, h);
@@ -223,9 +223,9 @@ export const SAMPLE_PHOTO_PRESETS: SamplePhotoPreset[] = [
     subtitle: 'Ảnh gốc: bãi cát vàng, vành đai rừng xanh, núi lửa nâu phun dung nham vàng cam & cột khói 2 đám mây',
     mode: 'both',
     suggestedBiome: 'hawaii_shield_volcano',
-    imageUrl: '/assets/aistudio/image_19e38ffa.png',
+    imageUrl: '/assets/aistudio/image_19e38ffa.webp',
     description:
-      'Tái tạo trực tiếp từ ảnh mẫu image_19e38ffa.png: dựng mô hình 3D Núi Lửa Đảo Nhiệt Đới 14 bộ phận (bãi cát vàng uốn lượn, vành đai cây xanh, sườn núi nâu rãnh sâu, miệng dung nham vàng cam & cột khói trắng-nâu kèm 2 đám mây trôi).',
+      'Tái tạo trực tiếp từ ảnh mẫu image_19e38ffa.webp: dựng mô hình 3D Núi Lửa Đảo Nhiệt Đới 14 bộ phận (bãi cát vàng uốn lượn, vành đai cây xanh, sườn núi nâu rãnh sâu, miệng dung nham vàng cam & cột khói trắng-nâu kèm 2 đám mây trôi).',
     drawPhoto: (ctx, w, h) => {
       ctx.fillStyle = '#f8fafc';
       ctx.fillRect(0, 0, w, h);

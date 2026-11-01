@@ -9,3 +9,4 @@ export * from './registry';
 export * from './brushes';
 export * from './sculpting';
 export * from './generation';
+export * from './junctionBlending';

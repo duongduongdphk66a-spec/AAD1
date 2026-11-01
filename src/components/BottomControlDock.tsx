@@ -110,6 +110,9 @@ interface BottomControlDockProps {
   placementScale: number;
   onChangePlacementScale: (scale: number) => void;
   onSpawnPrefabAtCenter: (prefab: PrefabId) => void;
+  autoJunctionBlend?: boolean;
+  onToggleAutoJunctionBlend?: () => void;
+  onExecuteJunctionBlend?: () => void;
 
   // Selected placed object manipulation
   selectedObject: PlacedObject | null;
@@ -238,6 +241,9 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
   placementScale,
   onChangePlacementScale,
   onSpawnPrefabAtCenter,
+  autoJunctionBlend = true,
+  onToggleAutoJunctionBlend,
+  onExecuteJunctionBlend,
   selectedObject,
   onRotateSelectedObject,
   onSetSelectedObjectRotationDeg,
@@ -1151,6 +1157,32 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                   <PlusCircle className="w-3 h-3" />
                   Đặt 1:1
                 </button>
+                <div className="flex items-center gap-1 pl-1.5 border-l border-slate-700">
+                  <button
+                    type="button"
+                    data-testid="toggle-auto-junction-blend"
+                    onClick={onToggleAutoJunctionBlend}
+                    title="Tự động nối liền tiếp giáp như 1 khối khi 2 công trình/địa hình đè lên nhau và nội/ngoại suy mượt nền đất dưới cùng cho 2 vật thể ở xa"
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold flex items-center gap-1 whitespace-nowrap cursor-pointer transition-colors ${
+                      autoJunctionBlend
+                        ? 'bg-emerald-500/25 border border-emerald-400/70 text-emerald-200'
+                        : 'bg-slate-800 border border-slate-700 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Layers className="w-3 h-3 text-emerald-400 shrink-0" />
+                    <span>Tự nối tiếp giáp: {autoJunctionBlend ? 'BẬT' : 'TẮT'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="execute-junction-blend-btn"
+                    onClick={onExecuteJunctionBlend}
+                    title="Chạy nội suy & ngoại suy nối liền mọi công trình giao nhau và làm mượt chuyển màu/địa hình nền đất dưới cùng"
+                    className="px-2 py-0.5 rounded bg-amber-400 hover:bg-amber-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                  >
+                    <Wand2 className="w-3 h-3" />
+                    <span>Nối Tiếp Giáp</span>
+                  </button>
+                </div>
               </div>
             )}
 

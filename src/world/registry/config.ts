@@ -8,10 +8,8 @@ import type {
 } from './types';
 
 // 10x10 km Open-World Continent Scale (10,000m x 10,000m = 100 km², 1,000m = 1 km max height)
-// 10,000,000,000 px (100,000 x 100,000 px, 0.1m = 10cm/px) Ultra-High Virtual Splat & Surface Detail Resolution (100x upgrade)
-export const VIRTUAL_SIDE_PX = 100000; // 100,000 px per side (0.1m / 10cm per pixel)
-export const VIRTUAL_RESOLUTION_PX = 10000000000; // 10,000,000,000 px (10 Gigapixels = 100x of 100M px)
-export const PIXEL_SIZE_CM = 10; // 10cm per virtual pixel
+// 160x160 grid cells (161x161 vertices = 25,921 vertices, 62.5m per cell) + 1:1 3D Surface Ecosystem Patches
+export const CELL_SPAN_METERS = 62.5; // 10,000m / 160 cells = 62.5m per grid cell
 export const MIN_BRUSH_RADIUS = 1; // 1m minimum brush radius
 export const MAX_BRUSH_RADIUS = 2500; // 2,500m maximum brush radius
 

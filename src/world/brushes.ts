@@ -70,8 +70,9 @@ export function recomputeTerrainColors(
     for (let ix = minIx; ix <= maxIx; ix++) {
       const idx = iz * VERTEX_COUNT_PER_SIDE + ix;
       const h = heightMap[idx];
+      const centerSplat = splatMap[idx];
 
-      const paintedBrushId = TEXTURE_INDEX_MAP[splatMap[idx]] || biome.defaultTexture;
+      const paintedBrushId = TEXTURE_INDEX_MAP[centerSplat] || biome.defaultTexture;
       const activeBrush = TEXTURE_BRUSHES[paintedBrushId] || TEXTURE_BRUSHES.earth_soil;
 
       // Subtle organic variation for stylized Cel-PBR richness
@@ -85,18 +86,49 @@ export function recomputeTerrainColors(
           ? 0.06
           : Math.max(-0.08, Math.min(0.14, (h / MAX_ELEVATION) * 0.14));
 
-      const r =
+      let r =
         activeBrush.primaryRgb[0] * (1 - blendFactor) +
         activeBrush.secondaryRgb[0] * blendFactor +
         elevationBoost;
-      const g =
+      let g =
         activeBrush.primaryRgb[1] * (1 - blendFactor) +
         activeBrush.secondaryRgb[1] * blendFactor +
         elevationBoost;
-      const b =
+      let b =
         activeBrush.primaryRgb[2] * (1 - blendFactor) +
         activeBrush.secondaryRgb[2] * blendFactor +
         elevationBoost;
+
+      // Smooth boundary color interpolation where two different terrain textures meet/overlap
+      let diffNeighborCount = 0;
+      let nSumR = 0;
+      let nSumG = 0;
+      let nSumB = 0;
+      const neighbors: Array<[number, number]> = [
+        [ix - 1, iz],
+        [ix + 1, iz],
+        [ix, iz - 1],
+        [ix, iz + 1],
+      ];
+      for (let n = 0; n < neighbors.length; n++) {
+        const [nx, nz] = neighbors[n];
+        if (nx < 0 || nx > GRID_SIZE || nz < 0 || nz > GRID_SIZE) continue;
+        const nSplat = splatMap[nz * VERTEX_COUNT_PER_SIDE + nx];
+        if (nSplat !== centerSplat) {
+          const nBrushId = TEXTURE_INDEX_MAP[nSplat] || biome.defaultTexture;
+          const nBrush = TEXTURE_BRUSHES[nBrushId] || TEXTURE_BRUSHES.earth_soil;
+          nSumR += nBrush.primaryRgb[0] * (1 - blendFactor) + nBrush.secondaryRgb[0] * blendFactor + elevationBoost;
+          nSumG += nBrush.primaryRgb[1] * (1 - blendFactor) + nBrush.secondaryRgb[1] * blendFactor + elevationBoost;
+          nSumB += nBrush.primaryRgb[2] * (1 - blendFactor) + nBrush.secondaryRgb[2] * blendFactor + elevationBoost;
+          diffNeighborCount++;
+        }
+      }
+      if (diffNeighborCount > 0) {
+        const seamLerp = Math.min(0.38, diffNeighborCount * 0.11);
+        r = r * (1 - seamLerp) + (nSumR / diffNeighborCount) * seamLerp;
+        g = g * (1 - seamLerp) + (nSumG / diffNeighborCount) * seamLerp;
+        b = b * (1 - seamLerp) + (nSumB / diffNeighborCount) * seamLerp;
+      }
 
       colorMap[idx * 3] = Math.max(0.04, Math.min(1, r));
       colorMap[idx * 3 + 1] = Math.max(0.04, Math.min(1, g));
@@ -106,7 +138,8 @@ export function recomputeTerrainColors(
 }
 
 /**
- * Paints a surface texture onto the 10x10 km terrain at (worldX, worldZ) using a dirty-rect bounding box.
+ * Paints a surface texture onto the 10x10 km terrain at (worldX, worldZ) using a dirty-rect bounding box,
+ * with smooth C2 color and elevation interpolation/extrapolation across the outer junction ring.
  */
 export function applyTextureBrush(
   heightMap: Float32Array,
@@ -127,6 +160,7 @@ export function applyTextureBrush(
   const safeRadius = Math.max(MIN_BRUSH_RADIUS, radius);
   const cellSpan = WORLD_SIZE / GRID_SIZE;
   const effectiveKernelRadius = Math.max(safeRadius, cellSpan * 0.72);
+  const extrapolateOuterRadius = effectiveKernelRadius * 1.25;
   const microScale = safeRadius < cellSpan ? Math.max(0.25, safeRadius / cellSpan) : 1;
   const targetIdx = getTextureIndex(brushId);
   const brushConfig = TEXTURE_BRUSHES[brushId];
@@ -137,19 +171,19 @@ export function applyTextureBrush(
 
   const minIx = Math.max(
     0,
-    Math.floor(((worldX - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.floor(((worldX - extrapolateOuterRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const maxIx = Math.min(
     GRID_SIZE,
-    Math.ceil(((worldX + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.ceil(((worldX + extrapolateOuterRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const minIz = Math.max(
     0,
-    Math.floor(((worldZ - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.floor(((worldZ - extrapolateOuterRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const maxIz = Math.min(
     GRID_SIZE,
-    Math.ceil(((worldZ + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.ceil(((worldZ + extrapolateOuterRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
 
   let touchedMinIx = GRID_SIZE;
@@ -205,7 +239,13 @@ export function applyTextureBrush(
       minIz: touchedMinIz,
       maxIz: touchedMaxIz,
     };
-    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, dirtyRect);
+    const colorBounds: GridDirtyRect = {
+      minIx: Math.max(0, touchedMinIx - 1),
+      maxIx: Math.min(GRID_SIZE, touchedMaxIx + 1),
+      minIz: Math.max(0, touchedMinIz - 1),
+      maxIz: Math.min(GRID_SIZE, touchedMaxIz + 1),
+    };
+    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, colorBounds);
     if (options?.outBounds) {
       options.outBounds.minIx = dirtyRect.minIx;
       options.outBounds.maxIx = dirtyRect.maxIx;

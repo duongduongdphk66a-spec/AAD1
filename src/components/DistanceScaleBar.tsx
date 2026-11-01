@@ -118,7 +118,7 @@ export const DistanceScaleBar: React.FC<DistanceScaleBarProps> = ({
 
       {hoverCoords && (
         <div className="mt-1 flex items-center justify-between text-[9px] font-mono text-slate-400 tabular-nums leading-none">
-          <span className="text-cyan-300">10cm (10 Tỷ px)</span>
+          <span className="text-cyan-300">62,5m/ô (161×161)</span>
           <span className="text-emerald-300">
             X:{hoverCoords.x.toFixed(0)} Z:{hoverCoords.z.toFixed(0)}m
           </span>

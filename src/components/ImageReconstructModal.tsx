@@ -53,6 +53,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   const [previewDataUrl, setPreviewDataUrl] = useState<string>('');
   const [heightmapPreviewUrl, setHeightmapPreviewUrl] = useState<string>('');
   const [mode, setMode] = useState<'both' | 'terrain' | 'object'>('both');
+  const [cropMode, setCropMode] = useState<'fill' | 'fit'>('fill');
   const [reliefScale, setReliefScale] = useState<number>(1.35);
   const [terraceSteps, setTerraceSteps] = useState<number>(0);
   const [overrideBiome, setOverrideBiome] = useState<BiomeId | 'auto'>('auto');
@@ -61,7 +62,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   const [aiSourceLabel, setAiSourceLabel] = useState<string>('Pixel Depth + AI Vision');
   const [regionTitle, setRegionTitle] = useState<string>('Thung Lũng Thảo Nguyên Phong Khởi');
   const [summaryText, setSummaryText] = useState<string>(
-    'Hệ thống đã trích xuất bản đồ độ cao 81×81 đỉnh, phân tách vùng nước, sườn cỏ ngọc lục bảo và tự động đặt 9 vật thể 3D khớp với bố cục bức ảnh.'
+    'Hệ thống đã trích xuất bản đồ độ cao 161×161 đỉnh, phân tách vùng nước, sườn cỏ ngọc lục bảo và tự động đặt 9 vật thể 3D khớp với bố cục bức ảnh.'
   );
   const [reconstructed, setReconstructed] = useState<ReconstructedWorldData | null>(null);
 
@@ -70,6 +71,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     width: number;
     height: number;
   } | null>(null);
+  const loadedImageElementRef = useRef<HTMLImageElement | null>(null);
   const aiImageDataUrlRef = useRef<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -84,16 +86,21 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     setIsAnalyzing(false);
   };
 
-  // Helper to draw an image onto a square canvas while preserving aspect ratio (center-crop)
-  const drawImagePreservingAspect = (
+  // Helper to draw an image onto a square canvas using either 'fill' (center-crop) or 'fit' (full frame)
+  const drawImageWithCropMode = (
     ctx: CanvasRenderingContext2D,
     img: HTMLImageElement,
-    targetSize: number
+    targetSize: number,
+    activeCropMode: 'fill' | 'fit'
   ) => {
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, targetSize, targetSize);
     const iw = Math.max(1, img.naturalWidth || img.width);
     const ih = Math.max(1, img.naturalHeight || img.height);
+    if (activeCropMode === 'fit') {
+      ctx.drawImage(img, 0, 0, iw, ih, 0, 0, targetSize, targetSize);
+      return;
+    }
     const scale = Math.max(targetSize / iw, targetSize / ih);
     const sw = targetSize / scale;
     const sh = targetSize / scale;
@@ -102,21 +109,21 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
   };
 
-  // Helper to encode a high-resolution (up to 896px) uncropped JPEG for Gemini Vision
-  const buildHighResAiDataUrl = (img: HTMLImageElement, maxDimension = 896): string => {
+  // Helper to encode a high-resolution (up to 896px) square JPEG matching the active cropMode for both preview & Gemini Vision
+  const buildMatchedPreviewAndAiUrl = (
+    img: HTMLImageElement,
+    activeCropMode: 'fill' | 'fit',
+    maxDimension = 896
+  ): string => {
     const iw = Math.max(1, img.naturalWidth || img.width);
     const ih = Math.max(1, img.naturalHeight || img.height);
-    const scale = Math.min(1, maxDimension / Math.max(iw, ih));
-    const outW = Math.max(1, Math.round(iw * scale));
-    const outH = Math.max(1, Math.round(ih * scale));
+    const targetDim = Math.max(1, Math.min(maxDimension, Math.max(iw, ih)));
     const aiCanvas = document.createElement('canvas');
-    aiCanvas.width = outW;
-    aiCanvas.height = outH;
+    aiCanvas.width = targetDim;
+    aiCanvas.height = targetDim;
     const aiCtx = aiCanvas.getContext('2d');
     if (!aiCtx) return '';
-    aiCtx.fillStyle = '#0f172a';
-    aiCtx.fillRect(0, 0, outW, outH);
-    aiCtx.drawImage(img, 0, 0, outW, outH);
+    drawImageWithCropMode(aiCtx, img, targetDim, activeCropMode);
     return aiCanvas.toDataURL('image/jpeg', 0.86);
   };
 
@@ -193,6 +200,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     nextMode: 'both' | 'terrain' | 'object'
   ) => {
     cancelPendingAiRequest();
+    loadedImageElementRef.current = null;
     setUploadError(null);
     setAiNotice(null);
     const rendered = renderSamplePresetToDataUrl(preset, 160);
@@ -219,22 +227,24 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
+        loadedImageElementRef.current = img;
         const canvas = document.createElement('canvas');
         const targetSize = 160;
         canvas.width = targetSize;
         canvas.height = targetSize;
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        drawImagePreservingAspect(ctx, img, targetSize);
+        drawImageWithCropMode(ctx, img, targetSize, cropMode);
         const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
         rgbaBufferRef.current = {
           rgba: imgData.data,
           width: targetSize,
           height: targetSize,
         };
-        const highResUrl = buildHighResAiDataUrl(img, 896);
+        const highResUrl = buildMatchedPreviewAndAiUrl(img, cropMode, 896);
         if (highResUrl) {
           aiImageDataUrlRef.current = highResUrl;
+          setPreviewDataUrl(highResUrl);
         }
         runLocalReconstruction(
           imgData.data,
@@ -335,13 +345,14 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         setUploadError('Tệp ảnh bị lỗi hoặc không thể giải mã. Vui lòng chọn ảnh khác.');
       };
       img.onload = () => {
+        loadedImageElementRef.current = img;
         const canvas = document.createElement('canvas');
         const targetSize = 256;
         canvas.width = targetSize;
         canvas.height = targetSize;
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        drawImagePreservingAspect(ctx, img, targetSize);
+        drawImageWithCropMode(ctx, img, targetSize, cropMode);
         const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
 
         rgbaBufferRef.current = {
@@ -349,7 +360,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           width: targetSize,
           height: targetSize,
         };
-        const highResAiUrl = buildHighResAiDataUrl(img, 896);
+        const highResAiUrl = buildMatchedPreviewAndAiUrl(img, cropMode, 896);
         aiImageDataUrlRef.current = highResAiUrl || canvas.toDataURL('image/jpeg', 0.92);
         setCustomImageName(file.name);
         setSelectedPresetId('custom');
@@ -376,6 +387,39 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       img.src = dataUrl;
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleCropModeChange = (nextCropMode: 'fill' | 'fit') => {
+    setCropMode(nextCropMode);
+    const img = loadedImageElementRef.current;
+    if (!img) return;
+    const targetSize = selectedPresetId === 'custom' ? 256 : 160;
+    const canvas = document.createElement('canvas');
+    canvas.width = targetSize;
+    canvas.height = targetSize;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    drawImageWithCropMode(ctx, img, targetSize, nextCropMode);
+    const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
+    rgbaBufferRef.current = {
+      rgba: imgData.data,
+      width: targetSize,
+      height: targetSize,
+    };
+    const highResAiUrl = buildMatchedPreviewAndAiUrl(img, nextCropMode, 896);
+    if (highResAiUrl) {
+      aiImageDataUrlRef.current = highResAiUrl;
+      setPreviewDataUrl(highResAiUrl);
+    }
+    runLocalReconstruction(
+      imgData.data,
+      targetSize,
+      targetSize,
+      reliefScale,
+      terraceSteps,
+      overrideBiome,
+      mode
+    );
   };
 
   const handleRunDeepAiScan = async () => {
@@ -743,9 +787,34 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
             <div className="grid grid-cols-2 gap-4">
               {/* Source Photo */}
               <div className="p-3 rounded-xl bg-[#162032] border border-slate-800">
-                <div className="flex items-center justify-between text-xs text-slate-300 mb-2">
+                <div className="flex items-center justify-between text-xs text-slate-300 mb-2 gap-1">
                   <span className="font-semibold">Ảnh Gốc Đầu Vào</span>
-                  <span className="text-[11px] text-slate-400">RGB Nguồn</span>
+                  <div className="flex items-center gap-1 bg-[#0d1420] p-0.5 rounded-md">
+                    <button
+                      type="button"
+                      onClick={() => handleCropModeChange('fill')}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                        cropMode === 'fill'
+                          ? 'bg-amber-400 text-slate-950 font-semibold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="Cắt giữa vuông 1:1 khớp chính xác với lưới 10×10km"
+                    >
+                      Cắt 1:1
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCropModeChange('fit')}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                        cropMode === 'fit'
+                          ? 'bg-amber-400 text-slate-950 font-semibold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="Co giãn toàn bộ khung ảnh vào lưới 10×10km"
+                    >
+                      Nguyên Khung
+                    </button>
+                  </div>
                 </div>
                 <div className="aspect-square rounded-lg overflow-hidden bg-slate-900 border border-slate-700 flex items-center justify-center">
                   {previewDataUrl ? (

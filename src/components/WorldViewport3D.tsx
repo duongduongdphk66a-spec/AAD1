@@ -26,6 +26,7 @@ import {
   animateSurfaceEcosystems,
   disposeObject3DTree,
 } from '../world/surfaceEcosystem3D';
+import { buildJunctionContinuumGroup } from '../world/junctionBridges3D';
 import { ActiveTabId } from './BottomControlDock';
 
 export type CameraPresetId =
@@ -67,6 +68,7 @@ interface WorldViewport3DProps {
   waterLevel: number;
   placedObjects: PlacedObject[];
   microStrokes?: MicroStrokeStamp[];
+  autoJunctionBlend?: boolean;
   selectedObjectId: string | null;
   activeTab: ActiveTabId;
   sculptTool: SculptToolId;
@@ -827,6 +829,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   waterLevel,
   placedObjects,
   microStrokes = [],
+  autoJunctionBlend = true,
   selectedObjectId,
   activeTab,
   placementRotationDeg = 0,
@@ -888,6 +891,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     selectionRing: THREE.Group;
     propsRoot: THREE.Group;
     microStrokesRoot: THREE.Group;
+    junctionContinuumRoot: THREE.Group;
     weatherRoot: THREE.Group;
     celestialRoot: THREE.Group;
     starDomeMat: THREE.PointsMaterial;
@@ -1022,7 +1026,13 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     posAttr.needsUpdate = true;
     const colorAttr = new THREE.BufferAttribute(linearColorArray, 3);
     terrainGeo.setAttribute('color', colorAttr);
-    terrainGeo.computeVertexNormals();
+    const initNormAttr = terrainGeo.attributes.normal as THREE.BufferAttribute | undefined;
+    if (initNormAttr) {
+      computePartialVertexNormals(heightMap, initNormAttr.array as Float32Array, null);
+      initNormAttr.needsUpdate = true;
+    } else {
+      terrainGeo.computeVertexNormals();
+    }
     terrainGeo.computeBoundingSphere();
 
     const terrainMat = new THREE.MeshStandardMaterial({
@@ -1146,6 +1156,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const microStrokesRoot = new THREE.Group();
     scene.add(microStrokesRoot);
 
+    const junctionContinuumRoot = new THREE.Group();
+    junctionContinuumRoot.name = 'junction_continuum_container';
+    scene.add(junctionContinuumRoot);
+
     const weatherRoot = new THREE.Group();
     weatherRoot.userData.activeWeather = activeWeather;
     weatherRoot.add(buildPlanetaryWeatherGroup(activeWeather));
@@ -1209,6 +1223,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       patchGroup.position.set(st.x, wy + (idx % 12) * 0.003, st.z);
       microStrokesRoot.add(patchGroup);
       microMeshMap.set(st.id, patchGroup);
+    }
+
+    if (autoJunctionBlend) {
+      junctionContinuumRoot.add(
+        buildJunctionContinuumGroup(placedObjects, microStrokes, heightMap, biomeId)
+      );
     }
 
     if (!isSoftwareGl) {
@@ -1718,6 +1738,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       selectionRing,
       propsRoot,
       microStrokesRoot,
+      junctionContinuumRoot,
       weatherRoot,
       celestialRoot,
       starDomeMat,
@@ -1821,9 +1842,6 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       const endVertex = nMaxIz * stride + nMaxIx;
       const floatStart = startVertex * 3;
       const floatCount = (endVertex - startVertex + 1) * 3;
-      posAttr.clearUpdateRanges();
-      colAttr.clearUpdateRanges();
-      normAttr.clearUpdateRanges();
       posAttr.addUpdateRange(floatStart, floatCount);
       colAttr.addUpdateRange(floatStart, floatCount);
       normAttr.addUpdateRange(floatStart, floatCount);
@@ -1863,7 +1881,13 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       colAttr.clearUpdateRanges();
       posAttr.needsUpdate = true;
       colAttr.needsUpdate = true;
-      handles.terrainGeo.computeVertexNormals();
+      if (normAttr) {
+        computePartialVertexNormals(heightMap, normAttr.array as Float32Array, null);
+        normAttr.clearUpdateRanges();
+        normAttr.needsUpdate = true;
+      } else {
+        handles.terrainGeo.computeVertexNormals();
+      }
       handles.terrainGeo.computeBoundingSphere();
 
       const currentSelectedId = latestPropsRef.current.selectedObjectId;
@@ -1998,6 +2022,22 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       patchGroup.position.set(st.x, wy + (idx % 12) * 0.003, st.z);
     }
   }, [microStrokes, heightMap, terrainVersion]);
+
+  // 3c. Sync 3D Junction & Ground Continuum Bridges (overlapping volume fusion + ground-only distant corridors + terrain stroke blending)
+  useEffect(() => {
+    const handles = sceneHandlesRef.current;
+    if (!handles) return;
+
+    const { junctionContinuumRoot } = handles;
+    disposeObject3DTree(junctionContinuumRoot);
+    junctionContinuumRoot.clear();
+
+    if (autoJunctionBlend) {
+      junctionContinuumRoot.add(
+        buildJunctionContinuumGroup(placedObjects, microStrokes, heightMap, biomeId)
+      );
+    }
+  }, [placedObjects, microStrokes, heightMap, terrainVersion, biomeId, autoJunctionBlend]);
 
   // 4. Sync Biome Atmosphere, Planetary Weather, Day/Night Cycle, Sun Azimuth Shadows & Starry Sky
   useEffect(() => {

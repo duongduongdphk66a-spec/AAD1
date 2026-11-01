@@ -430,8 +430,7 @@ export function applySculptBrush(
   worldZ: number,
   radius: number,
   strength: number,
-  outBounds?: GridDirtyRect,
-  normalMap?: Float32Array
+  outBounds?: GridDirtyRect
 ): number {
   const half = WORLD_SIZE / 2;
   const safeRadius = Math.max(MIN_BRUSH_RADIUS, radius);
@@ -521,9 +520,6 @@ export function applySculptBrush(
       maxIz: touchedMaxIz,
     };
     recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, dirtyRect);
-    if (normalMap) {
-      computePartialVertexNormals(heightMap, normalMap, dirtyRect);
-    }
     if (outBounds) {
       outBounds.minIx = dirtyRect.minIx;
       outBounds.maxIx = dirtyRect.maxIx;
@@ -559,9 +555,11 @@ export function mergeDirtyRect(
 }
 
 /**
- * Recomputes vertex normals only for the vertices inside `dirtyRect` (expanded by 1 grid cell
- * so neighbor slopes remain seamless) instead of iterating through all 25,921 vertices.
- * Returns the padded GridDirtyRect that was updated and the number of vertices processed.
+ * Recomputes vertex normals using the exact 6-triangle face-normal summation formula
+ * of Three.js `PlaneGeometry(WORLD_SIZE, WORLD_SIZE, GRID_SIZE, GRID_SIZE).rotateX(-Math.PI / 2)`.
+ * When `dirtyRect` is provided, only vertices inside `dirtyRect` (expanded by 1 grid cell)
+ * are recomputed; when `dirtyRect` is null/omitted, all 25,921 vertices are recomputed
+ * using the identical formula so partial and full updates have zero seam divergence.
  */
 export function computePartialVertexNormals(
   heightMap: Float32Array,
@@ -580,26 +578,52 @@ export function computePartialVertexNormals(
 
   for (let iz = nMinIz; iz <= nMaxIz; iz++) {
     const rowOffset = iz * stride;
-    const zPrev = Math.max(0, iz - 1) * stride;
-    const zNext = Math.min(GRID_SIZE, iz + 1) * stride;
-    const dzSpan = (iz > 0 && iz < GRID_SIZE ? 2 : 1) * cellSpan;
-
     for (let ix = nMinIx; ix <= nMaxIx; ix++) {
       const i = rowOffset + ix;
-      const xPrev = Math.max(0, ix - 1);
-      const xNext = Math.min(GRID_SIZE, ix + 1);
-      const dxSpan = (ix > 0 && ix < GRID_SIZE ? 2 : 1) * cellSpan;
+      const h00 = heightMap[i] ?? 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 0;
 
-      const hL = heightMap[rowOffset + xPrev] ?? 0;
-      const hR = heightMap[rowOffset + xNext] ?? 0;
-      const hU = heightMap[zPrev + ix] ?? 0;
-      const hD = heightMap[zNext + ix] ?? 0;
+      // 1. Bottom-Right cell (ix, iz) -> corner a (Triangle 1)
+      if (ix < GRID_SIZE && iz < GRID_SIZE) {
+        const h10 = heightMap[rowOffset + (ix + 1)] ?? 0;
+        const h01 = heightMap[(iz + 1) * stride + ix] ?? 0;
+        nx += h00 - h10;
+        ny += cellSpan;
+        nz += h00 - h01;
+      }
 
-      const nx = (hL - hR) / dxSpan;
-      const ny = 1.0;
-      const nz = (hU - hD) / dzSpan;
-      const invLen = 1.0 / Math.hypot(nx, ny, nz);
+      // 2. Bottom-Left cell (ix - 1, iz) -> corner d (Triangle 1 + Triangle 2)
+      if (ix > 0 && iz < GRID_SIZE) {
+        const hL0 = heightMap[rowOffset + (ix - 1)] ?? 0;
+        const hL1 = heightMap[(iz + 1) * stride + (ix - 1)] ?? 0;
+        const h01 = heightMap[(iz + 1) * stride + ix] ?? 0;
+        nx += hL0 - h00 + (hL1 - h01);
+        ny += 2 * cellSpan;
+        nz += hL0 - hL1 + (h00 - h01);
+      }
 
+      // 3. Top-Right cell (ix, iz - 1) -> corner b (Triangle 1 + Triangle 2)
+      if (ix < GRID_SIZE && iz > 0) {
+        const h0U = heightMap[(iz - 1) * stride + ix] ?? 0;
+        const h1U = heightMap[(iz - 1) * stride + (ix + 1)] ?? 0;
+        const h10 = heightMap[rowOffset + (ix + 1)] ?? 0;
+        nx += h0U - h1U + (h00 - h10);
+        ny += 2 * cellSpan;
+        nz += h0U - h00 + (h1U - h10);
+      }
+
+      // 4. Top-Left cell (ix - 1, iz - 1) -> corner c (Triangle 2)
+      if (ix > 0 && iz > 0) {
+        const hL0 = heightMap[rowOffset + (ix - 1)] ?? 0;
+        const h0U = heightMap[(iz - 1) * stride + ix] ?? 0;
+        nx += hL0 - h00;
+        ny += cellSpan;
+        nz += h0U - h00;
+      }
+
+      const invLen = 1.0 / (Math.hypot(nx, ny, nz) || 1.0);
       const nIdx = i * 3;
       normalArray[nIdx] = nx * invLen;
       normalArray[nIdx + 1] = ny * invLen;

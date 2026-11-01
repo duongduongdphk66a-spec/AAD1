@@ -12,9 +12,7 @@ import {
   FLOWER_COLOR_PALETTE,
   BRUSH_SCALE_PAGES,
   getBrushPageIndexForRadius,
-  VIRTUAL_RESOLUTION_PX,
-  VIRTUAL_SIDE_PX,
-  PIXEL_SIZE_CM,
+  CELL_SPAN_METERS,
   TOTAL_VERTICES,
   PREFAB_CATALOG,
   generateFlatEarthTerrain,
@@ -55,14 +53,29 @@ import * as prefabsMod from './registry/prefabs';
 import * as brushesMod from './brushes';
 import * as sculptingMod from './sculpting';
 import * as generationMod from './generation';
+import path from 'node:path';
+import type { Request, Response } from 'express';
+import {
+  resolveSafeDistFile,
+  selectContentEncoding,
+  serveCompressedOrStatic,
+} from '../../server';
+import {
+  blendObjectsAndTerrainJunctions,
+  computeObjectJunctionPairs,
+  hermiteInterpolateOrExtrapolate,
+  interpolateOrExtrapolateRgb,
+  polynomialSmoothMin,
+  quinticSmoothstep,
+} from './junctionBlending';
+import { buildJunctionContinuumGroup } from './junctionBridges3D';
 
-test('world dimensions are 10x10km, 10,000,000,000px (100x increase, 10cm/px) vector resolution, 1km max elevation, multi-page brush scales (5m, 25m, 100m, 500m, 2.5km), 3-5cm real grass, customizable 3D flowers, and 1:1 real building dimensions', () => {
+test('world dimensions are 10x10km, 161x161 grid (62.5m/cell), 1km max elevation, multi-page brush scales (5m, 25m, 100m, 500m, 2.5km), 3-5cm real grass, customizable 3D flowers, and 1:1 real building dimensions', () => {
   assert.equal(WORLD_SIZE, 10000);
   assert.equal(WORLD_SIZE_KM, 10);
   assert.equal(MAX_ELEVATION, 1000);
-  assert.equal(VIRTUAL_SIDE_PX, 100000);
-  assert.equal(VIRTUAL_RESOLUTION_PX, 10000000000);
-  assert.equal(PIXEL_SIZE_CM, 10);
+  assert.equal(CELL_SPAN_METERS, 62.5);
+  assert.equal(WORLD_SIZE / GRID_SIZE, CELL_SPAN_METERS);
   assert.equal(MIN_BRUSH_RADIUS, 1);
   assert.equal(MIN_GRASS_HEIGHT_CM, 3.0);
   assert.equal(MAX_GRASS_HEIGHT_CM, 5.0);
@@ -622,10 +635,17 @@ test('island_volcano_icon 3D model reproduces all 5 layers of reference image_19
   assert.ok(cloud2 && cloud2.userData.isDetachedSmokeCloud, 'Layer 5c: Detached smoke cloud 2 higher on right');
   assert.ok(cloud2.position.x > cloud1.position.x && cloud2.position.y > cloud1.position.y);
 
-  // Verify sample photo preset and starter flat earth terrain include all 7 featured reference mountains
+  // Verify sample photo presets use .webp thumbnails and starter flat earth terrain includes all 7 featured reference mountains
   const volcanoPreset = SAMPLE_PHOTO_PRESETS.find((p) => p.id === 'island_volcano_ref');
   assert.ok(volcanoPreset);
-  assert.equal(volcanoPreset.imageUrl, '/assets/aistudio/image_19e38ffa.png');
+  assert.equal(volcanoPreset.imageUrl, '/assets/aistudio/image_19e38ffa.webp');
+  for (const presetWithAsset of SAMPLE_PHOTO_PRESETS.filter((p) => p.imageUrl)) {
+    assert.ok(
+      presetWithAsset.imageUrl?.startsWith('/assets/aistudio/') &&
+        presetWithAsset.imageUrl.endsWith('.webp'),
+      `Sample photo preset ${presetWithAsset.id} should use a .webp thumbnail in /assets/aistudio/`
+    );
+  }
   const flatWorld = generateFlatEarthTerrain('mondstadt_meadow');
   for (const featuredId of [
     'pluto_cryo_volcano',
@@ -885,12 +905,9 @@ test('deserializeWorldFromSavePayload rejects malformed heightMap/gridSize/versi
   }
 });
 
-test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and compute surface normals only within dirtyRect', () => {
+test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and computePartialVertexNormals matches Three.js PlaneGeometry normals on jagged terrain', () => {
   const world = generateFlatEarthTerrain('mondstadt_meadow');
   const sculptBounds = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
-  const sculptNormals = new Float32Array(TOTAL_VERTICES * 3);
-  const sentinelValue = 7.5;
-  sculptNormals.fill(sentinelValue);
 
   const changed = applySculptBrush(
     world.heightMap,
@@ -902,24 +919,9 @@ test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and c
     0,
     120,
     50,
-    sculptBounds,
-    sculptNormals
+    sculptBounds
   );
   assert.ok(changed > 0);
-  // Distant corner vertex normal (0, 0) outside dirtyRect must remain untouched (sentinelValue)
-  assert.equal(
-    sculptNormals[0],
-    sentinelValue,
-    'applySculptBrush must not touch normals outside the padded dirtyRect'
-  );
-  // Center vertex normal inside dirtyRect must be recomputed to unit length
-  const centerIdx = (GRID_SIZE / 2) * (GRID_SIZE + 1) + GRID_SIZE / 2;
-  const cLen = Math.hypot(
-    sculptNormals[centerIdx * 3],
-    sculptNormals[centerIdx * 3 + 1],
-    sculptNormals[centerIdx * 3 + 2]
-  );
-  assert.ok(Math.abs(cLen - 1.0) < 1e-5, 'applySculptBrush must recompute unit normals inside dirtyRect');
   const centerCell = GRID_SIZE / 2;
   assert.ok(sculptBounds.minIx >= centerCell - 4 && sculptBounds.maxIx <= centerCell + 4);
   assert.ok(sculptBounds.minIz >= centerCell - 4 && sculptBounds.maxIz <= centerCell + 4);
@@ -945,16 +947,20 @@ test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and c
   assert.equal(paintBounds.minIx, sculptBounds.minIx);
   assert.equal(paintBounds.maxIx, sculptBounds.maxIx);
 
-  // Verify computePartialVertexNormals updates only the 1-cell padded dirtyRect instead of all 25,921 vertices
+  // Verify computePartialVertexNormals updates only the 1-cell padded dirtyRect and leaves outside vertices untouched
   const normalArray = new Float32Array(TOTAL_VERTICES * 3);
-  for (let i = 0; i < TOTAL_VERTICES; i++) {
-    normalArray[i * 3 + 1] = 1.0; // Initial flat terrain up-normal (0, 1, 0)
-  }
+  const sentinelValue = 7.5;
+  normalArray.fill(sentinelValue);
 
   const { paddedRect, updatedVertexCount } = sculptingMod.computePartialVertexNormals(
     world.heightMap,
     normalArray,
     sculptBounds
+  );
+  assert.equal(
+    normalArray[0],
+    sentinelValue,
+    'computePartialVertexNormals must not touch normals outside the padded dirtyRect'
   );
   assert.equal(paddedRect.minIx, Math.max(0, sculptBounds.minIx - 1));
   assert.equal(paddedRect.maxIx, Math.min(GRID_SIZE, sculptBounds.maxIx + 1));
@@ -965,13 +971,56 @@ test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and c
     `computePartialVertexNormals should process < 100 vertices for a 120m brush instead of ${TOTAL_VERTICES}, got ${updatedVertexCount}`
   );
 
-  // Check that a sloped vertex near the raised center has a tilted unit normal (nx !== 0 || nz !== 0)
-  const slopeIdx = centerCell * (GRID_SIZE + 1) + (centerCell + 1);
-  const nx = normalArray[slopeIdx * 3];
-  const ny = normalArray[slopeIdx * 3 + 1];
-  const nz = normalArray[slopeIdx * 3 + 2];
-  assert.ok(Math.abs(Math.hypot(nx, ny, nz) - 1.0) < 1e-5, 'Computed normal must be unit length');
-  assert.ok(nx > 0.01, 'East slope of a raised peak should have positive X normal component');
+  // Verify exact parity between partial normals, full normals, and Three.js PlaneGeometry.computeVertexNormals() even on jagged 1-2 cell terrain
+  const jaggedHeights = new Float32Array(TOTAL_VERTICES);
+  for (let i = 0; i < TOTAL_VERTICES; i++) {
+    jaggedHeights[i] = Math.sin(i * 1.7) * 350 + (i % 2 === 0 ? 160 : -160);
+  }
+  const fullNormals = new Float32Array(TOTAL_VERTICES * 3);
+  sculptingMod.computePartialVertexNormals(jaggedHeights, fullNormals, null);
+
+  const partialNormals = new Float32Array(fullNormals);
+  partialNormals.fill(0);
+  sculptingMod.computePartialVertexNormals(jaggedHeights, partialNormals, {
+    minIx: 40,
+    maxIx: 55,
+    minIz: 40,
+    maxIz: 55,
+  });
+
+  const refGeo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, GRID_SIZE, GRID_SIZE);
+  refGeo.rotateX(-Math.PI / 2);
+  const refPos = refGeo.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < refPos.count; i++) {
+    refPos.setY(i, jaggedHeights[i]);
+  }
+  refGeo.computeVertexNormals();
+  const threeNormals = (refGeo.attributes.normal as THREE.BufferAttribute).array as Float32Array;
+
+  for (let iz = 39; iz <= 56; iz++) {
+    for (let ix = 39; ix <= 56; ix++) {
+      const idx = (iz * (GRID_SIZE + 1) + ix) * 3;
+      assert.equal(partialNormals[idx], fullNormals[idx], 'Partial and full normal X must be identical');
+      assert.equal(partialNormals[idx + 1], fullNormals[idx + 1], 'Partial and full normal Y must be identical');
+      assert.equal(partialNormals[idx + 2], fullNormals[idx + 2], 'Partial and full normal Z must be identical');
+
+      const dot = Math.min(
+        1,
+        Math.max(
+          -1,
+          fullNormals[idx] * threeNormals[idx] +
+            fullNormals[idx + 1] * threeNormals[idx + 1] +
+            fullNormals[idx + 2] * threeNormals[idx + 2]
+        )
+      );
+      const angleDeg = Math.acos(dot) * (180 / Math.PI);
+      assert.ok(
+        angleDeg < 0.05,
+        `Normal on jagged terrain must match Three.js computeVertexNormals within 0.05 deg, got ${angleDeg}`
+      );
+    }
+  }
+  refGeo.dispose();
 
   // Verify mergeDirtyRect accumulates multiple brush strokes cleanly
   const merged = sculptingMod.mergeDirtyRect(sculptBounds, {
@@ -1019,4 +1068,242 @@ test('disposeObject3DTree disposes material textures (map, normalMap, emissiveMa
   assert.equal(normalDisposed, true, 'Should dispose material.normalMap texture');
   assert.equal(sharedDisposed, false, 'Should not dispose textures marked with userData.shared = true');
 });
+
+test('serveCompressedOrStatic blocks sibling path traversal via path.relative, catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
+  const distDir = path.resolve('/app/applet/dist');
+  const middleware = serveCompressedOrStatic(distDir);
+
+  // 1. Path traversal to sibling directory (/..%2fdist-secret%2fsecret.json) is blocked via path.relative(distPath, resolvedFile)
+  assert.equal(resolveSafeDistFile(distDir, '/../dist-secret/secret.json'), null);
+  let nextCalledForTraversal = false;
+  await middleware(
+    {
+      method: 'GET',
+      path: '/..%2fdist-secret%2fsecret.json',
+      headers: { 'accept-encoding': 'gzip, br' },
+    } as unknown as Request,
+    {} as unknown as Response,
+    () => {
+      nextCalledForTraversal = true;
+    }
+  );
+  assert.equal(
+    nextCalledForTraversal,
+    true,
+    'Middleware must reject sibling directory traversal and delegate to next()'
+  );
+
+  // 2. Malformed URI percent-encoding is caught by try-catch and returns HTTP 400 instead of throwing URIError (500)
+  let statusCode = 200;
+  let jsonBody: unknown = null;
+  await middleware(
+    {
+      method: 'GET',
+      path: '/%E0%A4%A',
+      headers: { 'accept-encoding': 'br' },
+    } as unknown as Request,
+    {
+      status(code: number) {
+        statusCode = code;
+        return this;
+      },
+      json(payload: unknown) {
+        jsonBody = payload;
+        return this;
+      },
+    } as unknown as Response,
+    () => {}
+  );
+  assert.equal(statusCode, 400, 'Malformed URI must return HTTP 400');
+  assert.ok(jsonBody && typeof jsonBody === 'object');
+
+  // 3. Accept-Encoding: br;q=0 is respected (never serves br when q=0)
+  assert.equal(selectContentEncoding('br;q=0'), null);
+  assert.equal(selectContentEncoding('br;q=0, gzip;q=0.8'), 'gzip');
+  let nextCalledForBrQ0 = false;
+  await middleware(
+    {
+      method: 'GET',
+      path: '/index.html',
+      headers: { 'accept-encoding': 'br;q=0' },
+    } as unknown as Request,
+    {} as unknown as Response,
+    () => {
+      nextCalledForBrQ0 = true;
+    }
+  );
+  assert.equal(
+    nextCalledForBrQ0,
+    true,
+    'Middleware must not serve Brotli when Accept-Encoding specifies br;q=0'
+  );
+});
+
+test('junctionBlending and junctionBridges3D fuse overlapping structures as 1 volume and interpolate/extrapolate only the bottom ground for distant objects', () => {
+  // 1. Verify Hermite interpolation (t in [0, 1]) and damped tangent extrapolation (t < 0, t > 1)
+  assert.equal(hermiteInterpolateOrExtrapolate(10, 30, 5, 5, 0), 10);
+  assert.equal(hermiteInterpolateOrExtrapolate(10, 30, 5, 5, 1), 30);
+  const midH = hermiteInterpolateOrExtrapolate(10, 30, 0, 0, 0.5);
+  assert.equal(midH, 20, 'Symmetric Hermite midpoint must equal 20');
+  const extrapLeft = hermiteInterpolateOrExtrapolate(10, 30, 12, 12, -0.2);
+  const extrapRight = hermiteInterpolateOrExtrapolate(10, 30, 12, 12, 1.2);
+  assert.ok(extrapLeft < 10 && extrapLeft > 5, 'Left extrapolation must continue slope smoothly');
+  assert.ok(extrapRight > 30 && extrapRight < 35, 'Right extrapolation must continue slope smoothly');
+
+  // 2. Verify C2 quintic color interpolation & extrapolation
+  const colMid = interpolateOrExtrapolateRgb([0.2, 0.4, 0.8], [0.8, 0.6, 0.2], 0.5);
+  assert.ok(Math.abs(colMid[0] - 0.5) < 1e-6);
+  assert.equal(quinticSmoothstep(0), 0);
+  assert.equal(quinticSmoothstep(1), 1);
+  assert.equal(quinticSmoothstep(0.5), 0.5);
+
+  const sminRes = polynomialSmoothMin(4.0, 4.0, 2.0);
+  assert.ok(sminRes.value < 4.0, 'Smooth minimum of equal values must round the junction corner');
+
+  // 3. Verify pair classification: overlapping pair (d = 8m) vs distant pair (d = 180m)
+  const testObjects = [
+    {
+      id: 'obj-overlap-a',
+      prefabId: 'windmill_cottage' as const,
+      label: 'Nhà A',
+      x: 0,
+      y: 0,
+      z: 0,
+      scale: 1.2,
+      rotationY: 0,
+    },
+    {
+      id: 'obj-overlap-b',
+      prefabId: 'sakura_shrine' as const,
+      label: 'Đền B (Đè lên A)',
+      x: 8,
+      y: 0,
+      z: 0,
+      scale: 1.2,
+      rotationY: 0.4,
+    },
+    {
+      id: 'obj-distant-c',
+      prefabId: 'mars_olympus_shield' as const,
+      label: 'Núi C (Ở xa)',
+      x: 180,
+      y: 0,
+      z: 0,
+      scale: 1.3,
+      rotationY: 0,
+    },
+  ];
+
+  const pairs = computeObjectJunctionPairs(testObjects);
+  const overlapPair = pairs.find(
+    (p) => p.objA.id === 'obj-overlap-a' && p.objB.id === 'obj-overlap-b'
+  );
+  const distantPair = pairs.find(
+    (p) => p.objB.id === 'obj-distant-c'
+  );
+
+  assert.ok(overlapPair, 'Should detect overlapping pair A-B');
+  assert.equal(overlapPair.mode, 'overlap_fusion');
+  assert.equal(overlapPair.groundOnly, false);
+
+  assert.ok(distantPair, 'Should detect distant pair to C');
+  assert.equal(distantPair.mode, 'distant_ground_only');
+  assert.equal(
+    distantPair.groundOnly,
+    true,
+    'Distant object pair must be flagged groundOnly = true ("chỉ tác động vào nền đất dưới cùng")'
+  );
+
+  // 4. Verify terrain & color blending on flat world with height difference
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
+  applySculptBrush(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    'raise',
+    180,
+    0,
+    140,
+    80
+  );
+
+  const blendRes = blendObjectsAndTerrainJunctions(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    testObjects,
+    { smoothTerrainSeams: true }
+  );
+
+  assert.equal(blendRes.overlapFusionCount, 1);
+  assert.ok(blendRes.distantGroundCorridorCount >= 1);
+  assert.ok(blendRes.modifiedVerticesCount > 0);
+  assert.ok(blendRes.blendedColorVerticesCount > 0);
+
+  // 5. Verify 3D Junction Continuum Group builds volume bridge for overlapping pair and ground-only strip for distant pair
+  const continuumGroup = buildJunctionContinuumGroup(
+    blendRes.updatedObjects,
+    [
+      { id: 'ms-1', x: -10, z: -10, radius: 14, brushId: 'emerald_grass' },
+      { id: 'ms-2', x: 4, z: -10, radius: 14, brushId: 'volcanic_lava' },
+    ],
+    world.heightMap,
+    'mondstadt_meadow'
+  );
+
+  assert.equal(continuumGroup.userData.overlapFusionCount, 1);
+  assert.ok(continuumGroup.userData.distantGroundCorridorCount >= 1);
+  assert.equal(continuumGroup.userData.terrainStrokeBridgeCount, 1);
+
+  let foundOverlapMesh = false;
+  let foundDistantGroundMesh = false;
+
+  continuumGroup.traverse((child) => {
+    if (child instanceof THREE.Mesh && child.userData.isJunctionBridge) {
+      const posAttr = child.geometry.attributes.position as THREE.BufferAttribute;
+      const colAttr = child.geometry.attributes.color as THREE.BufferAttribute;
+      assert.ok(posAttr.count > 20);
+      assert.equal(colAttr.count, posAttr.count, 'Every bridge vertex must have interpolated vertex color');
+
+      if (child.userData.junctionMode === 'overlap_fusion') {
+        foundOverlapMesh = true;
+        assert.equal(child.userData.groundOnly, false);
+        // Verify that the fused volume bridge rises significantly above ground to unite the 2 overlapping structures
+        let maxHeightAboveGround = 0;
+        for (let i = 0; i < posAttr.count; i++) {
+          const vx = posAttr.getX(i);
+          const vy = posAttr.getY(i);
+          const vz = posAttr.getZ(i);
+          const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
+          maxHeightAboveGround = Math.max(maxHeightAboveGround, vy - gy);
+        }
+        assert.ok(
+          maxHeightAboveGround > 1.2,
+          `Overlapping structures bridge should rise > 1.2m to fuse volumes as 1, got ${maxHeightAboveGround}`
+        );
+      } else if (child.userData.junctionMode === 'distant_ground_only') {
+        foundDistantGroundMesh = true;
+        assert.equal(child.userData.groundOnly, true);
+        // Verify that distant objects' continuum strip ONLY affects the bottom ground (never rises into upper structures)
+        for (let i = 0; i < posAttr.count; i++) {
+          const vx = posAttr.getX(i);
+          const vy = posAttr.getY(i);
+          const vz = posAttr.getZ(i);
+          const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
+          assert.ok(
+            Math.abs(vy - gy) < 15,
+            'Distant ground strip must stay hugging the interpolated bottom ground'
+          );
+        }
+      }
+    }
+  });
+
+  assert.equal(foundOverlapMesh, true);
+  assert.equal(foundDistantGroundMesh, true);
+  disposeObject3DTree(continuumGroup);
+});
+
 

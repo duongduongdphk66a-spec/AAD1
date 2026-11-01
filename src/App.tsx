@@ -57,6 +57,7 @@ import {
   timeOfDayToSunElevation,
   validateWorldSavePayload,
 } from './world/generation';
+import { blendObjectsAndTerrainJunctions } from './world/junctionBlending';
 import { WorldViewport3D, CameraPresetId, ScaleMetrics } from './components/WorldViewport3D';
 import { BottomControlDock, ActiveTabId } from './components/BottomControlDock';
 import { DistanceScaleBar } from './components/DistanceScaleBar';
@@ -90,13 +91,6 @@ export default function App() {
   const heightMapRef = useRef<Float32Array>(initialWorldRef.current.heightMap);
   const splatMapRef = useRef<Uint8Array>(initialWorldRef.current.splatMap);
   const colorMapRef = useRef<Float32Array>(initialWorldRef.current.colorMap);
-  const normalMapRef = useRef<Float32Array>((() => {
-    const arr = new Float32Array(TOTAL_VERTICES * 3);
-    for (let i = 0; i < TOTAL_VERTICES; i++) {
-      arr[i * 3 + 1] = 1.0;
-    }
-    return arr;
-  })());
 
   const [terrainVersion, setTerrainVersion] = useState<number>(1);
   const [biomeId, setBiomeId] = useState<BiomeId>('mondstadt_meadow');
@@ -121,7 +115,7 @@ export default function App() {
   const [undoStack, setUndoStack] = useState<WorldHistorySnapshot[]>([]);
   const lastStrokeSnapshotTimeRef = useRef<number>(0);
 
-  // Unified Bottom Dock State (calibrated for 10x10 km / 10,000,000,000 px / min 1m brush / 1:1 scale)
+  // Unified Bottom Dock State (calibrated for 10x10 km / 161x161 grid (62.5m/cell) / min 1m brush / 1:1 scale)
   const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<ActiveTabId>('prefabs');
   const [sculptTool, setSculptTool] = useState<SculptToolId>('sheer_cliff');
@@ -142,6 +136,7 @@ export default function App() {
   const [prefabCategoryFilter, setPrefabCategoryFilter] = useState<PrefabCategory | 'all'>('all');
   const [placementRotationDeg, setPlacementRotationDeg] = useState<number>(0);
   const [placementScale, setPlacementScale] = useState<number>(1.35);
+  const [autoJunctionBlend, setAutoJunctionBlend] = useState<boolean>(true);
 
   // Atmosphere, Planetary Weather, Day/Night Cycle & Camera State
   const [activeWeather, setActiveWeather] = useState<WeatherId>('clear_sky');
@@ -184,15 +179,17 @@ export default function App() {
     regionTitle,
     undoStack,
   });
-  latestStateRef.current = {
-    placedObjects,
-    microStrokes,
-    selectedObjectId,
-    biomeId,
-    waterLevel,
-    regionTitle,
-    undoStack,
-  };
+  useEffect(() => {
+    latestStateRef.current = {
+      placedObjects,
+      microStrokes,
+      selectedObjectId,
+      biomeId,
+      waterLevel,
+      regionTitle,
+      undoStack,
+    };
+  });
 
   useEffect(() => {
     if (!statusBanner) return;
@@ -465,8 +462,7 @@ export default function App() {
           worldZ,
           brushRadius,
           brushStrength,
-          bounds,
-          normalMapRef.current
+          bounds
         );
         if (changed > 0) {
           dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, bounds);
@@ -480,25 +476,27 @@ export default function App() {
               maxIz: Math.min(GRID_SIZE, Math.ceil(((worldZ + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
             };
             dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, ruleBounds);
-            setPlacedObjects((prevObjs) => {
-              const ruleRes = executeTerrainRules(
-                heightMapRef.current,
-                splatMapRef.current,
-                colorMapRef.current,
-                biomeId,
-                terrainRules,
-                prevObjs,
-                {
-                  ensureMatchingTerrain: false,
-                  focusAreaWorldX: worldX,
-                  focusAreaWorldZ: worldZ,
-                  focusRadiusMeters: focusRadius,
-                }
-              );
-              return ruleRes.newObjects;
-            });
+            const ruleRes = executeTerrainRules(
+              heightMapRef.current,
+              splatMapRef.current,
+              colorMapRef.current,
+              biomeId,
+              terrainRules,
+              latestStateRef.current.placedObjects,
+              {
+                ensureMatchingTerrain: false,
+                focusAreaWorldX: worldX,
+                focusAreaWorldZ: worldZ,
+                focusRadiusMeters: focusRadius,
+              }
+            );
+            setPlacedObjects(ruleRes.newObjects);
           } else {
-            setPlacedObjects((prevObjs) => syncObjectsToGround(prevObjs, bounds));
+            const syncedObjs = syncObjectsToGround(
+              latestStateRef.current.placedObjects,
+              bounds
+            );
+            setPlacedObjects(syncedObjs);
           }
           setTerrainVersion((v) => v + 1);
         }
@@ -620,6 +618,7 @@ export default function App() {
   }, [biomeId, pushUndoSnapshot, showToast]);
 
   // Place a 3D prefab at specific world coordinates with chosen orientation & scale (1:1 real dimensions)
+  // Automatically fuses overlapping structures ("nối liền như 2 khối là 1") and interpolates/extrapolates bottom ground for distant objects
   const handlePlacePrefabAt = useCallback(
     (worldX: number, worldZ: number, prefabOverride?: PrefabId) => {
       const targetPrefabId = prefabOverride || selectedPrefab;
@@ -649,14 +648,85 @@ export default function App() {
         rotationY: rotRad,
       };
 
-      setPlacedObjects((prev) => [...prev, newObj]);
-      setSelectedObjectId(newObj.id);
-      showToast(
-        `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] (Hướng ${placementRotationDeg}°, Cỡ ${finalScale}x) tại (${Math.round(worldX)}m, ${Math.round(worldZ)}m).`
-      );
+      const candidateList = [...latestStateRef.current.placedObjects, newObj];
+      if (autoJunctionBlend) {
+        const blendRes = blendObjectsAndTerrainJunctions(
+          heightMapRef.current,
+          splatMapRef.current,
+          colorMapRef.current,
+          biomeId,
+          candidateList,
+          {
+            microStrokes: latestStateRef.current.microStrokes,
+            focusObjectId: newObj.id,
+            smoothTerrainSeams: true,
+          }
+        );
+        setPlacedObjects(blendRes.updatedObjects);
+        setSelectedObjectId(newObj.id);
+        if (blendRes.dirtyRect) {
+          dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, blendRes.dirtyRect);
+          setTerrainVersion((v) => v + 1);
+        }
+        if (blendRes.overlapFusionCount > 0) {
+          showToast(
+            `Đã đặt "${meta.name}" & tự động nối liền tiếp giáp như 1 khối (${blendRes.overlapFusionCount} điểm giao + nội/ngoại suy màu & nền đất dưới cùng).`
+          );
+        } else {
+          showToast(
+            `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] & nội/ngoại suy mượt nền đất dưới cùng với ${blendRes.distantGroundCorridorCount} vật thể lân cận.`
+          );
+        }
+      } else {
+        setPlacedObjects(candidateList);
+        setSelectedObjectId(newObj.id);
+        showToast(
+          `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] (Hướng ${placementRotationDeg}°, Cỡ ${finalScale}x) tại (${Math.round(worldX)}m, ${Math.round(worldZ)}m).`
+        );
+      }
     },
-    [selectedPrefab, placementRotationDeg, placementScale, pushUndoSnapshot, showToast]
+    [
+      selectedPrefab,
+      placementRotationDeg,
+      placementScale,
+      autoJunctionBlend,
+      biomeId,
+      pushUndoSnapshot,
+      showToast,
+    ]
   );
+
+  // Execute full-map junction interpolation & extrapolation across all overlapping/distant objects and terrain seams
+  const handleExecuteJunctionBlend = useCallback(() => {
+    pushUndoSnapshot('Nối liền tiếp giáp (Nội/Ngoại suy)');
+    const blendRes = blendObjectsAndTerrainJunctions(
+      heightMapRef.current,
+      splatMapRef.current,
+      colorMapRef.current,
+      biomeId,
+      latestStateRef.current.placedObjects,
+      {
+        microStrokes: latestStateRef.current.microStrokes,
+        smoothTerrainSeams: true,
+      }
+    );
+    setPlacedObjects(blendRes.updatedObjects);
+    dirtyRectRef.current = null;
+    setTerrainVersion((v) => v + 1);
+    showToast(blendRes.summary);
+  }, [biomeId, pushUndoSnapshot, showToast]);
+
+  const handleToggleAutoJunctionBlend = useCallback(() => {
+    setAutoJunctionBlend((prev) => {
+      const next = !prev;
+      showToast(
+        next
+          ? 'Đã bật Tự Động Nối Liền Tiếp Giáp (Nội/Ngoại suy khối giao nhau & nền đất dưới cùng).'
+          : 'Đã tắt Tự Động Nối Liền Tiếp Giáp.'
+      );
+      return next;
+    });
+  }, [showToast]);
 
   // Spawn prefab near map center at realistic 1:1 village distances (12m - 44m)
   const handleSpawnPrefabAtCenter = useCallback(
@@ -1073,6 +1143,7 @@ export default function App() {
           waterLevel={waterLevel}
           placedObjects={placedObjects}
           microStrokes={microStrokes}
+          autoJunctionBlend={autoJunctionBlend}
           selectedObjectId={selectedObjectId}
           activeTab={activeTab}
           sculptTool={sculptTool}
@@ -1240,7 +1311,7 @@ export default function App() {
             testId: 'focus-pluto-btn',
             shortTab: 'Pluto',
             title: 'Núi Lửa Băng Wright Mons (Sao Diêm Vương)',
-            img: '/assets/aistudio/pluto_cryovolcano_ref.svg',
+            img: '/assets/aistudio/pluto_cryovolcano_ref.webp',
             desc: 'Nền tholin nâu đỏ gồ ghề · Sông băng nitơ trắng xanh tràn miệng caldera sụt lún · Cột phun Cryoplume thẳng đứng (NASA/JHUAPL/SwRI)',
           },
           {
@@ -1249,7 +1320,7 @@ export default function App() {
             testId: 'focus-europa-btn',
             shortTab: 'Europa',
             title: 'Mặt Cắt Rãnh Nứt Băng & Đại Dương Europa',
-            img: '/assets/aistudio/europa_ocean_rifts_ref.svg',
+            img: '/assets/aistudio/europa_ocean_rifts_ref.webp',
             desc: 'Buồng magma đáy biển · Thủy nhiệt khói trắng · Đại dương ngầm xanh ngọc · Vỏ băng nứt rãnh vàng cam & cột phun hơi nước',
           },
           {
@@ -1258,7 +1329,7 @@ export default function App() {
             testId: 'focus-alps-btn',
             shortTab: 'Alps',
             title: 'Đỉnh Sừng Băng Matterhorn (Dãy Anpơ)',
-            img: '/assets/aistudio/alps_matterhorn_ref.svg',
+            img: '/assets/aistudio/alps_matterhorn_ref.webp',
             desc: 'Thảm cỏ hoa đỗ quyên xanh mướt ở tiền cảnh · Yên ngựa tuyết trắng · Chóp sừng kim tự tháp nghiêng (mặt sáng xám + vách tối xanh lam)',
           },
           {
@@ -1267,7 +1338,7 @@ export default function App() {
             testId: 'focus-himalaya-btn',
             shortTab: 'Himalaya',
             title: 'Đỉnh Đuôi Cá Machapuchare (Dãy Himalaya)',
-            img: '/assets/aistudio/himalaya_fishtail_ref.svg',
+            img: '/assets/aistudio/himalaya_fishtail_ref.webp',
             desc: 'Đồi tiền cảnh nâu vàng bên trái · Vách tuyết dựng đứng đan xen sống đá xanh đen · Máng tuyết lở chéo & đỉnh đôi Đuôi Cá (Fishtail)',
           },
           {
@@ -1276,7 +1347,7 @@ export default function App() {
             testId: 'focus-olympus-btn',
             shortTab: 'Olympus',
             title: 'Núi Lửa Khiên Olympus Mons (Sao Hỏa)',
-            img: '/assets/aistudio/m8uek02co8l91_09cb37ea.png',
+            img: '/assets/aistudio/m8uek02co8l91_09cb37ea.webp',
             desc: 'Vách đá Basal Scarp 8km bao quanh vòm khiên vàng đất · Sườn dung nham tỏa tròn & cụm 6 miệng caldera lồng nhau (Ảnh NASA MOLA)',
           },
           {
@@ -1285,7 +1356,7 @@ export default function App() {
             testId: 'focus-titan-btn',
             shortTab: 'Titan',
             title: 'Núi Rãnh Sao Mithrim / Doom Mons (Titan)',
-            img: '/assets/aistudio/images_1f7cdcc6.jpg',
+            img: '/assets/aistudio/images_1f7cdcc6.webp',
             desc: 'Cụm 8 sống núi băng-hydrocarbon phân nhánh hình sao (sườn sáng vàng kem & thung lũng chữ V nâu đen) trên bình nguyên cồn cát tholin',
           },
           {
@@ -1294,7 +1365,7 @@ export default function App() {
             testId: 'focus-volcano-model-btn',
             shortTab: 'Núi Lửa',
             title: 'Núi Lửa Đảo Nhiệt Đới (14 Bộ Phận)',
-            img: '/assets/aistudio/image_19e38ffa.png',
+            img: '/assets/aistudio/image_19e38ffa.webp',
             desc: 'Bãi cát vàng uốn lượn · Vành đai cây xanh · Nón đá nâu rãnh sâu · Dung nham vàng cam & cột khói 2 đám mây trôi',
           },
         ];
@@ -1463,6 +1534,9 @@ export default function App() {
         placementScale={placementScale}
         onChangePlacementScale={setPlacementScale}
         onSpawnPrefabAtCenter={handleSpawnPrefabAtCenter}
+        autoJunctionBlend={autoJunctionBlend}
+        onToggleAutoJunctionBlend={handleToggleAutoJunctionBlend}
+        onExecuteJunctionBlend={handleExecuteJunctionBlend}
         selectedObject={selectedObject}
         onRotateSelectedObject={handleRotateSelected}
         onSetSelectedObjectRotationDeg={handleSetSelectedObjectRotationDeg}
