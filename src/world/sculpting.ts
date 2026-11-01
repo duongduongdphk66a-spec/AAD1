@@ -11,7 +11,7 @@ import {
   WORLD_SIZE,
   getTextureIndex,
 } from './registry';
-import { recomputeTerrainColors } from './brushes';
+import { GridDirtyRect, recomputeTerrainColors } from './brushes';
 
 export interface SculptKernelContext {
   ix: number;
@@ -417,7 +417,8 @@ export const SCULPT_TOOL_HANDLERS: Record<SculptToolId, SculptKernelHandler> = {
 
 /**
  * Applies a terrain sculpting tool at world coordinates (worldX, worldZ) on the 10x10 km continent.
- * Uses a dirty-rect bounding box so small brushes only inspect & re-color the touched grid cells.
+ * Uses a tight dirty-rect bounding box so small brushes only inspect, re-color, and recompute
+ * surface normals (`computePartialVertexNormals`) on the touched grid cells instead of all 25,921 vertices.
  */
 export function applySculptBrush(
   heightMap: Float32Array,
@@ -428,7 +429,9 @@ export function applySculptBrush(
   worldX: number,
   worldZ: number,
   radius: number,
-  strength: number
+  strength: number,
+  outBounds?: GridDirtyRect,
+  normalMap?: Float32Array
 ): number {
   const half = WORLD_SIZE / 2;
   const safeRadius = Math.max(MIN_BRUSH_RADIUS, radius);
@@ -454,6 +457,11 @@ export function applySculptBrush(
     GRID_SIZE,
     Math.ceil(((worldZ + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
+
+  let touchedMinIx = GRID_SIZE;
+  let touchedMaxIx = 0;
+  let touchedMinIz = GRID_SIZE;
+  let touchedMaxIz = 0;
 
   const copyMap = tool === 'smooth' ? new Float32Array(heightMap) : null;
   const kernelHandler = SCULPT_TOOL_HANDLERS[tool] ?? SCULPT_TOOL_HANDLERS.raise;
@@ -497,17 +505,117 @@ export function applySculptBrush(
       }
 
       heightMap[idx] = Math.max(MIN_ELEVATION, Math.min(MAX_ELEVATION, nextH));
+      if (ix < touchedMinIx) touchedMinIx = ix;
+      if (ix > touchedMaxIx) touchedMaxIx = ix;
+      if (iz < touchedMinIz) touchedMinIz = iz;
+      if (iz > touchedMaxIz) touchedMaxIz = iz;
       modifiedCount++;
     }
   }
 
   if (modifiedCount > 0) {
-    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, {
-      minIx,
-      maxIx,
-      minIz,
-      maxIz,
-    });
+    const dirtyRect: GridDirtyRect = {
+      minIx: touchedMinIx,
+      maxIx: touchedMaxIx,
+      minIz: touchedMinIz,
+      maxIz: touchedMaxIz,
+    };
+    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, dirtyRect);
+    if (normalMap) {
+      computePartialVertexNormals(heightMap, normalMap, dirtyRect);
+    }
+    if (outBounds) {
+      outBounds.minIx = dirtyRect.minIx;
+      outBounds.maxIx = dirtyRect.maxIx;
+      outBounds.minIz = dirtyRect.minIz;
+      outBounds.maxIz = dirtyRect.maxIz;
+    }
   }
   return modifiedCount;
 }
+
+/**
+ * Merges two GridDirtyRect regions into their bounding union so multiple brush strokes
+ * within a single frame accumulate cleanly without losing dirty vertices.
+ */
+export function mergeDirtyRect(
+  existing: GridDirtyRect | null | undefined,
+  next: GridDirtyRect
+): GridDirtyRect {
+  if (!existing) {
+    return {
+      minIx: next.minIx,
+      maxIx: next.maxIx,
+      minIz: next.minIz,
+      maxIz: next.maxIz,
+    };
+  }
+  return {
+    minIx: Math.min(existing.minIx, next.minIx),
+    maxIx: Math.max(existing.maxIx, next.maxIx),
+    minIz: Math.min(existing.minIz, next.minIz),
+    maxIz: Math.max(existing.maxIz, next.maxIz),
+  };
+}
+
+/**
+ * Recomputes vertex normals only for the vertices inside `dirtyRect` (expanded by 1 grid cell
+ * so neighbor slopes remain seamless) instead of iterating through all 25,921 vertices.
+ * Returns the padded GridDirtyRect that was updated and the number of vertices processed.
+ */
+export function computePartialVertexNormals(
+  heightMap: Float32Array,
+  normalArray: Float32Array,
+  dirtyRect?: GridDirtyRect | null
+): { paddedRect: GridDirtyRect; updatedVertexCount: number } {
+  const stride = VERTEX_COUNT_PER_SIDE;
+  const cellSpan = WORLD_SIZE / GRID_SIZE;
+
+  const nMinIx = dirtyRect ? Math.max(0, dirtyRect.minIx - 1) : 0;
+  const nMaxIx = dirtyRect ? Math.min(GRID_SIZE, dirtyRect.maxIx + 1) : GRID_SIZE;
+  const nMinIz = dirtyRect ? Math.max(0, dirtyRect.minIz - 1) : 0;
+  const nMaxIz = dirtyRect ? Math.min(GRID_SIZE, dirtyRect.maxIz + 1) : GRID_SIZE;
+
+  let updatedVertexCount = 0;
+
+  for (let iz = nMinIz; iz <= nMaxIz; iz++) {
+    const rowOffset = iz * stride;
+    const zPrev = Math.max(0, iz - 1) * stride;
+    const zNext = Math.min(GRID_SIZE, iz + 1) * stride;
+    const dzSpan = (iz > 0 && iz < GRID_SIZE ? 2 : 1) * cellSpan;
+
+    for (let ix = nMinIx; ix <= nMaxIx; ix++) {
+      const i = rowOffset + ix;
+      const xPrev = Math.max(0, ix - 1);
+      const xNext = Math.min(GRID_SIZE, ix + 1);
+      const dxSpan = (ix > 0 && ix < GRID_SIZE ? 2 : 1) * cellSpan;
+
+      const hL = heightMap[rowOffset + xPrev] ?? 0;
+      const hR = heightMap[rowOffset + xNext] ?? 0;
+      const hU = heightMap[zPrev + ix] ?? 0;
+      const hD = heightMap[zNext + ix] ?? 0;
+
+      const nx = (hL - hR) / dxSpan;
+      const ny = 1.0;
+      const nz = (hU - hD) / dzSpan;
+      const invLen = 1.0 / Math.hypot(nx, ny, nz);
+
+      const nIdx = i * 3;
+      normalArray[nIdx] = nx * invLen;
+      normalArray[nIdx + 1] = ny * invLen;
+      normalArray[nIdx + 2] = nz * invLen;
+      updatedVertexCount++;
+    }
+  }
+
+  return {
+    paddedRect: {
+      minIx: nMinIx,
+      maxIx: nMaxIx,
+      minIz: nMinIz,
+      maxIz: nMaxIz,
+    },
+    updatedVertexCount,
+  };
+}
+

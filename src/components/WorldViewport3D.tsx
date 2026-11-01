@@ -16,7 +16,8 @@ import {
   WEATHER_CATALOG,
   WORLD_SIZE,
 } from '../world/registry';
-import { getGroundHeightAt } from '../world/sculpting';
+import { computePartialVertexNormals, getGroundHeightAt } from '../world/sculpting';
+import type { GridDirtyRect } from '../world/brushes';
 import { computeDayNightLightingState } from '../world/generation';
 import { createTerrainDetailTextures } from '../world/materialsAndTextures';
 import { ProceduralPrefabFactory } from '../world/proceduralModels';
@@ -56,6 +57,7 @@ interface WorldViewport3DProps {
   splatMap: Uint8Array;
   colorMap: Float32Array;
   terrainVersion: number;
+  dirtyRectRef?: React.MutableRefObject<GridDirtyRect | null>;
   biomeId: BiomeId;
   activeWeather?: WeatherId;
   sunElevation: number;
@@ -815,6 +817,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   heightMap,
   colorMap,
   terrainVersion,
+  dirtyRectRef,
   biomeId,
   activeWeather = 'clear_sky',
   sunElevation,
@@ -1779,32 +1782,102 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     const posAttr = handles.terrainGeo.attributes.position as THREE.BufferAttribute;
     const colAttr = handles.terrainGeo.attributes.color as THREE.BufferAttribute;
-
-    for (let i = 0; i < posAttr.count; i++) {
-      posAttr.setY(i, heightMap[i] ?? 0);
-      colAttr.setXYZ(
-        i,
-        Math.pow(colorMap[i * 3] ?? 0.4, 2.2),
-        Math.pow(colorMap[i * 3 + 1] ?? 0.3, 2.2),
-        Math.pow(colorMap[i * 3 + 2] ?? 0.2, 2.2)
-      );
+    const normAttr = handles.terrainGeo.attributes.normal as THREE.BufferAttribute | undefined;
+    const rect = dirtyRectRef?.current ?? null;
+    if (dirtyRectRef) {
+      dirtyRectRef.current = null;
     }
-    posAttr.needsUpdate = true;
-    colAttr.needsUpdate = true;
-    handles.terrainGeo.computeVertexNormals();
-    handles.terrainGeo.computeBoundingSphere();
 
-    const currentSelectedId = latestPropsRef.current.selectedObjectId;
-    handles.objectMeshMap.forEach((group, id) => {
-      const wx = group.position.x;
-      const wz = group.position.z;
-      const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
-      group.position.y = wy;
-      if (id === currentSelectedId) {
-        handles.selectionRing.position.set(wx, wy + 0.12, wz);
+    const stride = GRID_SIZE + 1;
+    const isPartialRect =
+      rect !== null &&
+      (rect.minIx > 0 || rect.maxIx < GRID_SIZE || rect.minIz > 0 || rect.maxIz < GRID_SIZE);
+
+    if (isPartialRect && rect && normAttr) {
+      const { minIx, maxIx, minIz, maxIz } = rect;
+      for (let iz = minIz; iz <= maxIz; iz++) {
+        const rowOffset = iz * stride;
+        for (let ix = minIx; ix <= maxIx; ix++) {
+          const i = rowOffset + ix;
+          posAttr.setY(i, heightMap[i] ?? 0);
+          colAttr.setXYZ(
+            i,
+            Math.pow(colorMap[i * 3] ?? 0.4, 2.2),
+            Math.pow(colorMap[i * 3 + 1] ?? 0.3, 2.2),
+            Math.pow(colorMap[i * 3 + 2] ?? 0.2, 2.2)
+          );
+        }
       }
-    });
-  }, [terrainVersion, heightMap, colorMap]);
+
+      // Recompute vertex normals exclusively inside the 1-cell padded dirtyRect
+      const { paddedRect } = computePartialVertexNormals(
+        heightMap,
+        normAttr.array as Float32Array,
+        rect
+      );
+      const { minIx: nMinIx, maxIx: nMaxIx, minIz: nMinIz, maxIz: nMaxIz } = paddedRect;
+
+      const startVertex = nMinIz * stride + nMinIx;
+      const endVertex = nMaxIz * stride + nMaxIx;
+      const floatStart = startVertex * 3;
+      const floatCount = (endVertex - startVertex + 1) * 3;
+      posAttr.clearUpdateRanges();
+      colAttr.clearUpdateRanges();
+      normAttr.clearUpdateRanges();
+      posAttr.addUpdateRange(floatStart, floatCount);
+      colAttr.addUpdateRange(floatStart, floatCount);
+      normAttr.addUpdateRange(floatStart, floatCount);
+      posAttr.needsUpdate = true;
+      colAttr.needsUpdate = true;
+      normAttr.needsUpdate = true;
+
+      const half = WORLD_SIZE / 2;
+      const minWx = (nMinIx / GRID_SIZE) * WORLD_SIZE - half;
+      const maxWx = (nMaxIx / GRID_SIZE) * WORLD_SIZE - half;
+      const minWz = (nMinIz / GRID_SIZE) * WORLD_SIZE - half;
+      const maxWz = (nMaxIz / GRID_SIZE) * WORLD_SIZE - half;
+      const currentSelectedId = latestPropsRef.current.selectedObjectId;
+
+      handles.objectMeshMap.forEach((group, id) => {
+        const wx = group.position.x;
+        const wz = group.position.z;
+        if (wx >= minWx && wx <= maxWx && wz >= minWz && wz <= maxWz) {
+          const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
+          group.position.y = wy;
+          if (id === currentSelectedId) {
+            handles.selectionRing.position.set(wx, wy + 0.12, wz);
+          }
+        }
+      });
+    } else {
+      for (let i = 0; i < posAttr.count; i++) {
+        posAttr.setY(i, heightMap[i] ?? 0);
+        colAttr.setXYZ(
+          i,
+          Math.pow(colorMap[i * 3] ?? 0.4, 2.2),
+          Math.pow(colorMap[i * 3 + 1] ?? 0.3, 2.2),
+          Math.pow(colorMap[i * 3 + 2] ?? 0.2, 2.2)
+        );
+      }
+      posAttr.clearUpdateRanges();
+      colAttr.clearUpdateRanges();
+      posAttr.needsUpdate = true;
+      colAttr.needsUpdate = true;
+      handles.terrainGeo.computeVertexNormals();
+      handles.terrainGeo.computeBoundingSphere();
+
+      const currentSelectedId = latestPropsRef.current.selectedObjectId;
+      handles.objectMeshMap.forEach((group, id) => {
+        const wx = group.position.x;
+        const wz = group.position.z;
+        const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
+        group.position.y = wy;
+        if (id === currentSelectedId) {
+          handles.selectionRing.position.set(wx, wy + 0.12, wz);
+        }
+      });
+    }
+  }, [terrainVersion, heightMap, colorMap, dirtyRectRef]);
 
   // 3. Sync Placed 3D Objects (Houses, Mountains, Trees, Landmarks) at 1:1 Real-World Scale
   useEffect(() => {

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback, Suspense, lazy } from 'react';
 import {
   Sparkles,
   Camera,
@@ -19,12 +19,10 @@ import {
   generateInitialSurfaceShowcaseStrokes,
   getTextureIndex,
   GRID_SIZE,
-  MAX_ELEVATION,
   MAX_GRASS_HEIGHT_CM,
   MicroStrokeStamp,
   MIN_BRUSH_RADIUS,
   MIN_GRASS_HEIGHT_CM,
-  PIXEL_SIZE_CM,
   PlacedObject,
   PREFAB_CATALOG,
   PrefabCategory,
@@ -34,24 +32,22 @@ import {
   TerrainRule,
   TEXTURE_BRUSHES,
   TextureBrushId,
-  VIRTUAL_RESOLUTION_PX,
-  VIRTUAL_SIDE_PX,
+  TOTAL_VERTICES,
   WeatherId,
   WEATHER_CATALOG,
   WORLD_SIZE,
-  WORLD_SIZE_KM,
 } from './world/registry';
 import {
   applyTextureBrush,
+  GridDirtyRect,
   recomputeTerrainColors,
 } from './world/brushes';
 import {
   applySculptBrush,
   getGroundHeightAt,
-  getTerrainElevationStats,
+  mergeDirtyRect,
 } from './world/sculpting';
 import {
-  deserializeWorldFromSavePayload,
   executeTerrainRules,
   formatTerrainRuleFormula,
   formatTimeOfDayClock,
@@ -59,12 +55,18 @@ import {
   generateFlatEarthTerrain,
   serializeWorldToSavePayload,
   timeOfDayToSunElevation,
+  validateWorldSavePayload,
 } from './world/generation';
 import { WorldViewport3D, CameraPresetId, ScaleMetrics } from './components/WorldViewport3D';
 import { BottomControlDock, ActiveTabId } from './components/BottomControlDock';
-import { ImageReconstructModal } from './components/ImageReconstructModal';
 import { DistanceScaleBar } from './components/DistanceScaleBar';
 import { ErrorBoundary } from './components/ErrorBoundary';
+
+const ImageReconstructModal = lazy(() =>
+  import('./components/ImageReconstructModal').then((m) => ({
+    default: m.ImageReconstructModal,
+  }))
+);
 
 interface WorldHistorySnapshot {
   actionLabel: string;
@@ -88,6 +90,13 @@ export default function App() {
   const heightMapRef = useRef<Float32Array>(initialWorldRef.current.heightMap);
   const splatMapRef = useRef<Uint8Array>(initialWorldRef.current.splatMap);
   const colorMapRef = useRef<Float32Array>(initialWorldRef.current.colorMap);
+  const normalMapRef = useRef<Float32Array>((() => {
+    const arr = new Float32Array(TOTAL_VERTICES * 3);
+    for (let i = 0; i < TOTAL_VERTICES; i++) {
+      arr[i * 3 + 1] = 1.0;
+    }
+    return arr;
+  })());
 
   const [terrainVersion, setTerrainVersion] = useState<number>(1);
   const [biomeId, setBiomeId] = useState<BiomeId>('mondstadt_meadow');
@@ -160,16 +169,30 @@ export default function App() {
 
   // Image Reconstruction Modal State
   const [isReconstructModalOpen, setIsReconstructModalOpen] = useState<boolean>(false);
-  const [, setStrokeCount] = useState<number>(0);
-
-  const elevationStats = useMemo(
-    () => getTerrainElevationStats(heightMapRef.current),
-    [terrainVersion]
-  );
+  const dirtyRectRef = useRef<GridDirtyRect | null>(null);
 
   const showToast = useCallback((msg: string) => {
     setStatusBanner(msg);
   }, []);
+
+  const latestStateRef = useRef({
+    placedObjects,
+    microStrokes,
+    selectedObjectId,
+    biomeId,
+    waterLevel,
+    regionTitle,
+    undoStack,
+  });
+  latestStateRef.current = {
+    placedObjects,
+    microStrokes,
+    selectedObjectId,
+    biomeId,
+    waterLevel,
+    regionTitle,
+    undoStack,
+  };
 
   useEffect(() => {
     if (!statusBanner) return;
@@ -178,30 +201,29 @@ export default function App() {
   }, [statusBanner]);
 
   // Push current state onto Undo Stack before mutating world state
-  const pushUndoSnapshot = useCallback(
-    (actionLabel: string) => {
-      const snapshot: WorldHistorySnapshot = {
-        actionLabel,
-        heightMap: new Float32Array(heightMapRef.current),
-        splatMap: new Uint8Array(splatMapRef.current),
-        colorMap: new Float32Array(colorMapRef.current),
-        placedObjects: placedObjects.map((o) => ({ ...o })),
-        microStrokes: microStrokes.map((m) => ({ ...m })),
-        selectedObjectId,
-        biomeId,
-        waterLevel,
-        regionTitle,
-      };
-      setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), snapshot]);
-    },
-    [placedObjects, microStrokes, selectedObjectId, biomeId, waterLevel, regionTitle]
-  );
+  const pushUndoSnapshot = useCallback((actionLabel: string) => {
+    const cur = latestStateRef.current;
+    const snapshot: WorldHistorySnapshot = {
+      actionLabel,
+      heightMap: new Float32Array(heightMapRef.current),
+      splatMap: new Uint8Array(splatMapRef.current),
+      colorMap: new Float32Array(colorMapRef.current),
+      placedObjects: cur.placedObjects.map((o) => ({ ...o })),
+      microStrokes: cur.microStrokes.map((m) => ({ ...m })),
+      selectedObjectId: cur.selectedObjectId,
+      biomeId: cur.biomeId,
+      waterLevel: cur.waterLevel,
+      regionTitle: cur.regionTitle,
+    };
+    setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), snapshot]);
+  }, []);
 
   // Undo last action (pure state updates outside updater function for React StrictMode safety)
   const handleUndo = useCallback(() => {
-    if (undoStack.length === 0) return;
-    const snapshot = undoStack[undoStack.length - 1];
-    const remainingCount = undoStack.length - 1;
+    const stack = latestStateRef.current.undoStack;
+    if (stack.length === 0) return;
+    const snapshot = stack[stack.length - 1];
+    const remainingCount = stack.length - 1;
 
     setUndoStack((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
     heightMapRef.current = new Float32Array(snapshot.heightMap);
@@ -213,11 +235,12 @@ export default function App() {
     setBiomeId(snapshot.biomeId);
     setWaterLevel(snapshot.waterLevel);
     setRegionTitle(snapshot.regionTitle);
+    dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(
       `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
     );
-  }, [undoStack, showToast]);
+  }, [showToast]);
 
   // Keyboard shortcuts: 'H' to toggle Cinema / Zen Mode, 'Ctrl+Z' / 'Cmd+Z' to Undo
   useEffect(() => {
@@ -289,13 +312,48 @@ export default function App() {
     []
   );
 
-  // Sync Placed Objects Y coordinates after terrain edits
-  const syncObjectsToGround = useCallback((currentObjects: PlacedObject[]) => {
-    return currentObjects.map((obj) => ({
-      ...obj,
-      y: Number(getGroundHeightAt(heightMapRef.current, GRID_SIZE, WORLD_SIZE, obj.x, obj.z).toFixed(2)),
-    }));
-  }, []);
+  // Sync Placed Objects Y coordinates after terrain edits (filtering by dirtyRect when provided)
+  const syncObjectsToGround = useCallback(
+    (currentObjects: PlacedObject[], dirtyRect?: GridDirtyRect | null) => {
+      const half = WORLD_SIZE / 2;
+      const hasBounds =
+        dirtyRect != null &&
+        (dirtyRect.minIx > 0 ||
+          dirtyRect.maxIx < GRID_SIZE ||
+          dirtyRect.minIz > 0 ||
+          dirtyRect.maxIz < GRID_SIZE);
+      const minWx = hasBounds
+        ? (Math.max(0, dirtyRect!.minIx - 1) / GRID_SIZE) * WORLD_SIZE - half
+        : -half;
+      const maxWx = hasBounds
+        ? (Math.min(GRID_SIZE, dirtyRect!.maxIx + 1) / GRID_SIZE) * WORLD_SIZE - half
+        : half;
+      const minWz = hasBounds
+        ? (Math.max(0, dirtyRect!.minIz - 1) / GRID_SIZE) * WORLD_SIZE - half
+        : -half;
+      const maxWz = hasBounds
+        ? (Math.min(GRID_SIZE, dirtyRect!.maxIz + 1) / GRID_SIZE) * WORLD_SIZE - half
+        : half;
+
+      let anyChanged = false;
+      const next = currentObjects.map((obj) => {
+        if (
+          hasBounds &&
+          (obj.x < minWx || obj.x > maxWx || obj.z < minWz || obj.z > maxWz)
+        ) {
+          return obj;
+        }
+        const nextY = Number(
+          getGroundHeightAt(heightMapRef.current, GRID_SIZE, WORLD_SIZE, obj.x, obj.z).toFixed(2)
+        );
+        if (nextY === obj.y) return obj;
+        anyChanged = true;
+        return { ...obj, y: nextY };
+      });
+      return anyChanged ? next : currentObjects;
+    },
+    []
+  );
 
   // Toggle an existing terrain generation rule on/off
   const handleToggleTerrainRule = useCallback(
@@ -359,7 +417,7 @@ export default function App() {
       colorMapRef.current,
       biomeId,
       terrainRules,
-      placedObjects,
+      latestStateRef.current.placedObjects,
       { ensureMatchingTerrain: true }
     );
 
@@ -367,9 +425,10 @@ export default function App() {
     if (result.addedObjects.length > 0) {
       setSelectedObjectId(result.addedObjects[0].id);
     }
+    dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(result.summary);
-  }, [terrainRules, biomeId, placedObjects, pushUndoSnapshot, showToast]);
+  }, [terrainRules, biomeId, pushUndoSnapshot, showToast]);
 
   // Record undo snapshot when a brush stroke starts on the 3D terrain
   const handleTerrainStrokeStart = useCallback(() => {
@@ -381,7 +440,7 @@ export default function App() {
     pushUndoSnapshot(label);
   }, [activeTab, textureBrush, sculptTool, brushRadius, pushUndoSnapshot]);
 
-  // Handle Sculpt or Paint stroke at (worldX, worldZ)
+  // Handle Sculpt or Paint stroke at (worldX, worldZ) using localized dirtyRect updates
   const handleTerrainStroke = useCallback(
     (worldX: number, worldZ: number) => {
       const now = performance.now();
@@ -395,6 +454,7 @@ export default function App() {
       }
 
       if (activeTab === 'sculpt') {
+        const bounds: GridDirtyRect = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
         const changed = applySculptBrush(
           heightMapRef.current,
           splatMapRef.current,
@@ -404,10 +464,22 @@ export default function App() {
           worldX,
           worldZ,
           brushRadius,
-          brushStrength
+          brushStrength,
+          bounds,
+          normalMapRef.current
         );
         if (changed > 0) {
+          dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, bounds);
           if (autoRuleOnSculpt && terrainRules.some((r) => r.enabled)) {
+            const focusRadius = Math.max(brushRadius * 1.4, 80);
+            const half = WORLD_SIZE / 2;
+            const ruleBounds: GridDirtyRect = {
+              minIx: Math.max(0, Math.floor(((worldX - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+              maxIx: Math.min(GRID_SIZE, Math.ceil(((worldX + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+              minIz: Math.max(0, Math.floor(((worldZ - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+              maxIz: Math.min(GRID_SIZE, Math.ceil(((worldZ + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+            };
+            dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, ruleBounds);
             setPlacedObjects((prevObjs) => {
               const ruleRes = executeTerrainRules(
                 heightMapRef.current,
@@ -420,18 +492,18 @@ export default function App() {
                   ensureMatchingTerrain: false,
                   focusAreaWorldX: worldX,
                   focusAreaWorldZ: worldZ,
-                  focusRadiusMeters: Math.max(brushRadius * 1.4, 80),
+                  focusRadiusMeters: focusRadius,
                 }
               );
               return ruleRes.newObjects;
             });
           } else {
-            setPlacedObjects((prevObjs) => syncObjectsToGround(prevObjs));
+            setPlacedObjects((prevObjs) => syncObjectsToGround(prevObjs, bounds));
           }
           setTerrainVersion((v) => v + 1);
-          setStrokeCount((c) => c + 1);
         }
       } else if (activeTab === 'paint') {
+        const bounds: GridDirtyRect = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
         const painted = applyTextureBrush(
           heightMapRef.current,
           splatMapRef.current,
@@ -444,9 +516,11 @@ export default function App() {
           {
             carveTerrain: carveTerrainOnPaint,
             waterLevel,
+            outBounds: bounds,
           }
         );
         if (painted > 0) {
+          dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, bounds);
           setMicroStrokes((prev) => {
             const next = [
               ...prev.slice(-160),
@@ -464,7 +538,6 @@ export default function App() {
             return next;
           });
           setTerrainVersion((v) => v + 1);
-          setStrokeCount((c) => c + 1);
         }
       }
     },
@@ -519,9 +592,10 @@ export default function App() {
       }));
 
       setMicroStrokes(fillPatches);
+      dirtyRectRef.current = null;
       setTerrainVersion((v) => v + 1);
       showToast(
-        `Đã phủ "${TEXTURE_BRUSHES[brushId].name}" (3D thật) lên toàn bộ ${VIRTUAL_RESOLUTION_PX.toLocaleString()} điểm Vector.`
+        `Đã phủ "${TEXTURE_BRUSHES[brushId].name}" (3D thật) lên toàn bộ lưới ${GRID_SIZE + 1}×${GRID_SIZE + 1} (${TOTAL_VERTICES.toLocaleString()} đỉnh · 62,5m/ô).`
       );
     },
     [biomeId, grassHeightCm, flowerSpecies, flowerColorHex, pushUndoSnapshot, showToast]
@@ -538,9 +612,10 @@ export default function App() {
     setPlacedObjects(flatWorld.initialObjects);
     setSelectedObjectId(flatWorld.initialObjects[0]?.id ?? null);
     setRegionTitle('Mặt Phẳng Đất Nguyên Bản · 10×10km (Vector 1:1)');
+    dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(
-      'Đã đưa bản đồ 10×10km (10.000.000.000 điểm Vector) về Mặt Phẳng Đất Nguyên Bản (Cao độ 0m).'
+      `Đã đưa bản đồ 10×10km (lưới ${GRID_SIZE + 1}×${GRID_SIZE + 1} · ${TOTAL_VERTICES.toLocaleString()} đỉnh) về Mặt Phẳng Đất Nguyên Bản (Cao độ 0m).`
     );
   }, [biomeId, pushUndoSnapshot, showToast]);
 
@@ -586,14 +661,14 @@ export default function App() {
   // Spawn prefab near map center at realistic 1:1 village distances (12m - 44m)
   const handleSpawnPrefabAtCenter = useCallback(
     (prefabId: PrefabId) => {
-      const offsetIndex = placedObjects.length;
+      const offsetIndex = latestStateRef.current.placedObjects.length;
       const angle = offsetIndex * 1.15;
       const radius = 12 + (offsetIndex % 5) * 8;
       const wx = Number((Math.cos(angle) * radius).toFixed(1));
       const wz = Number((Math.sin(angle) * radius).toFixed(1));
       handlePlacePrefabAt(wx, wz, prefabId);
     },
-    [placedObjects.length, handlePlacePrefabAt]
+    [handlePlacePrefabAt]
   );
 
   // Switch Biome & regenerate scenic 1km mountain / planetary world + sync default planetary weather
@@ -636,6 +711,7 @@ export default function App() {
       );
 
       setRegionTitle(bConfig.name);
+      dirtyRectRef.current = null;
       setTerrainVersion((v) => v + 1);
       const weatherMeta = WEATHER_CATALOG.find((w) => w.id === nextWeather);
       showToast(
@@ -678,6 +754,7 @@ export default function App() {
       setPlacedObjects(synced);
       setSelectedObjectId(synced[0]?.id ?? null);
       setRegionTitle(payload.regionTitle);
+      dirtyRectRef.current = null;
       setTerrainVersion((v) => v + 1);
       setCameraPreset('village');
       setCameraPresetTrigger((t) => t + 1);
@@ -697,6 +774,7 @@ export default function App() {
     setPlacedObjects(generated.initialObjects);
     setSelectedObjectId(generated.initialObjects[0]?.id ?? null);
     setRegionTitle(BIOMES[biomeId].name);
+    dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast('Đã kiến tạo mẫu địa hình đồi núi Vector 10×10km (cao độ tối đa 1km).');
   }, [biomeId, pushUndoSnapshot, showToast]);
@@ -771,11 +849,12 @@ export default function App() {
   );
 
   const handleExportWorldJson = useCallback(() => {
+    const cur = latestStateRef.current;
     const payload = serializeWorldToSavePayload({
-      regionTitle,
-      biomeId,
+      regionTitle: cur.regionTitle,
+      biomeId: cur.biomeId,
       activeWeather,
-      waterLevel,
+      waterLevel: cur.waterLevel,
       sunElevation,
       sunAzimuth,
       timeOfDay,
@@ -785,8 +864,8 @@ export default function App() {
       flowerColorHex,
       heightMap: heightMapRef.current,
       splatMap: splatMapRef.current,
-      placedObjects,
-      microStrokes,
+      placedObjects: cur.placedObjects,
+      microStrokes: cur.microStrokes,
     });
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: 'application/json',
@@ -794,17 +873,14 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `aetherterra-v2-${biomeId}.json`;
+    a.download = `aetherterra-v2-${cur.biomeId}.json`;
     a.click();
     URL.revokeObjectURL(url);
     showToast(
-      `Đã xuất tệp bản đồ 3D đầy đủ (.JSON v2: lưới độ cao ${GRID_SIZE + 1}×${GRID_SIZE + 1}, bảng màu bề mặt & ${placedObjects.length} vật thể).`
+      `Đã xuất tệp bản đồ 3D đầy đủ (.JSON v2: lưới độ cao ${GRID_SIZE + 1}×${GRID_SIZE + 1}, bảng màu bề mặt & ${cur.placedObjects.length} vật thể).`
     );
   }, [
-    regionTitle,
-    biomeId,
     activeWeather,
-    waterLevel,
     sunElevation,
     sunAzimuth,
     timeOfDay,
@@ -812,8 +888,6 @@ export default function App() {
     grassHeightCm,
     flowerSpecies,
     flowerColorHex,
-    placedObjects,
-    microStrokes,
     showToast,
   ]);
 
@@ -823,11 +897,12 @@ export default function App() {
       reader.onload = () => {
         try {
           const parsed = JSON.parse(String(reader.result || '{}'));
-          const restored = deserializeWorldFromSavePayload(parsed);
-          if (!restored) {
-            showToast('Tệp JSON không hợp lệ hoặc thiếu dữ liệu bản đồ.');
+          const validation = validateWorldSavePayload(parsed);
+          if (!validation.ok) {
+            showToast(`Không thể nhập bản đồ: ${validation.reason}`);
             return;
           }
+          const restored = validation.data;
           pushUndoSnapshot(`Nhập bản đồ JSON (${restored.regionTitle})`);
           heightMapRef.current = restored.heightMap;
           splatMapRef.current = restored.splatMap;
@@ -846,12 +921,13 @@ export default function App() {
           setPlacedObjects(restored.placedObjects);
           setMicroStrokes(restored.microStrokes);
           setSelectedObjectId(restored.placedObjects[0]?.id ?? null);
+          dirtyRectRef.current = null;
           setTerrainVersion((v) => v + 1);
           showToast(
             `Đã tải bản đồ "${restored.regionTitle}" (${restored.placedObjects.length} vật thể 3D).`
           );
         } catch {
-          showToast('Không thể đọc tệp JSON. Vui lòng kiểm tra định dạng tệp.');
+          showToast('Không thể đọc tệp JSON. Vui lòng kiểm tra cú pháp JSON của tệp.');
         }
       };
       reader.onerror = () => {
@@ -865,70 +941,115 @@ export default function App() {
   const selectedObject =
     placedObjects.find((o) => o.id === selectedObjectId) || null;
 
-  const handleRotateSelected = () => {
-    if (!selectedObjectId) return;
+  const handleRotateSelected = useCallback(() => {
+    const selId = latestStateRef.current.selectedObjectId;
+    if (!selId) return;
     pushUndoSnapshot('Xoay vật thể +45°');
     setPlacedObjects((prev) =>
       prev.map((o) =>
-        o.id === selectedObjectId
+        o.id === selId
           ? { ...o, rotationY: o.rotationY + Math.PI / 4 }
           : o
       )
     );
-  };
+  }, [pushUndoSnapshot]);
 
-  const handleSetSelectedObjectRotationDeg = (deg: number) => {
-    const clampedDeg = ((deg % 360) + 360) % 360;
-    setPlacementRotationDeg(clampedDeg);
-    if (!selectedObjectId) return;
-    const now = performance.now();
-    if (now - lastStrokeSnapshotTimeRef.current > 1000) {
-      lastStrokeSnapshotTimeRef.current = now;
-      pushUndoSnapshot(`Xoay hướng vật thể (${clampedDeg}°)`);
-    }
-    const rad = Number(((clampedDeg * Math.PI) / 180).toFixed(4));
-    setPlacedObjects((prev) =>
-      prev.map((o) => (o.id === selectedObjectId ? { ...o, rotationY: rad } : o))
-    );
-  };
+  const handleSetSelectedObjectRotationDeg = useCallback(
+    (deg: number) => {
+      const clampedDeg = ((deg % 360) + 360) % 360;
+      setPlacementRotationDeg(clampedDeg);
+      const selId = latestStateRef.current.selectedObjectId;
+      if (!selId) return;
+      const now = performance.now();
+      if (now - lastStrokeSnapshotTimeRef.current > 1000) {
+        lastStrokeSnapshotTimeRef.current = now;
+        pushUndoSnapshot(`Xoay hướng vật thể (${clampedDeg}°)`);
+      }
+      const rad = Number(((clampedDeg * Math.PI) / 180).toFixed(4));
+      setPlacedObjects((prev) =>
+        prev.map((o) => (o.id === selId ? { ...o, rotationY: rad } : o))
+      );
+    },
+    [pushUndoSnapshot]
+  );
 
-  const handleScaleSelected = (delta: number) => {
-    if (!selectedObjectId) return;
-    pushUndoSnapshot('Đổi kích thước vật thể');
-    setPlacedObjects((prev) =>
-      prev.map((o) =>
-        o.id === selectedObjectId
-          ? {
-              ...o,
-              scale: Math.max(0.3, Math.min(3.0, Number((o.scale + delta).toFixed(2)))),
-            }
-          : o
-      )
-    );
-  };
+  const handleScaleSelected = useCallback(
+    (delta: number) => {
+      const selId = latestStateRef.current.selectedObjectId;
+      if (!selId) return;
+      pushUndoSnapshot('Đổi kích thước vật thể');
+      setPlacedObjects((prev) =>
+        prev.map((o) =>
+          o.id === selId
+            ? {
+                ...o,
+                scale: Math.max(0.3, Math.min(3.0, Number((o.scale + delta).toFixed(2)))),
+              }
+            : o
+        )
+      );
+    },
+    [pushUndoSnapshot]
+  );
 
-  const handleSetSelectedObjectScale = (nextScale: number) => {
-    const clamped = Math.max(0.3, Math.min(3.0, Number(nextScale.toFixed(2))));
-    setPlacementScale(clamped);
-    if (!selectedObjectId) return;
-    const now = performance.now();
-    if (now - lastStrokeSnapshotTimeRef.current > 1000) {
-      lastStrokeSnapshotTimeRef.current = now;
-      pushUndoSnapshot(`Chỉnh cỡ vật thể (${clamped}x)`);
-    }
-    setPlacedObjects((prev) =>
-      prev.map((o) => (o.id === selectedObjectId ? { ...o, scale: clamped } : o))
-    );
-  };
+  const handleSetSelectedObjectScale = useCallback(
+    (nextScale: number) => {
+      const clamped = Math.max(0.3, Math.min(3.0, Number(nextScale.toFixed(2))));
+      setPlacementScale(clamped);
+      const selId = latestStateRef.current.selectedObjectId;
+      if (!selId) return;
+      const now = performance.now();
+      if (now - lastStrokeSnapshotTimeRef.current > 1000) {
+        lastStrokeSnapshotTimeRef.current = now;
+        pushUndoSnapshot(`Chỉnh cỡ vật thể (${clamped}x)`);
+      }
+      setPlacedObjects((prev) =>
+        prev.map((o) => (o.id === selId ? { ...o, scale: clamped } : o))
+      );
+    },
+    [pushUndoSnapshot]
+  );
 
-  const handleDeleteSelected = () => {
-    if (!selectedObjectId) return;
-    const target = placedObjects.find((o) => o.id === selectedObjectId);
+  const handleDeleteSelected = useCallback(() => {
+    const selId = latestStateRef.current.selectedObjectId;
+    if (!selId) return;
+    const target = latestStateRef.current.placedObjects.find((o) => o.id === selId);
     pushUndoSnapshot(`Xóa ${target?.label || 'vật thể'}`);
-    setPlacedObjects((prev) => prev.filter((o) => o.id !== selectedObjectId));
+    setPlacedObjects((prev) => prev.filter((o) => o.id !== selId));
     setSelectedObjectId(null);
     showToast('Đã xóa vật thể khỏi bản đồ (Có thể nhấn Hoàn Tác để khôi phục).');
-  };
+  }, [pushUndoSnapshot, showToast]);
+
+  const handleToggleCollapse = useCallback(() => {
+    setIsDockCollapsed((prev) => !prev);
+  }, []);
+
+  const handleToggleCarveTerrainOnPaint = useCallback(() => {
+    setCarveTerrainOnPaint((prev) => !prev);
+  }, []);
+
+  const handleToggleAutoRuleOnSculpt = useCallback(() => {
+    setAutoRuleOnSculpt((prev) => !prev);
+  }, []);
+
+  const handleToggleDayNightAuto = useCallback(() => {
+    setIsDayNightAuto((prev) => !prev);
+  }, []);
+
+  const handleOpenReconstructModal = useCallback(() => {
+    setIsReconstructModalOpen(true);
+  }, []);
+
+  const handleCloseReconstructModal = useCallback(() => {
+    setIsReconstructModalOpen(false);
+  }, []);
+
+  const handleViewportPlacePrefab = useCallback(
+    (x: number, z: number) => {
+      handlePlacePrefabAt(x, z);
+    },
+    [handlePlacePrefabAt]
+  );
 
   const canUndo = undoStack.length > 0;
   const lastUndoLabel = undoStack[undoStack.length - 1]?.actionLabel;
@@ -942,6 +1063,7 @@ export default function App() {
           splatMap={splatMapRef.current}
           colorMap={colorMapRef.current}
           terrainVersion={terrainVersion}
+          dirtyRectRef={dirtyRectRef}
           biomeId={biomeId}
           activeWeather={activeWeather}
           sunElevation={sunElevation}
@@ -964,7 +1086,7 @@ export default function App() {
           cameraPresetTrigger={cameraPresetTrigger}
           onTerrainStrokeStart={handleTerrainStrokeStart}
           onTerrainStroke={handleTerrainStroke}
-          onPlacePrefabAt={(x, z) => handlePlacePrefabAt(x, z)}
+          onPlacePrefabAt={handleViewportPlacePrefab}
           onSelectObject={setSelectedObjectId}
           onHoverCoordsChange={setHoverCoords}
           onScaleMetricsChange={setScaleMetrics}
@@ -993,9 +1115,9 @@ export default function App() {
             <span
               className="text-amber-300 font-semibold"
               data-testid="world-resolution-spec"
-              title="Lưới địa hình thực tế 161×161 đỉnh (25.921 đỉnh, 62.5m/ô) kết hợp hệ tọa độ Vector 10cm"
+              title="Lưới độ cao 161×161 đỉnh (25.921 đỉnh, 62,5m/ô) kết hợp thảm sinh thái 3D tỉ lệ 1:1"
             >
-              Lưới 161×161 (Vector 10cm)
+              Lưới 161×161 (62,5m/ô)
             </span>
             <span>·</span>
             <span className="text-cyan-300 font-semibold" data-testid="world-scale-spec">
@@ -1100,7 +1222,7 @@ export default function App() {
 
           <button
             type="button"
-            onClick={() => setIsReconstructModalOpen(true)}
+            onClick={handleOpenReconstructModal}
             className="px-3 py-1.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-[11px] font-bold flex items-center gap-1 shadow-lg transition-colors whitespace-nowrap cursor-pointer"
           >
             <Sparkles className="w-3.5 h-3.5" />
@@ -1304,7 +1426,7 @@ export default function App() {
       {/* Unified Collapsible Bottom Control Dock (Single-Row Tools + Multi-Page Brush Scales + Day/Night & Starlight + Undo) */}
       <BottomControlDock
         isCollapsed={isDockCollapsed}
-        onToggleCollapse={() => setIsDockCollapsed((prev) => !prev)}
+        onToggleCollapse={handleToggleCollapse}
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         sculptTool={sculptTool}
@@ -1322,12 +1444,12 @@ export default function App() {
         flowerColorHex={flowerColorHex}
         onChangeFlowerColorHex={handleChangeFlowerColorHex}
         carveTerrainOnPaint={carveTerrainOnPaint}
-        onToggleCarveTerrainOnPaint={() => setCarveTerrainOnPaint((prev) => !prev)}
+        onToggleCarveTerrainOnPaint={handleToggleCarveTerrainOnPaint}
         onFillEntireTerrainTexture={handleFillEntireTerrainTexture}
         onResetToFlatEarth={handleResetToFlatEarth}
         terrainRules={terrainRules}
         autoRuleOnSculpt={autoRuleOnSculpt}
-        onToggleAutoRuleOnSculpt={() => setAutoRuleOnSculpt((prev) => !prev)}
+        onToggleAutoRuleOnSculpt={handleToggleAutoRuleOnSculpt}
         onToggleTerrainRule={handleToggleTerrainRule}
         onAddTerrainRule={handleAddTerrainRule}
         onDeleteTerrainRule={handleDeleteTerrainRule}
@@ -1358,7 +1480,7 @@ export default function App() {
         timeOfDay={timeOfDay}
         onChangeTimeOfDay={handleChangeTimeOfDay}
         isDayNightAuto={isDayNightAuto}
-        onToggleDayNightAuto={() => setIsDayNightAuto((prev) => !prev)}
+        onToggleDayNightAuto={handleToggleDayNightAuto}
         starlightMode={starlightMode}
         onToggleStarlightMode={handleToggleStarlightMode}
         onApplyDayNightPreset={handleApplyDayNightPreset}
@@ -1368,7 +1490,7 @@ export default function App() {
         undoCount={undoStack.length}
         lastUndoLabel={lastUndoLabel}
         onUndo={handleUndo}
-        onOpenReconstructModal={() => setIsReconstructModalOpen(true)}
+        onOpenReconstructModal={handleOpenReconstructModal}
         onResetWorld={handleResetWorld}
         onExportWorldJson={handleExportWorldJson}
         onImportWorldJson={handleImportWorldJson}
@@ -1381,12 +1503,16 @@ export default function App() {
         hoverCoords={hoverCoords}
       />
 
-      {/* Image-to-3D Terrain & Object Reconstruction Modal */}
-      <ImageReconstructModal
-        isOpen={isReconstructModalOpen}
-        onClose={() => setIsReconstructModalOpen(false)}
-        onApplyReconstruction={handleApplyReconstruction}
-      />
+      {/* Lazy-Loaded Image-to-3D Terrain & Object Reconstruction Modal */}
+      {isReconstructModalOpen && (
+        <Suspense fallback={null}>
+          <ImageReconstructModal
+            isOpen={isReconstructModalOpen}
+            onClose={handleCloseReconstructModal}
+            onApplyReconstruction={handleApplyReconstruction}
+          />
+        </Suspense>
+      )}
     </main>
   );
 }

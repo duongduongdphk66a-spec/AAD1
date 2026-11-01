@@ -987,10 +987,13 @@ export function executeTerrainRules(
     }
   }
 
-  const allObjects: PlacedObject[] = existingObjects.map((o) => ({
-    ...o,
-    y: Number(getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, o.x, o.z).toFixed(2)),
-  }));
+  let anyObjectYChanged = false;
+  const allObjects: PlacedObject[] = existingObjects.map((o) => {
+    const nextY = Number(getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, o.x, o.z).toFixed(2));
+    if (nextY === o.y) return o;
+    anyObjectYChanged = true;
+    return { ...o, y: nextY };
+  });
   const addedObjects: PlacedObject[] = [];
   let paintedVerticesCount = 0;
   let matchedRulesCount = 0;
@@ -1000,6 +1003,25 @@ export function executeTerrainRules(
     typeof options?.focusAreaWorldZ === 'number' &&
     typeof options?.focusRadiusMeters === 'number';
 
+  const focusX = hasFocusFilter ? (options!.focusAreaWorldX as number) : 0;
+  const focusZ = hasFocusFilter ? (options!.focusAreaWorldZ as number) : 0;
+  const focusRadius = hasFocusFilter
+    ? Math.max(options!.focusRadiusMeters as number, cellSpan * 1.15)
+    : WORLD_SIZE;
+
+  const scanMinIx = hasFocusFilter
+    ? Math.max(0, Math.floor(((focusX - focusRadius + half) / WORLD_SIZE) * GRID_SIZE))
+    : 0;
+  const scanMaxIx = hasFocusFilter
+    ? Math.min(GRID_SIZE, Math.ceil(((focusX + focusRadius + half) / WORLD_SIZE) * GRID_SIZE))
+    : GRID_SIZE;
+  const scanMinIz = hasFocusFilter
+    ? Math.max(0, Math.floor(((focusZ - focusRadius + half) / WORLD_SIZE) * GRID_SIZE))
+    : 0;
+  const scanMaxIz = hasFocusFilter
+    ? Math.min(GRID_SIZE, Math.ceil(((focusZ + focusRadius + half) / WORLD_SIZE) * GRID_SIZE))
+    : GRID_SIZE;
+
   for (const rule of enabledRules) {
     const prefabMeta =
       PREFAB_CATALOG.find((p) => p.id === rule.targetPrefabId) || PREFAB_CATALOG[0];
@@ -1008,11 +1030,11 @@ export function executeTerrainRules(
         ? getTextureIndex(rule.targetTextureId)
         : null;
 
-    // Collect matching vertices for this rule
+    // Collect matching vertices for this rule within the active scan bounds
     const matchingVertices: Array<{ wx: number; wz: number; h: number; distOrigin: number }> = [];
 
-    for (let iz = 0; iz <= GRID_SIZE; iz++) {
-      for (let ix = 0; ix <= GRID_SIZE; ix++) {
+    for (let iz = scanMinIz; iz <= scanMaxIz; iz++) {
+      for (let ix = scanMinIx; ix <= scanMaxIx; ix++) {
         const idx = iz * VERTEX_COUNT_PER_SIDE + ix;
         const h = heightMap[idx];
         if (!evaluateRuleElevation(h, rule)) continue;
@@ -1021,11 +1043,8 @@ export function executeTerrainRules(
         const wz = (iz / GRID_SIZE) * WORLD_SIZE - half;
 
         if (hasFocusFilter) {
-          const distFocus = Math.hypot(
-            wx - (options!.focusAreaWorldX as number),
-            wz - (options!.focusAreaWorldZ as number)
-          );
-          if (distFocus > Math.max(options!.focusRadiusMeters as number, cellSpan * 1.15)) {
+          const distFocus = Math.hypot(wx - focusX, wz - focusZ);
+          if (distFocus > focusRadius) {
             continue;
           }
         }
@@ -1115,7 +1134,20 @@ export function executeTerrainRules(
   }
 
   if (sculptedVerticesCount > 0 || paintedVerticesCount > 0) {
-    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId);
+    recomputeTerrainColors(
+      heightMap,
+      splatMap,
+      colorMap,
+      biomeId,
+      hasFocusFilter && !ensureMatching
+        ? {
+            minIx: scanMinIx,
+            maxIx: scanMaxIx,
+            minIz: scanMinIz,
+            maxIz: scanMaxIz,
+          }
+        : undefined
+    );
   }
 
   const firstRuleText = enabledRules[0] ? formatTerrainRuleFormula(enabledRules[0]) : '';
@@ -1127,7 +1159,7 @@ export function executeTerrainRules(
       : `Đã kiểm tra ${enabledRules.length} quy luật: Các đỉnh đủ điều kiện đã có đủ mật độ vật thể.`;
 
   return {
-    newObjects: allObjects,
+    newObjects: addedObjects.length > 0 || anyObjectYChanged ? allObjects : existingObjects,
     addedObjects,
     addedCount: addedObjects.length,
     paintedVerticesCount,
@@ -1421,13 +1453,7 @@ export function serializeWorldToSavePayload(params: {
   };
 }
 
-/**
- * Deserializes a saved JSON payload (supporting named texturePalette remapping so
- * future insertions into TEXTURE_INDEX_MAP never corrupt older save files).
- * Strictly validates version, gridSize, heightMap length, placedObjects, and microStrokes,
- * returning null if the save payload is malformed or incompatible.
- */
-export function deserializeWorldFromSavePayload(raw: unknown): {
+export interface DeserializedWorldPayload {
   regionTitle: string;
   biomeId: BiomeId;
   activeWeather: WeatherId;
@@ -1444,28 +1470,61 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
   colorMap: Float32Array;
   placedObjects: PlacedObject[];
   microStrokes: MicroStrokeStamp[];
-} | null {
-  if (!raw || typeof raw !== 'object') return null;
+}
+
+export type WorldSaveValidationResult =
+  | { ok: true; data: DeserializedWorldPayload }
+  | { ok: false; reason: string };
+
+/**
+ * Validates and deserializes a saved JSON payload (supporting named texturePalette remapping).
+ * Uses Object.hasOwn to prevent prototype-pollution keys ('constructor', 'toString', '__proto__')
+ * from bypassing dictionary lookups, and returns a specific rejection reason when invalid.
+ */
+export function validateWorldSavePayload(raw: unknown): WorldSaveValidationResult {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      ok: false,
+      reason: 'Tệp JSON không phải là đối tượng dữ liệu bản đồ hợp lệ.',
+    };
+  }
   const data = raw as Omit<Partial<WorldSaveFileV2>, 'version'> & { version?: unknown };
 
   if (data.version !== undefined && data.version !== 1 && data.version !== 2) {
-    return null;
+    return {
+      ok: false,
+      reason: `Phiên bản tệp bản đồ không được hỗ trợ (version: ${String(data.version)}, yêu cầu v1 hoặc v2).`,
+    };
   }
   if (data.gridSize !== undefined && data.gridSize !== GRID_SIZE) {
-    return null;
+    return {
+      ok: false,
+      reason: `Kích thước lưới không tương thích (gridSize: ${String(data.gridSize)}, yêu cầu ${GRID_SIZE}).`,
+    };
   }
-  if (!Array.isArray(data.heightMap) || data.heightMap.length !== TOTAL_VERTICES) {
-    return null;
+  if (!Array.isArray(data.heightMap)) {
+    return {
+      ok: false,
+      reason: 'Tệp bản đồ thiếu mảng độ cao (heightMap).',
+    };
   }
-  if (
-    data.splatMap !== undefined &&
-    (!Array.isArray(data.splatMap) || data.splatMap.length !== TOTAL_VERTICES)
-  ) {
-    return null;
+  if (data.heightMap.length !== TOTAL_VERTICES) {
+    return {
+      ok: false,
+      reason: `Độ dài heightMap không khớp (${data.heightMap.length} điểm, yêu cầu ${TOTAL_VERTICES} đỉnh cho lưới ${GRID_SIZE + 1}×${GRID_SIZE + 1}).`,
+    };
+  }
+  if (data.splatMap !== undefined) {
+    if (!Array.isArray(data.splatMap) || data.splatMap.length !== TOTAL_VERTICES) {
+      return {
+        ok: false,
+        reason: `Độ dài splatMap không khớp (${Array.isArray(data.splatMap) ? data.splatMap.length : 'không phải mảng'}, yêu cầu ${TOTAL_VERTICES}).`,
+      };
+    }
   }
 
   const biomeId: BiomeId =
-    typeof data.biomeId === 'string' && data.biomeId in BIOMES
+    typeof data.biomeId === 'string' && Object.hasOwn(BIOMES, data.biomeId)
       ? (data.biomeId as BiomeId)
       : 'mondstadt_meadow';
   const bCfg = BIOMES[biomeId];
@@ -1487,9 +1546,14 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
     for (let i = 0; i < TOTAL_VERTICES; i++) {
       const rawIdx = Number(data.splatMap[i]);
       const safeIdx = Number.isInteger(rawIdx) && rawIdx >= 0 ? rawIdx : -1;
-      const brushName = safeIdx >= 0 ? (palette[safeIdx] as TextureBrushId | undefined) : undefined;
+      const brushName =
+        safeIdx >= 0 && safeIdx < palette.length
+          ? (palette[safeIdx] as TextureBrushId | undefined)
+          : undefined;
       splatMap[i] =
-        brushName && brushName in TEXTURE_BRUSHES ? getTextureIndex(brushName) : defaultTexIdx;
+        typeof brushName === 'string' && Object.hasOwn(TEXTURE_BRUSHES, brushName)
+          ? getTextureIndex(brushName)
+          : defaultTexIdx;
     }
   } else {
     splatMap.fill(defaultTexIdx);
@@ -1553,7 +1617,7 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
     for (let i = 0; i < rawStrokes.length; i++) {
       const st = rawStrokes[i] as Partial<MicroStrokeStamp> | null | undefined;
       if (!st || typeof st !== 'object') continue;
-      if (typeof st.brushId !== 'string' || !(st.brushId in TEXTURE_BRUSHES)) {
+      if (typeof st.brushId !== 'string' || !Object.hasOwn(TEXTURE_BRUSHES, st.brushId)) {
         continue;
       }
       const rx = Number(st.x);
@@ -1635,28 +1699,40 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
       : '#f472b6';
 
   return {
-    regionTitle:
-      typeof data.regionTitle === 'string' && data.regionTitle.trim()
-        ? data.regionTitle.trim().slice(0, 120)
-        : bCfg.name,
-    biomeId,
-    activeWeather:
-      typeof data.activeWeather === 'string' &&
-      WEATHER_CATALOG.some((w) => w.id === data.activeWeather)
-        ? (data.activeWeather as WeatherId)
-        : bCfg.defaultWeather ?? 'clear_sky',
-    waterLevel,
-    sunElevation,
-    sunAzimuth,
-    timeOfDay,
-    starlightMode: Boolean(data.starlightMode),
-    grassHeightCm,
-    flowerSpecies,
-    flowerColorHex,
-    heightMap,
-    splatMap,
-    colorMap,
-    placedObjects: sanitizedObjects,
-    microStrokes: sanitizedStrokes,
+    ok: true,
+    data: {
+      regionTitle:
+        typeof data.regionTitle === 'string' && data.regionTitle.trim()
+          ? data.regionTitle.trim().slice(0, 120)
+          : bCfg.name,
+      biomeId,
+      activeWeather:
+        typeof data.activeWeather === 'string' &&
+        WEATHER_CATALOG.some((w) => w.id === data.activeWeather)
+          ? (data.activeWeather as WeatherId)
+          : bCfg.defaultWeather ?? 'clear_sky',
+      waterLevel,
+      sunElevation,
+      sunAzimuth,
+      timeOfDay,
+      starlightMode: Boolean(data.starlightMode),
+      grassHeightCm,
+      flowerSpecies,
+      flowerColorHex,
+      heightMap,
+      splatMap,
+      colorMap,
+      placedObjects: sanitizedObjects,
+      microStrokes: sanitizedStrokes,
+    },
   };
 }
+
+/**
+ * Deserializes a saved JSON payload, returning null if malformed or incompatible.
+ */
+export function deserializeWorldFromSavePayload(raw: unknown): DeserializedWorldPayload | null {
+  const res = validateWorldSavePayload(raw);
+  return res.ok ? res.data : null;
+}
+

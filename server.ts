@@ -1,7 +1,9 @@
 import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import zlib from 'zlib';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   BIOMES,
@@ -18,18 +20,24 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const isProd =
   process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
 
-// Trust reverse proxy (Cloud Run / load balancer) so req.ip reflects the real client IP
-app.set('trust proxy', 1);
+// Configure reverse proxy hops based on environment (prevents X-Forwarded-For spoofing when running directly)
+const hops = Number(process.env.TRUST_PROXY_HOPS ?? (process.env.K_SERVICE ? 1 : 0));
+app.set('trust proxy', hops > 0 ? hops : false);
 app.disable('x-powered-by');
 
-// Security headers
+// Security headers (CSP, X-Content-Type-Options, Referrer-Policy)
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self';"
+  );
   next();
 });
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '2.5mb' }));
 
 // Health check endpoint
 app.get('/healthz', (_req, res) => {
@@ -78,10 +86,10 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 const ALLOWED_MODES = new Set(['terrain', 'object', 'objects', 'both']);
 const BASE64_REGEX = /^[A-Za-z0-9+/=\r\n]+$/;
-const MAX_BASE64_LENGTH = 14 * 1024 * 1024; // ~10 MB binary image
+const MAX_BASE64_LENGTH = 2.8 * 1024 * 1024; // ~2 MB binary image payload
 
 function sanitizeClientMetrics(raw: unknown): Record<string, number | string> {
-  if (!raw || typeof raw !== 'object') return {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const src = raw as Record<string, unknown>;
   const clampNum = (val: unknown, min: number, max: number, fallback = 0): number => {
     const n = Number(val);
@@ -89,7 +97,7 @@ function sanitizeClientMetrics(raw: unknown): Record<string, number | string> {
     return Number(Math.max(min, Math.min(max, n)).toFixed(3));
   };
   const suggestedBiome =
-    typeof src.suggestedBiome === 'string' && src.suggestedBiome in BIOMES
+    typeof src.suggestedBiome === 'string' && Object.hasOwn(BIOMES, src.suggestedBiome)
       ? src.suggestedBiome
       : 'mondstadt_meadow';
   const suggestedTexture =
@@ -150,7 +158,7 @@ app.post('/api/reconstruct', async (req, res) => {
       cleanBase64.length > MAX_BASE64_LENGTH ||
       !BASE64_REGEX.test(cleanBase64)
     ) {
-      res.status(400).json({ error: 'Dữ liệu ảnh base64 không hợp lệ hoặc vượt quá giới hạn dung lượng.' });
+      res.status(400).json({ error: 'Dữ liệu ảnh base64 không hợp lệ hoặc vượt quá giới hạn dung lượng (2MB).' });
       return;
     }
 
@@ -201,6 +209,7 @@ ${prefabLines}`;
         ],
       },
       config: {
+        abortSignal: AbortSignal.timeout(20_000),
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -284,18 +293,71 @@ ${prefabLines}`;
   }
 });
 
-// Express JSON / payload error middleware (prevents leaking HTML stack traces & file paths)
-app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
-  if (err.type === 'entity.too.large') {
-    res.status(413).json({ error: 'Kích thước dữ liệu gửi lên vượt quá giới hạn cho phép (15MB).' });
-    return;
-  }
-  if (err instanceof SyntaxError && 'body' in err) {
-    res.status(400).json({ error: 'Định dạng JSON trong yêu cầu không hợp lệ.' });
-    return;
-  }
-  res.status(err.status || 500).json({ error: 'Lỗi máy chủ nội bộ.' });
-});
+// In-memory cache for compressed static assets in production
+const compressedAssetCache = new Map<string, { br: Buffer; gzip: Buffer; mime: string }>();
+const COMPRESSIBLE_EXT_MIME: Record<string, string> = {
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+};
+
+function serveCompressedOrStatic(distPath: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      next();
+      return;
+    }
+    const cleanPath = decodeURIComponent(req.path.split('?')[0]);
+    const ext = path.extname(cleanPath).toLowerCase();
+    const mime = COMPRESSIBLE_EXT_MIME[ext];
+    if (!mime) {
+      next();
+      return;
+    }
+
+    const resolvedFile = path.resolve(distPath, '.' + (cleanPath === '/' ? '/index.html' : cleanPath));
+    if (!resolvedFile.startsWith(distPath) || !fs.existsSync(resolvedFile) || !fs.statSync(resolvedFile).isFile()) {
+      next();
+      return;
+    }
+
+    let cached = compressedAssetCache.get(resolvedFile);
+    if (!cached) {
+      const rawBuf = fs.readFileSync(resolvedFile);
+      cached = {
+        br: zlib.brotliCompressSync(rawBuf, {
+          params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+        }),
+        gzip: zlib.gzipSync(rawBuf, { level: 6 }),
+        mime,
+      };
+      compressedAssetCache.set(resolvedFile, cached);
+    }
+
+    const isHashedAsset = cleanPath.startsWith('/assets/');
+    res.setHeader(
+      'Cache-Control',
+      isHashedAsset ? 'public, max-age=31536000, immutable' : 'no-cache'
+    );
+    res.setHeader('Content-Type', cached.mime);
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    if (acceptEncoding.includes('br')) {
+      res.setHeader('Content-Encoding', 'br');
+      res.send(cached.br);
+      return;
+    }
+    if (acceptEncoding.includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.send(cached.gzip);
+      return;
+    }
+    next();
+  };
+}
 
 async function startServer() {
   if (!isProd) {
@@ -307,11 +369,43 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(serveCompressedOrStatic(distPath));
+    app.use(
+      '/assets',
+      express.static(path.join(distPath, 'assets'), {
+        immutable: true,
+        maxAge: '365d',
+      })
+    );
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Express JSON / payload & fallback error middleware registered LAST so it catches all route/static errors
+  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    if (err.type === 'entity.too.large') {
+      res.status(413).json({ error: 'Kích thước dữ liệu gửi lên vượt quá giới hạn cho phép (2.5MB).' });
+      return;
+    }
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(400).json({ error: 'Định dạng JSON trong yêu cầu không hợp lệ.' });
+      return;
+    }
+    res.status(err.status || 500).json({ error: 'Lỗi máy chủ nội bộ.' });
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
@@ -321,3 +415,4 @@ async function startServer() {
 }
 
 startServer();
+

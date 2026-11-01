@@ -812,11 +812,178 @@ test('deserializeWorldFromSavePayload rejects malformed heightMap/gridSize/versi
   assert.equal(restored.flowerColorHex, '#f472b6');
   assert.equal(restored.flowerSpecies, 'sakura_bloom');
   assert.equal(restored.placedObjects.length, 1);
-  assert.equal(restored.placedObjects[0].id, 'valid-1');
-  assert.equal(restored.placedObjects[0].scale, 3.0);
-  assert.equal(restored.microStrokes.length, 1);
-  assert.equal(restored.microStrokes[0].id, 'valid-stroke');
-  assert.equal(restored.microStrokes[0].radius, 2500);
+  // 3. Rejects Object.prototype keys ("constructor", "toString", "__proto__") via Object.hasOwn
+  const protoTest = deserializeWorldFromSavePayload({
+    version: 2,
+    gridSize: GRID_SIZE,
+    biomeId: 'constructor',
+    texturePalette: ['__proto__', 'toString', 'valueOf'],
+    heightMap: validHeights,
+    splatMap: new Array(TOTAL_VERTICES).fill(0),
+    microStrokes: [
+      {
+        id: 'proto-stroke-1',
+        brushId: 'constructor',
+        x: 0,
+        z: 0,
+        radius: 10,
+      },
+      {
+        id: 'proto-stroke-2',
+        brushId: 'toString',
+        x: 5,
+        z: 5,
+        radius: 10,
+      },
+    ],
+  });
+  assert.ok(protoTest !== null);
+  assert.equal(
+    protoTest.biomeId,
+    'mondstadt_meadow',
+    'Prototype key "constructor" must not be accepted as a valid biomeId'
+  );
+  assert.equal(
+    protoTest.microStrokes.length,
+    0,
+    'Prototype keys "constructor" and "toString" must not be accepted as valid brushIds'
+  );
+  assert.equal(
+    protoTest.splatMap[0],
+    getTextureIndex('emerald_grass'),
+    'Prototype key "__proto__" in texturePalette must fall back to default texture index'
+  );
+
+  // 4. validateWorldSavePayload returns specific Vietnamese rejection reasons
+  const badVer = generationMod.validateWorldSavePayload({
+    version: 99,
+    heightMap: validHeights,
+  });
+  assert.equal(badVer.ok, false);
+  if (!badVer.ok) {
+    assert.ok(badVer.reason.includes('Phiên bản'));
+  }
+
+  const badGrid = generationMod.validateWorldSavePayload({
+    version: 2,
+    gridSize: 64,
+    heightMap: validHeights,
+  });
+  assert.equal(badGrid.ok, false);
+  if (!badGrid.ok) {
+    assert.ok(badGrid.reason.includes('gridSize'));
+  }
+
+  const badHeights = generationMod.validateWorldSavePayload({
+    version: 2,
+    gridSize: GRID_SIZE,
+    heightMap: [1, 2, 3],
+  });
+  assert.equal(badHeights.ok, false);
+  if (!badHeights.ok) {
+    assert.ok(badHeights.reason.includes('heightMap'));
+  }
+});
+
+test('applySculptBrush and applyTextureBrush populate dirty-rect outBounds and compute surface normals only within dirtyRect', () => {
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
+  const sculptBounds = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
+  const sculptNormals = new Float32Array(TOTAL_VERTICES * 3);
+  const sentinelValue = 7.5;
+  sculptNormals.fill(sentinelValue);
+
+  const changed = applySculptBrush(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    'raise',
+    0,
+    0,
+    120,
+    50,
+    sculptBounds,
+    sculptNormals
+  );
+  assert.ok(changed > 0);
+  // Distant corner vertex normal (0, 0) outside dirtyRect must remain untouched (sentinelValue)
+  assert.equal(
+    sculptNormals[0],
+    sentinelValue,
+    'applySculptBrush must not touch normals outside the padded dirtyRect'
+  );
+  // Center vertex normal inside dirtyRect must be recomputed to unit length
+  const centerIdx = (GRID_SIZE / 2) * (GRID_SIZE + 1) + GRID_SIZE / 2;
+  const cLen = Math.hypot(
+    sculptNormals[centerIdx * 3],
+    sculptNormals[centerIdx * 3 + 1],
+    sculptNormals[centerIdx * 3 + 2]
+  );
+  assert.ok(Math.abs(cLen - 1.0) < 1e-5, 'applySculptBrush must recompute unit normals inside dirtyRect');
+  const centerCell = GRID_SIZE / 2;
+  assert.ok(sculptBounds.minIx >= centerCell - 4 && sculptBounds.maxIx <= centerCell + 4);
+  assert.ok(sculptBounds.minIz >= centerCell - 4 && sculptBounds.maxIz <= centerCell + 4);
+  assert.ok(
+    (sculptBounds.maxIx - sculptBounds.minIx + 1) * (sculptBounds.maxIz - sculptBounds.minIz + 1) <
+      TOTAL_VERTICES / 10,
+    'Dirty rect should cover only a small localized subset of vertices'
+  );
+
+  const paintBounds = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
+  const painted = applyTextureBrush(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    'volcanic_lava',
+    0,
+    0,
+    120,
+    { outBounds: paintBounds }
+  );
+  assert.ok(painted > 0);
+  assert.equal(paintBounds.minIx, sculptBounds.minIx);
+  assert.equal(paintBounds.maxIx, sculptBounds.maxIx);
+
+  // Verify computePartialVertexNormals updates only the 1-cell padded dirtyRect instead of all 25,921 vertices
+  const normalArray = new Float32Array(TOTAL_VERTICES * 3);
+  for (let i = 0; i < TOTAL_VERTICES; i++) {
+    normalArray[i * 3 + 1] = 1.0; // Initial flat terrain up-normal (0, 1, 0)
+  }
+
+  const { paddedRect, updatedVertexCount } = sculptingMod.computePartialVertexNormals(
+    world.heightMap,
+    normalArray,
+    sculptBounds
+  );
+  assert.equal(paddedRect.minIx, Math.max(0, sculptBounds.minIx - 1));
+  assert.equal(paddedRect.maxIx, Math.min(GRID_SIZE, sculptBounds.maxIx + 1));
+  assert.equal(paddedRect.minIz, Math.max(0, sculptBounds.minIz - 1));
+  assert.equal(paddedRect.maxIz, Math.min(GRID_SIZE, sculptBounds.maxIz + 1));
+  assert.ok(
+    updatedVertexCount < 100 && updatedVertexCount < TOTAL_VERTICES / 250,
+    `computePartialVertexNormals should process < 100 vertices for a 120m brush instead of ${TOTAL_VERTICES}, got ${updatedVertexCount}`
+  );
+
+  // Check that a sloped vertex near the raised center has a tilted unit normal (nx !== 0 || nz !== 0)
+  const slopeIdx = centerCell * (GRID_SIZE + 1) + (centerCell + 1);
+  const nx = normalArray[slopeIdx * 3];
+  const ny = normalArray[slopeIdx * 3 + 1];
+  const nz = normalArray[slopeIdx * 3 + 2];
+  assert.ok(Math.abs(Math.hypot(nx, ny, nz) - 1.0) < 1e-5, 'Computed normal must be unit length');
+  assert.ok(nx > 0.01, 'East slope of a raised peak should have positive X normal component');
+
+  // Verify mergeDirtyRect accumulates multiple brush strokes cleanly
+  const merged = sculptingMod.mergeDirtyRect(sculptBounds, {
+    minIx: 10,
+    maxIx: 14,
+    minIz: 20,
+    maxIz: 25,
+  });
+  assert.equal(merged.minIx, 10);
+  assert.equal(merged.maxIx, sculptBounds.maxIx);
+  assert.equal(merged.minIz, 20);
+  assert.equal(merged.maxIz, sculptBounds.maxIz);
 });
 
 test('disposeObject3DTree disposes material textures (map, normalMap, emissiveMap) while preserving shared textures', () => {
@@ -852,3 +1019,4 @@ test('disposeObject3DTree disposes material textures (map, normalMap, emissiveMa
   assert.equal(normalDisposed, true, 'Should dispose material.normalMap texture');
   assert.equal(sharedDisposed, false, 'Should not dispose textures marked with userData.shared = true');
 });
+

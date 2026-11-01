@@ -120,6 +120,7 @@ export function applyTextureBrush(
   options?: {
     carveTerrain?: boolean;
     waterLevel?: number;
+    outBounds?: GridDirtyRect;
   }
 ): number {
   const half = WORLD_SIZE / 2;
@@ -150,6 +151,11 @@ export function applyTextureBrush(
     GRID_SIZE,
     Math.ceil(((worldZ + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
+
+  let touchedMinIx = GRID_SIZE;
+  let touchedMaxIx = 0;
+  let touchedMinIz = GRID_SIZE;
+  let touchedMaxIz = 0;
 
   for (let iz = minIz; iz <= maxIz; iz++) {
     for (let ix = minIx; ix <= maxIx; ix++) {
@@ -183,18 +189,30 @@ export function applyTextureBrush(
           }
         }
 
+        if (ix < touchedMinIx) touchedMinIx = ix;
+        if (ix > touchedMaxIx) touchedMaxIx = ix;
+        if (iz < touchedMinIz) touchedMinIz = iz;
+        if (iz > touchedMaxIz) touchedMaxIz = iz;
         paintedCount++;
       }
     }
   }
 
   if (paintedCount > 0) {
-    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, {
-      minIx,
-      maxIx,
-      minIz,
-      maxIz,
-    });
+    const dirtyRect: GridDirtyRect = {
+      minIx: touchedMinIx,
+      maxIx: touchedMaxIx,
+      minIz: touchedMinIz,
+      maxIz: touchedMaxIz,
+    };
+    recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId, dirtyRect);
+    if (options?.outBounds) {
+      options.outBounds.minIx = dirtyRect.minIx;
+      options.outBounds.maxIx = dirtyRect.maxIx;
+      options.outBounds.minIz = dirtyRect.minIz;
+      options.outBounds.maxIz = dirtyRect.maxIz;
+    }
   }
   return paintedCount;
 }
+

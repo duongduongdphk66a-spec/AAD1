@@ -70,9 +70,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     width: number;
     height: number;
   } | null>(null);
+  const aiImageDataUrlRef = useRef<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
 
   const cancelPendingAiRequest = () => {
     if (abortControllerRef.current) {
@@ -98,6 +100,24 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     const sx = (iw - sw) * 0.5;
     const sy = (ih - sh) * 0.5;
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+  };
+
+  // Helper to encode a high-resolution (up to 896px) uncropped JPEG for Gemini Vision
+  const buildHighResAiDataUrl = (img: HTMLImageElement, maxDimension = 896): string => {
+    const iw = Math.max(1, img.naturalWidth || img.width);
+    const ih = Math.max(1, img.naturalHeight || img.height);
+    const scale = Math.min(1, maxDimension / Math.max(iw, ih));
+    const outW = Math.max(1, Math.round(iw * scale));
+    const outH = Math.max(1, Math.round(ih * scale));
+    const aiCanvas = document.createElement('canvas');
+    aiCanvas.width = outW;
+    aiCanvas.height = outH;
+    const aiCtx = aiCanvas.getContext('2d');
+    if (!aiCtx) return '';
+    aiCtx.fillStyle = '#0f172a';
+    aiCtx.fillRect(0, 0, outW, outH);
+    aiCtx.drawImage(img, 0, 0, outW, outH);
+    return aiCanvas.toDataURL('image/jpeg', 0.86);
   };
 
   // Render smooth vector-interpolated heightmap + contour preview to a 2D data URL
@@ -174,12 +194,14 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   ) => {
     cancelPendingAiRequest();
     setUploadError(null);
+    setAiNotice(null);
     const rendered = renderSamplePresetToDataUrl(preset, 160);
     rgbaBufferRef.current = {
       rgba: rendered.rgba,
       width: rendered.width,
       height: rendered.height,
     };
+    aiImageDataUrlRef.current = rendered.dataUrl;
     setPreviewDataUrl(preset.imageUrl || rendered.dataUrl);
     setRegionTitle(preset.title);
     setSummaryText(preset.description);
@@ -210,6 +232,10 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           width: targetSize,
           height: targetSize,
         };
+        const highResUrl = buildHighResAiDataUrl(img, 896);
+        if (highResUrl) {
+          aiImageDataUrlRef.current = highResUrl;
+        }
         runLocalReconstruction(
           imgData.data,
           targetSize,
@@ -280,17 +306,19 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
 
     cancelPendingAiRequest();
     setUploadError(null);
+    setAiNotice(null);
 
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (!allowedTypes.includes(file.type)) {
       setUploadError('Định dạng tệp không hỗ trợ. Vui lòng chọn ảnh .JPG, .PNG, .WEBP hoặc .GIF.');
       return;
     }
-    const maxBytes = 10 * 1024 * 1024; // 10 MB
+    const maxBytes = 10 * 1024 * 1024; // 10 MB client source file limit (resized to 896px JPEG before upload)
     if (file.size > maxBytes) {
       setUploadError('Dung lượng ảnh vượt quá 10MB. Vui lòng chọn ảnh nhỏ hơn 10MB.');
       return;
@@ -321,9 +349,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           width: targetSize,
           height: targetSize,
         };
+        const highResAiUrl = buildHighResAiDataUrl(img, 896);
+        aiImageDataUrlRef.current = highResAiUrl || canvas.toDataURL('image/jpeg', 0.92);
         setCustomImageName(file.name);
         setSelectedPresetId('custom');
-        setPreviewDataUrl(canvas.toDataURL('image/jpeg', 0.92));
+        setPreviewDataUrl(aiImageDataUrlRef.current);
 
         const localResult = runLocalReconstruction(
           imgData.data,
@@ -349,12 +379,14 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   };
 
   const handleRunDeepAiScan = async () => {
-    if (!rgbaBufferRef.current || !previewDataUrl) return;
+    const payloadDataUrl = aiImageDataUrlRef.current || previewDataUrl;
+    if (!rgbaBufferRef.current || !payloadDataUrl) return;
     cancelPendingAiRequest();
     const controller = new AbortController();
     abortControllerRef.current = controller;
     setIsAnalyzing(true);
     setUploadError(null);
+    setAiNotice(null);
 
     try {
       const localResult = runLocalReconstruction(
@@ -367,9 +399,9 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         mode
       );
 
-      const detectedMime = previewDataUrl.startsWith('data:image/jpeg')
+      const detectedMime = payloadDataUrl.startsWith('data:image/jpeg')
         ? 'image/jpeg'
-        : previewDataUrl.startsWith('data:image/webp')
+        : payloadDataUrl.startsWith('data:image/webp')
         ? 'image/webp'
         : 'image/png';
 
@@ -378,7 +410,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          imageBase64: previewDataUrl,
+          imageBase64: payloadDataUrl,
           mimeType: detectedMime,
           mode,
           clientMetrics: localResult.metrics,
@@ -393,17 +425,17 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           data && typeof data.error === 'string'
             ? data.error
             : `Lỗi máy chủ (${response.status}) — đã giữ kết quả Pixel Depth Engine cục bộ.`;
-        setUploadError(errMsg);
+        setAiNotice(errMsg);
         setAiSourceLabel('Pixel Depth & Chroma Engine');
         return;
       }
 
       if (data?.analysis) {
         const ai = data.analysis;
-        const validBiomes = Object.keys(BIOMES) as BiomeId[];
-        const aiBiome: BiomeId = validBiomes.includes(ai.biome)
-          ? ai.biome
-          : localResult.metrics.suggestedBiome;
+        const aiBiome: BiomeId =
+          typeof ai.biome === 'string' && Object.hasOwn(BIOMES, ai.biome)
+            ? (ai.biome as BiomeId)
+            : localResult.metrics.suggestedBiome;
 
         const nextRelief =
           typeof ai.reliefScale === 'number' && Number.isFinite(ai.reliefScale)
@@ -470,7 +502,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       } else {
         setAiSourceLabel('Pixel Depth & Chroma Engine');
         if (data && typeof data.warning === 'string') {
-          setUploadError(data.warning);
+          setAiNotice(data.warning);
         }
       }
     } catch (err: unknown) {
@@ -734,7 +766,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                 <div className="flex items-center justify-between text-xs text-slate-300 mb-2">
                   <span className="font-semibold">Bản Đồ Vector 10×10km</span>
                   <span className="text-[11px] text-emerald-400 font-mono tabular-nums">
-                    Vector 10 Tỷ điểm (25,921 Đỉnh)
+                    Lưới 161×161 (25.921 Đỉnh · 62,5m/ô)
                   </span>
                 </div>
                 <div className="aspect-square rounded-lg overflow-hidden bg-slate-900 border border-slate-700 flex items-center justify-center">
@@ -771,6 +803,16 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                   {isAnalyzing ? 'Đang Quét AI...' : 'Phân Tích Sâu AI'}
                 </button>
               </div>
+
+              {aiNotice && (
+                <p
+                  role="status"
+                  data-testid="ai-fallback-notice"
+                  className="px-3 py-1.5 rounded-lg bg-indigo-500/15 border border-indigo-400/40 text-[11px] text-indigo-200"
+                >
+                  {aiNotice}
+                </p>
+              )}
 
               <p className="text-xs text-slate-300 leading-relaxed">{summaryText}</p>
 
