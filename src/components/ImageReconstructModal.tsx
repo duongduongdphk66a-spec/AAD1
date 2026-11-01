@@ -71,6 +71,34 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     height: number;
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const cancelPendingAiRequest = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsAnalyzing(false);
+  };
+
+  // Helper to draw an image onto a square canvas while preserving aspect ratio (center-crop)
+  const drawImagePreservingAspect = (
+    ctx: CanvasRenderingContext2D,
+    img: HTMLImageElement,
+    targetSize: number
+  ) => {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, targetSize, targetSize);
+    const iw = Math.max(1, img.naturalWidth || img.width);
+    const ih = Math.max(1, img.naturalHeight || img.height);
+    const scale = Math.max(targetSize / iw, targetSize / ih);
+    const sw = targetSize / scale;
+    const sh = targetSize / scale;
+    const sx = (iw - sw) * 0.5;
+    const sy = (ih - sh) * 0.5;
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
+  };
 
   // Render smooth vector-interpolated heightmap + contour preview to a 2D data URL
   const buildHeightmapPreview = (data: ReconstructedWorldData): string => {
@@ -144,6 +172,8 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     nextBiome: BiomeId | 'auto',
     nextMode: 'both' | 'terrain' | 'object'
   ) => {
+    cancelPendingAiRequest();
+    setUploadError(null);
     const rendered = renderSamplePresetToDataUrl(preset, 160);
     rgbaBufferRef.current = {
       rgba: rendered.rgba,
@@ -173,9 +203,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         canvas.height = targetSize;
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        ctx.fillStyle = '#f8fafc';
-        ctx.fillRect(0, 0, targetSize, targetSize);
-        ctx.drawImage(img, 0, 0, targetSize, targetSize);
+        drawImagePreservingAspect(ctx, img, targetSize);
         const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
         rgbaBufferRef.current = {
           rgba: imgData.data,
@@ -192,16 +220,25 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           nextMode
         );
       };
+      img.onerror = () => {
+        // Keep procedural fallback already rendered above
+      };
       img.src = preset.imageUrl;
     }
   };
 
-  // Load initial preset when modal opens
+  // Load initial preset when modal opens, and cancel pending AI requests on close/unmount
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      cancelPendingAiRequest();
+      return;
+    }
     const preset =
       SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
     loadPresetWithOptionalImage(preset, reliefScale, terraceSteps, overrideBiome, mode);
+    return () => {
+      cancelPendingAiRequest();
+    };
   }, [isOpen]);
 
   // Re-run local pixel heightfield whenever sliders change
@@ -245,17 +282,38 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    cancelPendingAiRequest();
+    setUploadError(null);
+
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!allowedTypes.includes(file.type)) {
+      setUploadError('Định dạng tệp không hỗ trợ. Vui lòng chọn ảnh .JPG, .PNG, .WEBP hoặc .GIF.');
+      return;
+    }
+    const maxBytes = 10 * 1024 * 1024; // 10 MB
+    if (file.size > maxBytes) {
+      setUploadError('Dung lượng ảnh vượt quá 10MB. Vui lòng chọn ảnh nhỏ hơn 10MB.');
+      return;
+    }
+
     const reader = new FileReader();
+    reader.onerror = () => {
+      setUploadError('Không thể đọc tệp ảnh từ thiết bị. Vui lòng thử lại.');
+    };
     reader.onload = () => {
       const dataUrl = String(reader.result || '');
       const img = new Image();
+      img.onerror = () => {
+        setUploadError('Tệp ảnh bị lỗi hoặc không thể giải mã. Vui lòng chọn ảnh khác.');
+      };
       img.onload = () => {
         const canvas = document.createElement('canvas');
         const targetSize = 256;
         canvas.width = targetSize;
         canvas.height = targetSize;
-        const ctx = canvas.getContext('2d')!;
-        ctx.drawImage(img, 0, 0, targetSize, targetSize);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        drawImagePreservingAspect(ctx, img, targetSize);
         const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
 
         rgbaBufferRef.current = {
@@ -292,7 +350,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
 
   const handleRunDeepAiScan = async () => {
     if (!rgbaBufferRef.current || !previewDataUrl) return;
+    cancelPendingAiRequest();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setIsAnalyzing(true);
+    setUploadError(null);
 
     try {
       const localResult = runLocalReconstruction(
@@ -307,11 +369,14 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
 
       const detectedMime = previewDataUrl.startsWith('data:image/jpeg')
         ? 'image/jpeg'
+        : previewDataUrl.startsWith('data:image/webp')
+        ? 'image/webp'
         : 'image/png';
 
       const response = await fetch('/api/reconstruct', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           imageBase64: previewDataUrl,
           mimeType: detectedMime,
@@ -320,7 +385,19 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         }),
       });
 
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+      if (controller.signal.aborted) return;
+
+      if (!response.ok) {
+        const errMsg =
+          data && typeof data.error === 'string'
+            ? data.error
+            : `Lỗi máy chủ (${response.status}) — đã giữ kết quả Pixel Depth Engine cục bộ.`;
+        setUploadError(errMsg);
+        setAiSourceLabel('Pixel Depth & Chroma Engine');
+        return;
+      }
+
       if (data?.analysis) {
         const ai = data.analysis;
         const validBiomes = Object.keys(BIOMES) as BiomeId[];
@@ -329,11 +406,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           : localResult.metrics.suggestedBiome;
 
         const nextRelief =
-          typeof ai.reliefScale === 'number'
+          typeof ai.reliefScale === 'number' && Number.isFinite(ai.reliefScale)
             ? Math.max(0.6, Math.min(2.2, ai.reliefScale))
             : reliefScale;
         const nextTerrace =
-          typeof ai.terraceSteps === 'number'
+          typeof ai.terraceSteps === 'number' && Number.isFinite(ai.terraceSteps)
             ? Math.max(0, Math.min(8, ai.terraceSteps))
             : terraceSteps;
 
@@ -348,6 +425,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         );
 
         const validPrefabs = PREFAB_CATALOG.map((p) => p.id);
+        const MAX_VILLAGE_COORD_M = 48;
         if (Array.isArray(ai.detectedObjects) && ai.detectedObjects.length > 0) {
           const aiPlaced: PlacedObject[] = ai.detectedObjects
             .slice(0, 16)
@@ -355,13 +433,12 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
               const pId = validPrefabs.includes(item.prefabId as PrefabId)
                 ? (item.prefabId as PrefabId)
                 : 'windmill_cottage';
-              const rawX = Number(item.x) || 0;
-              const rawZ = Number(item.z) || 0;
-              // Keep placed objects within the visible 1:1 village/basin (-55m..+55m)
-              const normX = Math.abs(rawX) > 60 ? (rawX / 3600) * 45 : rawX;
-              const normZ = Math.abs(rawZ) > 60 ? (rawZ / 3600) * 45 : rawZ;
-              const wx = Math.max(-55, Math.min(55, normX));
-              const wz = Math.max(-55, Math.min(55, normZ));
+              const rawX = Number(item.x);
+              const rawZ = Number(item.z);
+              const safeX = Number.isFinite(rawX) ? rawX : 0;
+              const safeZ = Number.isFinite(rawZ) ? rawZ : 0;
+              const wx = Math.max(-MAX_VILLAGE_COORD_M, Math.min(MAX_VILLAGE_COORD_M, safeX));
+              const wz = Math.max(-MAX_VILLAGE_COORD_M, Math.min(MAX_VILLAGE_COORD_M, safeZ));
               const wy = getGroundHeightAt(
                 updatedLocal.heightMap,
                 GRID_SIZE,
@@ -381,8 +458,8 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
               };
             });
           updatedLocal.detectedObjects = aiPlaced;
-          setReconstructed({ ...updatedLocal });
         }
+        setReconstructed({ ...updatedLocal });
 
         setReliefScale(nextRelief);
         setTerraceSteps(nextTerrace);
@@ -392,11 +469,20 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         if (ai.summary) setSummaryText(ai.summary);
       } else {
         setAiSourceLabel('Pixel Depth & Chroma Engine');
+        if (data && typeof data.warning === 'string') {
+          setUploadError(data.warning);
+        }
       }
-    } catch {
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
       setAiSourceLabel('Pixel Depth & Chroma Engine');
     } finally {
-      setIsAnalyzing(false);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        setIsAnalyzing(false);
+      }
     }
   };
 
@@ -484,6 +570,14 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                     : 'Chọn Ảnh Vùng Đất / Vật Thể (.JPG, .PNG)'}
                 </span>
               </button>
+              {uploadError && (
+                <p
+                  role="alert"
+                  className="mt-2 px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-400/40 text-[11px] text-amber-200"
+                >
+                  {uploadError}
+                </p>
+              )}
             </div>
 
             <div>

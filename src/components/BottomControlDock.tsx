@@ -199,7 +199,7 @@ const RULE_PREFAB_OPTIONS: Array<{ id: PrefabId; label: string; defaultTex: Text
   { id: 'windmill_cottage', label: 'Nhà Cối Xay Gió', defaultTex: 'emerald_grass' },
 ];
 
-export const BottomControlDock: React.FC<BottomControlDockProps> = ({
+const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
   isCollapsed,
   onToggleCollapse,
   activeTab,
@@ -1438,3 +1438,5 @@ export const BottomControlDock: React.FC<BottomControlDockProps> = ({
     </div>
   );
 };
+
+export const BottomControlDock = React.memo(BottomControlDockComponent);

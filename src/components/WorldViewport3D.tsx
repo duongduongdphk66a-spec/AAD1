@@ -896,6 +896,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     prefabFactory: ProceduralPrefabFactory;
     objectMeshMap: Map<string, THREE.Group>;
     microMeshMap: Map<string, THREE.Group>;
+    animatedPropNodes: THREE.Object3D[];
     requestWake: () => void;
     triggerCameraPreset: (preset: CameraPresetId) => void;
   } | null>(null);
@@ -945,7 +946,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     scene.fog = fog;
 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    const roomEnv = new RoomEnvironment();
+    scene.environment = pmremGenerator.fromScene(roomEnv, 0.04).texture;
+    roomEnv.dispose();
     pmremGenerator.dispose();
 
     const camera = new THREE.PerspectiveCamera(
@@ -1162,6 +1165,25 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const prefabFactory = new ProceduralPrefabFactory(contactShadowMap, isSoftwareGl);
     const objectMeshMap = new Map<string, THREE.Group>();
     const microMeshMap = new Map<string, THREE.Group>();
+    const animatedPropNodes: THREE.Object3D[] = [];
+
+    const collectAnimatedPropNodes = () => {
+      animatedPropNodes.length = 0;
+      propsRoot.traverse((obj) => {
+        const ud = obj.userData;
+        if (
+          ud.isWindmillRotor ||
+          ud.isFloatingCrystal ||
+          ud.isFloatingIsland ||
+          ud.isStylizedVolcanoPlume ||
+          ud.isDetachedSmokeCloud ||
+          ud.isVolcanoPlume ||
+          ud.isAbyssVortex
+        ) {
+          animatedPropNodes.push(obj);
+        }
+      });
+    };
 
     // Populate initial placed objects immediately before first render at true 1:1 scale
     for (const item of placedObjects) {
@@ -1174,6 +1196,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       propsRoot.add(group);
       objectMeshMap.set(item.id, group);
     }
+    collectAnimatedPropNodes();
 
     // Populate initial 3D surface ecosystems (3-5cm grass, 3D flowers, desert sand dunes, smoking lava)
     for (let idx = 0; idx < microStrokes.length; idx++) {
@@ -1285,7 +1308,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     };
 
     const onPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || e.ctrlKey || e.altKey || e.metaKey) return;
       pointerDownPos = { x: e.clientX, y: e.clientY };
       const {
         activeTab: tab,
@@ -1342,6 +1365,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         return;
       }
 
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+
       const moveDist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
       if (moveDist > 6) return;
 
@@ -1378,11 +1403,31 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     // Keyboard WASD camera panning support (adaptive speed based on camera height)
     const keysPressed: Record<string, boolean> = {};
+    const onBlur = () => {
+      for (const key of Object.keys(keysPressed)) {
+        keysPressed[key] = false;
+      }
+      if (isPointerDraggingTerrain) {
+        isPointerDraggingTerrain = false;
+        controls.enabled = true;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        onBlur();
+      }
+    };
     const onKeyDown = (e: KeyboardEvent) => {
       if (
         document.activeElement &&
         ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)
       ) {
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        for (const key of Object.keys(keysPressed)) {
+          keysPressed[key] = false;
+        }
         return;
       }
       keysPressed[e.code] = true;
@@ -1392,11 +1437,23 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     };
 
     const domElem = renderer.domElement;
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+      onBlur();
+    };
+    const onContextRestored = () => {
+      renderer.render(scene, camera);
+    };
+
     domElem.addEventListener('pointerdown', onPointerDown);
     domElem.addEventListener('pointermove', onPointerMove);
+    domElem.addEventListener('webglcontextlost', onContextLost, false);
+    domElem.addEventListener('webglcontextrestored', onContextRestored, false);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     const onResize = () => {
       if (!container) return;
@@ -1476,7 +1533,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
       }
 
-      propsRoot.traverse((obj) => {
+      for (let i = 0; i < animatedPropNodes.length; i++) {
+        const obj = animatedPropNodes[i];
         if (obj.userData.isWindmillRotor) {
           obj.rotation.z += dt * 1.15;
         } else if (obj.userData.isFloatingCrystal) {
@@ -1503,7 +1561,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           obj.rotation.y -= dt * 1.25;
           obj.position.y = 2.6 + Math.sin(elapsed * 2.0) * 0.25;
         }
-      });
+      }
 
       // Keep weather & celestial star dome centered around the camera target
       weatherRoot.position.set(controls.target.x, 0, controls.target.z);
@@ -1668,6 +1726,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       prefabFactory,
       objectMeshMap,
       microMeshMap,
+      animatedPropNodes,
       requestWake: () => {},
       triggerCameraPreset,
     };
@@ -1680,13 +1739,36 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       clearTimeout(frameId);
       domElem.removeEventListener('pointerdown', onPointerDown);
       domElem.removeEventListener('pointermove', onPointerMove);
+      domElem.removeEventListener('webglcontextlost', onContextLost, false);
+      domElem.removeEventListener('webglcontextrestored', onContextRestored, false);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('resize', onResize);
+      controls.removeEventListener('start', cancelCamTransition);
+      controls.removeEventListener('change', emitScaleMetrics);
       controls.dispose();
+      microCircleGeo.dispose();
+      if (scene.environment) {
+        scene.environment.dispose();
+        scene.environment = null;
+      }
+      if (sunLight.shadow.map) {
+        sunLight.shadow.map.dispose();
+      }
+      prefabFactory.dispose();
+      contactShadowMap.userData.shared = false;
+      contactShadowMap.dispose();
       disposeObject3DTree(scene);
+      renderer.renderLists.dispose();
       renderer.dispose();
+      renderer.forceContextLoss();
+      if (container.contains(domElem)) {
+        container.removeChild(domElem);
+      }
+      sceneHandlesRef.current = null;
     };
   }, []);
 
@@ -1712,30 +1794,33 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     handles.terrainGeo.computeVertexNormals();
     handles.terrainGeo.computeBoundingSphere();
 
+    const currentSelectedId = latestPropsRef.current.selectedObjectId;
     handles.objectMeshMap.forEach((group, id) => {
       const wx = group.position.x;
       const wz = group.position.z;
       const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
       group.position.y = wy;
-      if (id === selectedObjectId) {
+      if (id === currentSelectedId) {
         handles.selectionRing.position.set(wx, wy + 0.12, wz);
       }
     });
-  }, [terrainVersion, heightMap, colorMap, selectedObjectId]);
+  }, [terrainVersion, heightMap, colorMap]);
 
   // 3. Sync Placed 3D Objects (Houses, Mountains, Trees, Landmarks) at 1:1 Real-World Scale
   useEffect(() => {
     const handles = sceneHandlesRef.current;
     if (!handles) return;
 
-    const { propsRoot, prefabFactory, objectMeshMap, selectionRing } = handles;
+    const { propsRoot, prefabFactory, objectMeshMap, selectionRing, animatedPropNodes } = handles;
     const incomingIds = new Set(placedObjects.map((o) => o.id));
+    let structureChanged = false;
 
     objectMeshMap.forEach((group, id) => {
       if (!incomingIds.has(id)) {
         propsRoot.remove(group);
         disposeObject3DTree(group);
         objectMeshMap.delete(id);
+        structureChanged = true;
       }
     });
 
@@ -1746,11 +1831,30 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         group.userData.placedObjectId = item.id;
         propsRoot.add(group);
         objectMeshMap.set(item.id, group);
+        structureChanged = true;
       }
       const groundY = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, item.x, item.z);
       group.position.set(item.x, groundY, item.z);
       group.rotation.y = item.rotationY;
       group.scale.setScalar(item.scale * WORLD_PROP_BASE_SCALE);
+    }
+
+    if (structureChanged) {
+      animatedPropNodes.length = 0;
+      propsRoot.traverse((obj) => {
+        const ud = obj.userData;
+        if (
+          ud.isWindmillRotor ||
+          ud.isFloatingCrystal ||
+          ud.isFloatingIsland ||
+          ud.isStylizedVolcanoPlume ||
+          ud.isDetachedSmokeCloud ||
+          ud.isVolcanoPlume ||
+          ud.isAbyssVortex
+        ) {
+          animatedPropNodes.push(obj);
+        }
+      });
     }
 
     const selectedObj = placedObjects.find((o) => o.id === selectedObjectId);

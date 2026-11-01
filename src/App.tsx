@@ -197,29 +197,27 @@ export default function App() {
     [placedObjects, microStrokes, selectedObjectId, biomeId, waterLevel, regionTitle]
   );
 
-  // Undo last action
+  // Undo last action (pure state updates outside updater function for React StrictMode safety)
   const handleUndo = useCallback(() => {
-    setUndoStack((prev) => {
-      if (prev.length === 0) return prev;
-      const snapshot = prev[prev.length - 1];
-      const remaining = prev.slice(0, -1);
+    if (undoStack.length === 0) return;
+    const snapshot = undoStack[undoStack.length - 1];
+    const remainingCount = undoStack.length - 1;
 
-      heightMapRef.current = new Float32Array(snapshot.heightMap);
-      splatMapRef.current = new Uint8Array(snapshot.splatMap);
-      colorMapRef.current = new Float32Array(snapshot.colorMap);
-      setPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
-      setMicroStrokes(snapshot.microStrokes.map((m) => ({ ...m })));
-      setSelectedObjectId(snapshot.selectedObjectId);
-      setBiomeId(snapshot.biomeId);
-      setWaterLevel(snapshot.waterLevel);
-      setRegionTitle(snapshot.regionTitle);
-      setTerrainVersion((v) => v + 1);
-      showToast(
-        `Đã hoàn tác: "${snapshot.actionLabel}" (${remaining.length} bước hoàn tác còn lại).`
-      );
-      return remaining;
-    });
-  }, [showToast]);
+    setUndoStack((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
+    heightMapRef.current = new Float32Array(snapshot.heightMap);
+    splatMapRef.current = new Uint8Array(snapshot.splatMap);
+    colorMapRef.current = new Float32Array(snapshot.colorMap);
+    setPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
+    setMicroStrokes(snapshot.microStrokes.map((m) => ({ ...m })));
+    setSelectedObjectId(snapshot.selectedObjectId);
+    setBiomeId(snapshot.biomeId);
+    setWaterLevel(snapshot.waterLevel);
+    setRegionTitle(snapshot.regionTitle);
+    setTerrainVersion((v) => v + 1);
+    showToast(
+      `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
+    );
+  }, [undoStack, showToast]);
 
   // Keyboard shortcuts: 'H' to toggle Cinema / Zen Mode, 'Ctrl+Z' / 'Cmd+Z' to Undo
   useEffect(() => {
@@ -230,9 +228,12 @@ export default function App() {
       ) {
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault();
         handleUndo();
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) {
         return;
       }
       if (e.key === 'h' || e.key === 'H') {
@@ -613,33 +614,26 @@ export default function App() {
       setPlacedObjects(generated.initialObjects);
       setSelectedObjectId(generated.initialObjects[0]?.id ?? null);
 
-      // Populate 3D physical surface ecosystem patches matching the planet's surface
-      if (
-        nextBiome === 'mars_olympus' ||
-        nextBiome === 'venus_ishtar' ||
-        nextBiome === 'kepler_crystalline' ||
-        nextBiome === 'trappist_tidally_locked'
-      ) {
-        const planetBrush = bConfig.defaultTexture;
-        setMicroStrokes(
-          [
-            { x: 0, z: 0, r: 16 },
-            { x: -16, z: -10, r: 12 },
-            { x: 18, z: -12, r: 12 },
-            { x: -14, z: 14, r: 12 },
-            { x: 15, z: 14, r: 12 },
-          ].map((pt, i) => ({
-            id: `planet-patch-${nextBiome}-${i}`,
-            x: pt.x,
-            z: pt.z,
-            radius: pt.r,
-            brushId: planetBrush,
-            grassHeightCm,
-            flowerSpecies,
-            flowerColorHex,
-          }))
-        );
-      }
+      // Always reset 3D physical surface ecosystem patches to match the newly selected biome
+      const biomeBrush = bConfig.defaultTexture;
+      setMicroStrokes(
+        [
+          { x: 0, z: 0, r: 16 },
+          { x: -16, z: -10, r: 12 },
+          { x: 18, z: -12, r: 12 },
+          { x: -14, z: 14, r: 12 },
+          { x: 15, z: 14, r: 12 },
+        ].map((pt, i) => ({
+          id: `biome-patch-${nextBiome}-${i}`,
+          x: pt.x,
+          z: pt.z,
+          radius: pt.r,
+          brushId: biomeBrush,
+          grassHeightCm,
+          flowerSpecies,
+          flowerColorHex,
+        }))
+      );
 
       setRegionTitle(bConfig.name);
       setTerrainVersion((v) => v + 1);
@@ -859,6 +853,9 @@ export default function App() {
         } catch {
           showToast('Không thể đọc tệp JSON. Vui lòng kiểm tra định dạng tệp.');
         }
+      };
+      reader.onerror = () => {
+        showToast('Không thể đọc tệp đã chọn. Vui lòng thử lại.');
       };
       reader.readAsText(file);
     },

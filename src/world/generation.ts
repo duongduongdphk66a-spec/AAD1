@@ -6,10 +6,12 @@ import {
   DEFAULT_TERRAIN_RULES,
   DayNightPreset,
   DayPhaseId,
+  FLOWER_SPECIES_CATALOG,
   FlowerSpeciesId,
   GRID_SIZE,
   MAX_ELEVATION,
   MAX_GRASS_HEIGHT_CM,
+  MIN_BRUSH_RADIUS,
   MIN_ELEVATION,
   MIN_GRASS_HEIGHT_CM,
   MicroStrokeStamp,
@@ -1422,6 +1424,8 @@ export function serializeWorldToSavePayload(params: {
 /**
  * Deserializes a saved JSON payload (supporting named texturePalette remapping so
  * future insertions into TEXTURE_INDEX_MAP never corrupt older save files).
+ * Strictly validates version, gridSize, heightMap length, placedObjects, and microStrokes,
+ * returning null if the save payload is malformed or incompatible.
  */
 export function deserializeWorldFromSavePayload(raw: unknown): {
   regionTitle: string;
@@ -1442,30 +1446,48 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
   microStrokes: MicroStrokeStamp[];
 } | null {
   if (!raw || typeof raw !== 'object') return null;
-  const data = raw as Partial<WorldSaveFileV2>;
+  const data = raw as Omit<Partial<WorldSaveFileV2>, 'version'> & { version?: unknown };
+
+  if (data.version !== undefined && data.version !== 1 && data.version !== 2) {
+    return null;
+  }
+  if (data.gridSize !== undefined && data.gridSize !== GRID_SIZE) {
+    return null;
+  }
+  if (!Array.isArray(data.heightMap) || data.heightMap.length !== TOTAL_VERTICES) {
+    return null;
+  }
+  if (
+    data.splatMap !== undefined &&
+    (!Array.isArray(data.splatMap) || data.splatMap.length !== TOTAL_VERTICES)
+  ) {
+    return null;
+  }
+
   const biomeId: BiomeId =
-    data.biomeId && data.biomeId in BIOMES ? data.biomeId : 'mondstadt_meadow';
+    typeof data.biomeId === 'string' && data.biomeId in BIOMES
+      ? (data.biomeId as BiomeId)
+      : 'mondstadt_meadow';
   const bCfg = BIOMES[biomeId];
 
   const heightMap = new Float32Array(TOTAL_VERTICES);
   const splatMap = new Uint8Array(TOTAL_VERTICES);
   const colorMap = new Float32Array(TOTAL_VERTICES * 3);
 
-  if (Array.isArray(data.heightMap) && data.heightMap.length === TOTAL_VERTICES) {
-    for (let i = 0; i < TOTAL_VERTICES; i++) {
-      const v = Number(data.heightMap[i]);
-      heightMap[i] = Number.isFinite(v)
-        ? Math.max(MIN_ELEVATION, Math.min(MAX_ELEVATION, v))
-        : 0;
-    }
+  for (let i = 0; i < TOTAL_VERTICES; i++) {
+    const v = Number(data.heightMap[i]);
+    heightMap[i] = Number.isFinite(v)
+      ? Math.max(MIN_ELEVATION, Math.min(MAX_ELEVATION, v))
+      : 0;
   }
 
   const palette = Array.isArray(data.texturePalette) ? data.texturePalette : TEXTURE_INDEX_MAP;
   const defaultTexIdx = getTextureIndex(bCfg.defaultTexture);
   if (Array.isArray(data.splatMap) && data.splatMap.length === TOTAL_VERTICES) {
     for (let i = 0; i < TOTAL_VERTICES; i++) {
-      const rawIdx = Number(data.splatMap[i]) || 0;
-      const brushName = palette[rawIdx] as TextureBrushId | undefined;
+      const rawIdx = Number(data.splatMap[i]);
+      const safeIdx = Number.isInteger(rawIdx) && rawIdx >= 0 ? rawIdx : -1;
+      const brushName = safeIdx >= 0 ? (palette[safeIdx] as TextureBrushId | undefined) : undefined;
       splatMap[i] =
         brushName && brushName in TEXTURE_BRUSHES ? getTextureIndex(brushName) : defaultTexIdx;
     }
@@ -1475,10 +1497,147 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
 
   recomputeTerrainColors(heightMap, splatMap, colorMap, biomeId);
 
+  const halfWorld = WORLD_SIZE / 2;
+  const validPrefabIds = new Set<PrefabId>(PREFAB_CATALOG.map((p) => p.id));
+  const validFlowerSpecies = new Set<FlowerSpeciesId>(FLOWER_SPECIES_CATALOG.map((s) => s.id));
+  const hexColorRegex = /^#[0-9a-fA-F]{6}$/;
+
+  const sanitizedObjects: PlacedObject[] = [];
+  if (Array.isArray(data.placedObjects)) {
+    const rawList = data.placedObjects.slice(0, 500);
+    for (let i = 0; i < rawList.length; i++) {
+      const item = rawList[i] as Partial<PlacedObject> | null | undefined;
+      if (!item || typeof item !== 'object') continue;
+      if (typeof item.prefabId !== 'string' || !validPrefabIds.has(item.prefabId as PrefabId)) {
+        continue;
+      }
+      const rx = Number(item.x);
+      const rz = Number(item.z);
+      if (!Number.isFinite(rx) || !Number.isFinite(rz)) continue;
+
+      const x = Math.max(-halfWorld, Math.min(halfWorld, rx));
+      const z = Math.max(-halfWorld, Math.min(halfWorld, rz));
+      const ry = Number(item.y);
+      const y = Number.isFinite(ry)
+        ? Math.max(MIN_ELEVATION, Math.min(MAX_ELEVATION, ry))
+        : Number(getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, x, z).toFixed(2));
+      const rScale = Number(item.scale);
+      const scale = Number.isFinite(rScale)
+        ? Math.max(0.3, Math.min(3.0, rScale))
+        : 1.0;
+      const rRot = Number(item.rotationY);
+      const rotationY = Number.isFinite(rRot) ? rRot : 0;
+
+      sanitizedObjects.push({
+        id:
+          typeof item.id === 'string' && item.id.trim()
+            ? item.id.trim().slice(0, 80)
+            : `restored-obj-${i}-${item.prefabId}`,
+        prefabId: item.prefabId as PrefabId,
+        label:
+          typeof item.label === 'string' && item.label.trim()
+            ? item.label.trim().slice(0, 120)
+            : item.prefabId,
+        x,
+        y,
+        z,
+        scale,
+        rotationY,
+      });
+    }
+  }
+
+  const sanitizedStrokes: MicroStrokeStamp[] = [];
+  if (Array.isArray(data.microStrokes)) {
+    const rawStrokes = data.microStrokes.slice(0, 300);
+    for (let i = 0; i < rawStrokes.length; i++) {
+      const st = rawStrokes[i] as Partial<MicroStrokeStamp> | null | undefined;
+      if (!st || typeof st !== 'object') continue;
+      if (typeof st.brushId !== 'string' || !(st.brushId in TEXTURE_BRUSHES)) {
+        continue;
+      }
+      const rx = Number(st.x);
+      const rz = Number(st.z);
+      if (!Number.isFinite(rx) || !Number.isFinite(rz)) continue;
+
+      const x = Math.max(-halfWorld, Math.min(halfWorld, rx));
+      const z = Math.max(-halfWorld, Math.min(halfWorld, rz));
+      const rRad = Number(st.radius);
+      const radius = Number.isFinite(rRad)
+        ? Math.max(MIN_BRUSH_RADIUS, Math.min(2500, rRad))
+        : 8;
+      const rGrass = Number(st.grassHeightCm);
+      const grassHeightCm = Number.isFinite(rGrass)
+        ? Math.max(MIN_GRASS_HEIGHT_CM, Math.min(MAX_GRASS_HEIGHT_CM, rGrass))
+        : undefined;
+      const flowerSpecies =
+        typeof st.flowerSpecies === 'string' &&
+        validFlowerSpecies.has(st.flowerSpecies as FlowerSpeciesId)
+          ? (st.flowerSpecies as FlowerSpeciesId)
+          : undefined;
+      const flowerColorHex =
+        typeof st.flowerColorHex === 'string' && hexColorRegex.test(st.flowerColorHex)
+          ? st.flowerColorHex
+          : undefined;
+
+      sanitizedStrokes.push({
+        id:
+          typeof st.id === 'string' && st.id.trim()
+            ? st.id.trim().slice(0, 80)
+            : `restored-stroke-${i}`,
+        x,
+        z,
+        radius,
+        brushId: st.brushId as TextureBrushId,
+        grassHeightCm,
+        flowerSpecies,
+        flowerColorHex,
+      });
+    }
+  } else {
+    sanitizedStrokes.push(...generateInitialSurfaceShowcaseStrokes());
+  }
+
+  const rawWater = Number(data.waterLevel);
+  const waterLevel = Number.isFinite(rawWater)
+    ? Math.max(-150, Math.min(150, rawWater))
+    : bCfg.waterLevel;
+
+  const rawSunElev = Number(data.sunElevation);
+  const sunElevation = Number.isFinite(rawSunElev)
+    ? Math.max(-65, Math.min(85, rawSunElev))
+    : 48;
+
+  const rawSunAzim = Number(data.sunAzimuth);
+  const sunAzimuth = Number.isFinite(rawSunAzim)
+    ? ((rawSunAzim % 360) + 360) % 360
+    : 135;
+
+  const rawTime = Number(data.timeOfDay);
+  const timeOfDay = Number.isFinite(rawTime)
+    ? ((rawTime % 24) + 24) % 24
+    : 10.5;
+
+  const rawGrass = Number(data.grassHeightCm);
+  const grassHeightCm = Number.isFinite(rawGrass)
+    ? Math.max(MIN_GRASS_HEIGHT_CM, Math.min(MAX_GRASS_HEIGHT_CM, rawGrass))
+    : DEFAULT_GRASS_HEIGHT_CM;
+
+  const flowerSpecies: FlowerSpeciesId =
+    typeof data.flowerSpecies === 'string' &&
+    validFlowerSpecies.has(data.flowerSpecies as FlowerSpeciesId)
+      ? (data.flowerSpecies as FlowerSpeciesId)
+      : 'sakura_bloom';
+
+  const flowerColorHex =
+    typeof data.flowerColorHex === 'string' && hexColorRegex.test(data.flowerColorHex)
+      ? data.flowerColorHex
+      : '#f472b6';
+
   return {
     regionTitle:
       typeof data.regionTitle === 'string' && data.regionTitle.trim()
-        ? data.regionTitle
+        ? data.regionTitle.trim().slice(0, 120)
         : bCfg.name,
     biomeId,
     activeWeather:
@@ -1486,25 +1645,18 @@ export function deserializeWorldFromSavePayload(raw: unknown): {
       WEATHER_CATALOG.some((w) => w.id === data.activeWeather)
         ? (data.activeWeather as WeatherId)
         : bCfg.defaultWeather ?? 'clear_sky',
-    waterLevel: typeof data.waterLevel === 'number' ? data.waterLevel : bCfg.waterLevel,
-    sunElevation: typeof data.sunElevation === 'number' ? data.sunElevation : 48,
-    sunAzimuth: typeof data.sunAzimuth === 'number' ? data.sunAzimuth : 135,
-    timeOfDay: typeof data.timeOfDay === 'number' ? data.timeOfDay : 10.5,
+    waterLevel,
+    sunElevation,
+    sunAzimuth,
+    timeOfDay,
     starlightMode: Boolean(data.starlightMode),
-    grassHeightCm:
-      typeof data.grassHeightCm === 'number'
-        ? Math.max(MIN_GRASS_HEIGHT_CM, Math.min(MAX_GRASS_HEIGHT_CM, data.grassHeightCm))
-        : DEFAULT_GRASS_HEIGHT_CM,
-    flowerSpecies:
-      typeof data.flowerSpecies === 'string' ? data.flowerSpecies : 'sakura_bloom',
-    flowerColorHex:
-      typeof data.flowerColorHex === 'string' ? data.flowerColorHex : '#f472b6',
+    grassHeightCm,
+    flowerSpecies,
+    flowerColorHex,
     heightMap,
     splatMap,
     colorMap,
-    placedObjects: Array.isArray(data.placedObjects) ? data.placedObjects : [],
-    microStrokes: Array.isArray(data.microStrokes)
-      ? data.microStrokes
-      : generateInitialSurfaceShowcaseStrokes(),
+    placedObjects: sanitizedObjects,
+    microStrokes: sanitizedStrokes,
   };
 }

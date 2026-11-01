@@ -909,8 +909,36 @@ export const PATCH_BUILDERS: Record<TextureBrushId, PatchBuilder> = {
   },
 };
 
+const MATERIAL_TEXTURE_SLOTS = [
+  'map',
+  'alphaMap',
+  'aoMap',
+  'bumpMap',
+  'displacementMap',
+  'emissiveMap',
+  'envMap',
+  'lightMap',
+  'metalnessMap',
+  'normalMap',
+  'roughnessMap',
+  'specularMap',
+  'gradientMap',
+] as const;
+
+function disposeMaterialWithTextures(mat: THREE.Material): void {
+  if (mat.userData?.shared) return;
+  const matRecord = mat as unknown as Record<string, unknown>;
+  for (const slot of MATERIAL_TEXTURE_SLOTS) {
+    const tex = matRecord[slot] as THREE.Texture | null | undefined;
+    if (tex && typeof tex.dispose === 'function' && !tex.userData?.shared) {
+      tex.dispose();
+    }
+  }
+  mat.dispose();
+}
+
 /**
- * Recursively disposes geometries and materials of a 3D Group/Object3D
+ * Recursively disposes geometries, textures, and materials of a 3D Group/Object3D
  * to prevent GPU memory leaks when surface patches or prefabs are removed.
  */
 export function disposeObject3DTree(root: THREE.Object3D): void {
@@ -922,10 +950,10 @@ export function disposeObject3DTree(root: THREE.Object3D): void {
     if (mesh.material) {
       if (Array.isArray(mesh.material)) {
         for (const m of mesh.material) {
-          m.dispose();
+          disposeMaterialWithTextures(m);
         }
       } else {
-        mesh.material.dispose();
+        disposeMaterialWithTextures(mesh.material);
       }
     }
   });

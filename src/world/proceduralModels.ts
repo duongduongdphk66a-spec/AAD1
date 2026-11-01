@@ -12,6 +12,7 @@ export class ProceduralPrefabFactory {
 
   constructor(contactShadowTexture: THREE.Texture, isSoftwareGl: boolean) {
     this.isSoftwareGl = isSoftwareGl;
+    contactShadowTexture.userData = { ...contactShadowTexture.userData, shared: true };
     this.contactShadowMat = new THREE.MeshBasicMaterial({
       map: contactShadowTexture,
       transparent: true,
@@ -21,6 +22,12 @@ export class ProceduralPrefabFactory {
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
     });
+    this.contactShadowMat.userData = { shared: true };
+  }
+
+  public dispose(): void {
+    this.contactShadowMat.userData.shared = false;
+    this.contactShadowMat.dispose();
   }
 
   private addContactShadow(group: THREE.Group, radius: number): void {

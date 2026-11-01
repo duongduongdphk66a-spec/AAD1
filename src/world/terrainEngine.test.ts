@@ -726,4 +726,129 @@ test('src/world/registry modular structure exports all 20 individual biomes and 
   }
 });
 
+test('deserializeWorldFromSavePayload rejects malformed heightMap/gridSize/version and sanitizes placedObjects, microStrokes, waterLevel, and flowerColorHex', () => {
+  // 1. Rejects wrong heightMap length instead of returning a silent 0m flat terrain
+  assert.equal(deserializeWorldFromSavePayload(null), null);
+  assert.equal(deserializeWorldFromSavePayload({}), null);
+  assert.equal(deserializeWorldFromSavePayload({ version: 2, heightMap: [1, 2, 3] }), null);
+  assert.equal(
+    deserializeWorldFromSavePayload({
+      version: 99,
+      heightMap: new Array(TOTAL_VERTICES).fill(0),
+    }),
+    null
+  );
+  assert.equal(
+    deserializeWorldFromSavePayload({
+      version: 2,
+      gridSize: 64,
+      heightMap: new Array(TOTAL_VERTICES).fill(0),
+    }),
+    null
+  );
 
+  // 2. Sanitizes placedObjects (filters unknown prefabId & NaN, clamps scale) and microStrokes
+  const validHeights = new Array(TOTAL_VERTICES).fill(12);
+  const restored = deserializeWorldFromSavePayload({
+    version: 2,
+    gridSize: GRID_SIZE,
+    biomeId: 'mondstadt_meadow',
+    waterLevel: 9999,
+    flowerColorHex: 'not-a-hex-color',
+    flowerSpecies: 'unknown_flower',
+    heightMap: validHeights,
+    placedObjects: [
+      {
+        id: 'valid-1',
+        prefabId: 'windmill_cottage',
+        label: 'Cối Xay',
+        x: 10,
+        y: 12,
+        z: -10,
+        scale: 99,
+        rotationY: 0.5,
+      },
+      {
+        id: 'invalid-prefab',
+        prefabId: 'non_existent_prefab',
+        label: 'Bad',
+        x: 0,
+        y: 0,
+        z: 0,
+        scale: 1,
+        rotationY: 0,
+      },
+      {
+        id: 'nan-coords',
+        prefabId: 'windmill_cottage',
+        label: 'NaN',
+        x: Number.NaN,
+        y: 0,
+        z: 0,
+        scale: 1,
+        rotationY: 0,
+      },
+    ],
+    microStrokes: [
+      {
+        id: 'valid-stroke',
+        brushId: 'emerald_grass',
+        x: 4,
+        z: -4,
+        radius: 50000,
+      },
+      {
+        id: 'bad-brush',
+        brushId: 'unknown_brush',
+        x: 0,
+        z: 0,
+        radius: 10,
+      },
+    ],
+  });
+
+  assert.ok(restored !== null);
+  assert.equal(restored.waterLevel, 150);
+  assert.equal(restored.flowerColorHex, '#f472b6');
+  assert.equal(restored.flowerSpecies, 'sakura_bloom');
+  assert.equal(restored.placedObjects.length, 1);
+  assert.equal(restored.placedObjects[0].id, 'valid-1');
+  assert.equal(restored.placedObjects[0].scale, 3.0);
+  assert.equal(restored.microStrokes.length, 1);
+  assert.equal(restored.microStrokes[0].id, 'valid-stroke');
+  assert.equal(restored.microStrokes[0].radius, 2500);
+});
+
+test('disposeObject3DTree disposes material textures (map, normalMap, emissiveMap) while preserving shared textures', () => {
+  const group = new THREE.Group();
+  const mapTex = new THREE.Texture();
+  const normalTex = new THREE.Texture();
+  const sharedTex = new THREE.Texture();
+  sharedTex.userData = { shared: true };
+
+  let mapDisposed = false;
+  let normalDisposed = false;
+  let sharedDisposed = false;
+  mapTex.dispose = () => {
+    mapDisposed = true;
+  };
+  normalTex.dispose = () => {
+    normalDisposed = true;
+  };
+  sharedTex.dispose = () => {
+    sharedDisposed = true;
+  };
+
+  const mat = new THREE.MeshStandardMaterial({
+    map: mapTex,
+    normalMap: normalTex,
+    roughnessMap: sharedTex,
+  });
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat);
+  group.add(mesh);
+
+  disposeObject3DTree(group);
+  assert.equal(mapDisposed, true, 'Should dispose material.map texture');
+  assert.equal(normalDisposed, true, 'Should dispose material.normalMap texture');
+  assert.equal(sharedDisposed, false, 'Should not dispose textures marked with userData.shared = true');
+});
