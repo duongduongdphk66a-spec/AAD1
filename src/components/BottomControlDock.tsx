@@ -49,6 +49,7 @@ import {
   TEXTURE_BRUSHES,
   WeatherId,
   WEATHER_CATALOG,
+  WeatherPresetType,
 } from '../world/registry';
 import {
   formatTerrainRuleFormula,
@@ -70,6 +71,10 @@ interface BottomControlDockProps {
   onChangeBrushRadius: (r: number) => void;
   brushStrength: number;
   onChangeBrushStrength: (s: number) => void;
+  spawnObjectOnSculpt?: boolean;
+  onToggleSpawnObjectOnSculpt?: () => void;
+  sculptPrefabOverride?: PrefabId | 'auto';
+  onChangeSculptPrefabOverride?: (prefab: PrefabId | 'auto') => void;
 
   // Texture painting & 3D surface ecosystem state (3-5cm grass, flower species & color)
   textureBrush: TextureBrushId;
@@ -147,11 +152,23 @@ interface BottomControlDockProps {
   lastUndoLabel?: string;
   onUndo: () => void;
 
-  // Actions
+  // Actions & GPU Shader / Weather / Erosion / GLB Export controls
   onOpenReconstructModal: () => void;
   onResetWorld: () => void;
   onExportWorldJson: () => void;
   onImportWorldJson?: (file: File) => void;
+  onExportWorldGlb?: () => void;
+  onRunHydraulicErosion?: () => void;
+  gpuShaderEnabled?: boolean;
+  onToggleGpuShader?: () => void;
+  gpuWeatherPreset?: WeatherPresetType | 'auto';
+  onChangeGpuWeatherPreset?: (preset: WeatherPresetType | 'auto') => void;
+  snowCoverageIntensity?: number;
+  onChangeSnowCoverageIntensity?: (val: number) => void;
+  lavaLevelMeters?: number;
+  onChangeLavaLevelMeters?: (val: number) => void;
+  triplanarSharpness?: number;
+  onChangeTriplanarSharpness?: (val: number) => void;
 }
 
 const SCULPT_TOOLS: Array<{ id: SculptToolId; name: string }> = [
@@ -213,6 +230,10 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
   onChangeBrushRadius,
   brushStrength,
   onChangeBrushStrength,
+  spawnObjectOnSculpt = true,
+  onToggleSpawnObjectOnSculpt,
+  sculptPrefabOverride = 'auto',
+  onChangeSculptPrefabOverride,
   textureBrush,
   onSelectTextureBrush,
   grassHeightCm,
@@ -274,6 +295,18 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
   onResetWorld,
   onExportWorldJson,
   onImportWorldJson,
+  onExportWorldGlb,
+  onRunHydraulicErosion,
+  gpuShaderEnabled = false,
+  onToggleGpuShader,
+  gpuWeatherPreset = 'auto',
+  onChangeGpuWeatherPreset,
+  snowCoverageIntensity = 0.85,
+  onChangeSnowCoverageIntensity,
+  lavaLevelMeters = 2.5,
+  onChangeLavaLevelMeters,
+  triplanarSharpness = 6.0,
+  onChangeTriplanarSharpness,
 }) => {
   const [brushPageIndex, setBrushPageIndex] = useState<number>(() =>
     getBrushPageIndexForRadius(brushRadius)
@@ -580,6 +613,18 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                 <RotateCcw className="w-3 h-3" />
                 Đồi Núi 1km
               </button>
+              {onRunHydraulicErosion && (
+                <button
+                  type="button"
+                  onClick={onRunHydraulicErosion}
+                  data-testid="run-hydraulic-erosion-btn"
+                  title="Mô phỏng Xói Mòn Thủy Lực theo hạt (Web Worker)"
+                  className="px-2 py-0.5 rounded-lg bg-cyan-950/70 hover:bg-cyan-900/80 border border-cyan-500/40 text-cyan-200 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                >
+                  <Sparkles className="w-3 h-3 text-cyan-300" />
+                  Xói Mòn
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onExportWorldJson}
@@ -590,6 +635,18 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                 <Download className="w-3 h-3" />
                 Xuất JSON
               </button>
+              {onExportWorldGlb && (
+                <button
+                  type="button"
+                  onClick={onExportWorldGlb}
+                  aria-label="Xuất cảnh 3D sang tệp GLB"
+                  data-testid="export-world-glb-btn"
+                  className="px-2 py-0.5 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/80 border border-emerald-500/40 text-emerald-200 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                >
+                  <Download className="w-3 h-3 text-emerald-300" />
+                  Xuất GLB
+                </button>
+              )}
               {onImportWorldJson && (
                 <>
                   <input
@@ -1059,7 +1116,7 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                 </div>
 
                 {activeTab === 'sculpt' && (
-                  <div className="flex items-center gap-1 pl-1 border-l border-slate-700">
+                  <div className="flex items-center gap-1.5 pl-1 border-l border-slate-700">
                     <span className="text-[10px] text-slate-300">Cao:</span>
                     <input
                       aria-label="Biên độ đắp địa hình"
@@ -1072,6 +1129,41 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                       className="w-14 h-1 accent-amber-400 cursor-pointer"
                     />
                     <span className="text-[10px] font-mono text-amber-300">+{brushStrength}m</span>
+                    {onToggleSpawnObjectOnSculpt && (
+                      <button
+                        type="button"
+                        data-testid="toggle-spawn-object-on-sculpt"
+                        onClick={onToggleSpawnObjectOnSculpt}
+                        title="Tự động đặt mô hình vật thể 3D tương ứng lên mặt đất ngay khi đắp địa hình"
+                        className={`px-2 py-0.5 rounded border text-[10px] font-semibold whitespace-nowrap cursor-pointer ${
+                          spawnObjectOnSculpt
+                            ? 'bg-amber-400/20 border-amber-400 text-amber-200'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {spawnObjectOnSculpt ? '✓ Đặt Vật Thể 3D' : 'Đặt Vật Thể 3D'}
+                      </button>
+                    )}
+                    {spawnObjectOnSculpt && onChangeSculptPrefabOverride && (
+                      <select
+                        aria-label="Chọn mô hình vật thể 3D đặt kèm khi đắp địa hình"
+                        data-testid="sculpt-prefab-override-select"
+                        value={sculptPrefabOverride}
+                        onChange={(e) =>
+                          onChangeSculptPrefabOverride(e.target.value as PrefabId | 'auto')
+                        }
+                        className="bg-[#0b111c] border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-cyan-200 cursor-pointer max-w-[148px]"
+                      >
+                        <option value="auto">
+                          Theo công cụ đắp ({SCULPT_TOOLS.find((t) => t.id === sculptTool)?.name || sculptTool})
+                        </option>
+                        {PREFAB_CATALOG.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                 )}
               </div>
@@ -1359,6 +1451,107 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                   <Sparkles className="w-2.5 h-2.5 text-amber-300" />
                   <span>{starlightMode ? '★ Ánh Sao Đêm: BẬT' : 'Chế Độ Ánh Sao Đêm'}</span>
                 </button>
+              </div>
+
+              {/* 5. Custom GLSL Triplanar Terrain Shader & GPU Weather Particle Kinematics Controls */}
+              <div
+                data-testid="gpu-shader-weather-controls"
+                className="flex items-center gap-1.5 shrink-0 pl-2 border-l border-slate-800"
+              >
+                <button
+                  type="button"
+                  data-testid="toggle-gpu-terrain-shader"
+                  onClick={onToggleGpuShader}
+                  className={`px-2 py-0.5 rounded-md border flex items-center gap-1 whitespace-nowrap cursor-pointer transition-colors ${
+                    gpuShaderEnabled
+                      ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-bold'
+                      : 'bg-slate-800 border-slate-700 text-cyan-200 hover:bg-slate-700'
+                  }`}
+                >
+                  <Sparkles className="w-3 h-3" />
+                  <span>{gpuShaderEnabled ? 'GLSL Triplanar: BẬT' : 'GLSL Triplanar'}</span>
+                </button>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Hạt GPU:</span>
+                  {(
+                    [
+                      { id: 'auto', label: 'Tự động' },
+                      { id: 'snowstorm', label: 'Bão Tuyết' },
+                      { id: 'sakura_petals', label: 'Anh Đào' },
+                      { id: 'volcanic_ash', label: 'Tro Lửa' },
+                      { id: 'methane_rain', label: 'Mưa Metan' },
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      data-testid={`gpu-weather-preset-${item.id}`}
+                      onClick={() => onChangeGpuWeatherPreset?.(item.id)}
+                      className={`px-1.5 py-0.5 rounded whitespace-nowrap cursor-pointer ${
+                        gpuWeatherPreset === item.id
+                          ? 'bg-amber-400 text-slate-950 font-bold'
+                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Tuyết:</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={snowCoverageIntensity}
+                    onChange={(e) => onChangeSnowCoverageIntensity?.(Number(e.target.value))}
+                    aria-label="Cường độ phủ tuyết GLSL"
+                    data-testid="gpu-snow-intensity-slider"
+                    className="w-14 h-1 accent-cyan-300 cursor-pointer"
+                  />
+                  <span className="font-mono text-cyan-200 tabular-nums">
+                    {Math.round(snowCoverageIntensity * 100)}%
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Dung nham:</span>
+                  <input
+                    type="range"
+                    min={-20}
+                    max={80}
+                    step={1}
+                    value={lavaLevelMeters}
+                    onChange={(e) => onChangeLavaLevelMeters?.(Number(e.target.value))}
+                    aria-label="Mực dung nham GLSL"
+                    data-testid="gpu-lava-level-slider"
+                    className="w-14 h-1 accent-orange-400 cursor-pointer"
+                  />
+                  <span className="font-mono text-orange-300 tabular-nums">
+                    {lavaLevelMeters}m
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Triplanar:</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={12}
+                    step={0.5}
+                    value={triplanarSharpness}
+                    onChange={(e) => onChangeTriplanarSharpness?.(Number(e.target.value))}
+                    aria-label="Độ sắc nét Triplanar GLSL"
+                    data-testid="gpu-triplanar-sharpness-slider"
+                    className="w-12 h-1 accent-emerald-400 cursor-pointer"
+                  />
+                  <span className="font-mono text-emerald-300 tabular-nums">
+                    {triplanarSharpness.toFixed(1)}
+                  </span>
+                </div>
               </div>
             </div>
           )}

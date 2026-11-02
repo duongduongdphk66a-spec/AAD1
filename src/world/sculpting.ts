@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import {
   BIOMES,
   BiomeId,
@@ -5,6 +7,9 @@ import {
   MAX_ELEVATION,
   MIN_BRUSH_RADIUS,
   MIN_ELEVATION,
+  PREFAB_CATALOG,
+  PlacedObject,
+  PrefabId,
   SculptToolId,
   TextureBrushId,
   VERTEX_COUNT_PER_SIDE,
@@ -12,6 +17,7 @@ import {
   getTextureIndex,
 } from './registry';
 import { GridDirtyRect, recomputeTerrainColors } from './brushes';
+
 
 export interface SculptKernelContext {
   ix: number;
@@ -435,26 +441,44 @@ export function applySculptBrush(
   const half = WORLD_SIZE / 2;
   const safeRadius = Math.max(MIN_BRUSH_RADIUS, radius);
   const cellSpan = WORLD_SIZE / GRID_SIZE;
-  const effectiveKernelRadius = Math.max(safeRadius, cellSpan * 0.72);
-  const microScale = safeRadius < cellSpan ? Math.max(0.25, safeRadius / cellSpan) : 1;
+  const effectiveKernelRadius = Math.max(safeRadius, cellSpan * 1.15);
+  const microScale =
+    safeRadius < cellSpan ? Math.max(0.55, Math.sqrt(safeRadius / cellSpan)) : 1;
   const centerHeight = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, worldX, worldZ);
   let modifiedCount = 0;
 
+  // When brush radius is smaller than a 62.5m grid cell, blend kernel center toward the nearest
+  // grid vertex so clicking anywhere inside a cell hits the core of the 3D landform profile
+  // instead of only touching the outer color skirt.
+  const nearestIx = Math.max(
+    0,
+    Math.min(GRID_SIZE, Math.round(((worldX + half) / WORLD_SIZE) * GRID_SIZE))
+  );
+  const nearestIz = Math.max(
+    0,
+    Math.min(GRID_SIZE, Math.round(((worldZ + half) / WORLD_SIZE) * GRID_SIZE))
+  );
+  const nearestWx = (nearestIx / GRID_SIZE) * WORLD_SIZE - half;
+  const nearestWz = (nearestIz / GRID_SIZE) * WORLD_SIZE - half;
+  const snapBlend = safeRadius < cellSpan ? 0.65 : 0;
+  const kernelCenterX = worldX * (1 - snapBlend) + nearestWx * snapBlend;
+  const kernelCenterZ = worldZ * (1 - snapBlend) + nearestWz * snapBlend;
+
   const minIx = Math.max(
     0,
-    Math.floor(((worldX - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.floor(((kernelCenterX - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const maxIx = Math.min(
     GRID_SIZE,
-    Math.ceil(((worldX + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.ceil(((kernelCenterX + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const minIz = Math.max(
     0,
-    Math.floor(((worldZ - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.floor(((kernelCenterZ - effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
   const maxIz = Math.min(
     GRID_SIZE,
-    Math.ceil(((worldZ + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
+    Math.ceil(((kernelCenterZ + effectiveKernelRadius + half) / WORLD_SIZE) * GRID_SIZE)
   );
 
   let touchedMinIx = GRID_SIZE;
@@ -469,7 +493,7 @@ export function applySculptBrush(
     for (let ix = minIx; ix <= maxIx; ix++) {
       const wx = (ix / GRID_SIZE) * WORLD_SIZE - half;
       const wz = (iz / GRID_SIZE) * WORLD_SIZE - half;
-      const dist = Math.hypot(wx - worldX, wz - worldZ);
+      const dist = Math.hypot(wx - kernelCenterX, wz - kernelCenterZ);
 
       if (dist > effectiveKernelRadius) continue;
 
@@ -484,8 +508,8 @@ export function applySculptBrush(
         idx,
         wx,
         wz,
-        worldX,
-        worldZ,
+        worldX: kernelCenterX,
+        worldZ: kernelCenterZ,
         dist,
         normalizedDist,
         effectiveKernelRadius,
@@ -642,4 +666,363 @@ export function computePartialVertexNormals(
     updatedVertexCount,
   };
 }
+
+export interface SparseDeltaPatch {
+  indices: Uint32Array;
+  oldHeights: Float32Array;
+  newHeights: Float32Array;
+}
+
+/**
+ * Sparse Delta Undo/Redo History Manager:
+ * Records only vertices whose height changed by more than `epsilon` (default 1e-5)
+ * during a sculpt stroke, avoiding full heightmap copies per stroke.
+ */
+export class SculptHistoryManager {
+  private undoStack: SparseDeltaPatch[] = [];
+  private redoStack: SparseDeltaPatch[] = [];
+  private maxHistorySize: number;
+
+  constructor(maxHistorySize = 50) {
+    this.maxHistorySize = maxHistorySize;
+  }
+
+  public recordStroke(
+    beforeMap: Float32Array,
+    afterMap: Float32Array,
+    epsilon = 1e-5
+  ): void {
+    const changedIndices: number[] = [];
+    const oldVals: number[] = [];
+    const newVals: number[] = [];
+
+    const len = Math.min(beforeMap.length, afterMap.length);
+    for (let i = 0; i < len; i++) {
+      if (Math.abs(afterMap[i] - beforeMap[i]) > epsilon) {
+        changedIndices.push(i);
+        oldVals.push(beforeMap[i]);
+        newVals.push(afterMap[i]);
+      }
+    }
+
+    if (changedIndices.length === 0) return;
+
+    this.undoStack.push({
+      indices: new Uint32Array(changedIndices),
+      oldHeights: new Float32Array(oldVals),
+      newHeights: new Float32Array(newVals),
+    });
+
+    if (this.undoStack.length > this.maxHistorySize) {
+      this.undoStack.shift();
+    }
+    this.redoStack.length = 0;
+  }
+
+  public undo(targetMap: Float32Array): boolean {
+    const patch = this.undoStack.pop();
+    if (!patch) return false;
+
+    for (let k = 0; k < patch.indices.length; k++) {
+      targetMap[patch.indices[k]] = patch.oldHeights[k];
+    }
+    this.redoStack.push(patch);
+    return true;
+  }
+
+  public redo(targetMap: Float32Array): boolean {
+    const patch = this.redoStack.pop();
+    if (!patch) return false;
+
+    for (let k = 0; k < patch.indices.length; k++) {
+      targetMap[patch.indices[k]] = patch.newHeights[k];
+    }
+    this.undoStack.push(patch);
+    return true;
+  }
+
+  public get canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  public get canRedo(): boolean {
+    return this.redoStack.length > 0;
+  }
+
+  public get undoCount(): number {
+    return this.undoStack.length;
+  }
+
+  public get redoCount(): number {
+    return this.redoStack.length;
+  }
+
+  public clear(): void {
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+  }
+}
+
+/**
+ * Smooth cosine brush falloff F(r) = 0.5 * (1 + cos(pi * r / R)) for r < R, 0 for r >= R.
+ * Guarantees zero first derivative at both the brush center (r = 0) and boundary (r = R).
+ */
+export function cosineBrushFalloff(distance: number, radius: number): number {
+  if (radius <= 0 || distance >= radius) return 0;
+  if (distance <= 0) return 1;
+  return 0.5 * (1 + Math.cos((Math.PI * distance) / radius));
+}
+
+/**
+ * Exports a Three.js scene or Object3D hierarchy to a binary `.glb` file download.
+ */
+export function exportWorldToGLB(
+  sceneRoot: THREE.Object3D,
+  filename = 'world_export.glb'
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const exporter = new GLTFExporter();
+    exporter.parse(
+      sceneRoot,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          if (typeof document !== 'undefined' && typeof URL !== 'undefined') {
+            const blob = new Blob([result], { type: 'model/gltf-binary' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            link.click();
+            URL.revokeObjectURL(url);
+          }
+          resolve();
+        } else {
+          reject(new Error('Kết quả xuất không ở định dạng nhị phân GLB.'));
+        }
+      },
+      (error) => reject(error),
+      { binary: true }
+    );
+  });
+}
+
+export interface SculptToolPrefabMapping {
+  prefabId: PrefabId;
+  secondaryPrefabId?: PrefabId;
+  label: string;
+  defaultScale: number;
+  minSpacingMeters: number;
+}
+
+/**
+ * Maps each geological/planetary sculpting tool (`SculptToolId`) to its corresponding
+ * 3D physical landmark or ecosystem prefab (`PrefabId`) so sculpting in "Đắp Địa Hình"
+ * both deforms the 3D terrain mesh and places real 3D objects onto the sculpted landform.
+ */
+export const SCULPT_TOOL_PREFAB_MAP: Record<SculptToolId, SculptToolPrefabMapping | null> = {
+  alpine_horn_glacier: {
+    prefabId: 'himalaya_matterhorn_peak',
+    secondaryPrefabId: 'himalaya_fishtail_peak',
+    label: 'Đỉnh Sừng Băng Matterhorn / Himalaya (Đắp 3D)',
+    defaultScale: 1.25,
+    minSpacingMeters: 22,
+  },
+  barchan_dune_saltflat: {
+    prefabId: 'sahara_atacama_oasis',
+    label: 'Ốc Đảo Sahara & Tháp Đá Atacama (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 20,
+  },
+  meander_river_delta: {
+    prefabId: 'amazon_congo_canopy_tree',
+    secondaryPrefabId: 'ancient_bridge',
+    label: 'Đại Thụ Rừng Mưa Amazon (Đắp 3D)',
+    defaultScale: 1.15,
+    minSpacingMeters: 16,
+  },
+  cryo_volcano: {
+    prefabId: 'pluto_cryo_volcano',
+    secondaryPrefabId: 'europa_penitentes_spire',
+    label: 'Núi Lửa Băng Wright Mons Pluto (Đắp 3D)',
+    defaultScale: 1.25,
+    minSpacingMeters: 22,
+  },
+  methane_basin: {
+    prefabId: 'titan_methane_geyser',
+    secondaryPrefabId: 'titan_mithrim_montes',
+    label: 'Đảo Đá & Mạch Phun Metan Titan (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 20,
+  },
+  meteor_crater: {
+    prefabId: 'meteor_impact_crater',
+    secondaryPrefabId: 'exoplanet_crystal_spire',
+    label: 'Hố Thiên Thạch & Lõi Sao Băng (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 20,
+  },
+  shield_mesa: {
+    prefabId: 'mars_olympus_shield',
+    secondaryPrefabId: 'venus_pancake_dome',
+    label: 'Núi Lửa Khiên Olympus Mons (Đắp 3D)',
+    defaultScale: 1.25,
+    minSpacingMeters: 24,
+  },
+  sheer_cliff: {
+    prefabId: 'sheer_cliff_wall',
+    label: 'Vách Đá Dựng Đứng 90° (Đắp 3D)',
+    defaultScale: 1.15,
+    minSpacingMeters: 18,
+  },
+  volcano_crater: {
+    prefabId: 'active_volcano',
+    secondaryPrefabId: 'island_volcano_icon',
+    label: 'Núi Lửa Phun Trào 3D (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 22,
+  },
+  abyss_chasm: {
+    prefabId: 'abyss_chasm_vortex',
+    label: 'Vực Sâu Xoáy Thâm Uyên (Đắp 3D)',
+    defaultScale: 1.15,
+    minSpacingMeters: 20,
+  },
+  canyon_gorge: {
+    prefabId: 'karst_mountain',
+    secondaryPrefabId: 'sheer_cliff_wall',
+    label: 'Đỉnh Đá Hẻm Núi (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 18,
+  },
+  raise: {
+    prefabId: 'volcanic_peak',
+    secondaryPrefabId: 'emerald_pine',
+    label: 'Khối Núi & Rừng Thông (Đắp 3D)',
+    defaultScale: 1.15,
+    minSpacingMeters: 16,
+  },
+  lower: {
+    prefabId: 'ancient_bridge',
+    label: 'Cầu Đá Qua Sông Hồ (Đắp 3D)',
+    defaultScale: 1.05,
+    minSpacingMeters: 18,
+  },
+  ridge: {
+    prefabId: 'karst_mountain',
+    label: 'Đỉnh Đá Nhọn Thạch Anh (Đắp 3D)',
+    defaultScale: 1.2,
+    minSpacingMeters: 16,
+  },
+  terrace: {
+    prefabId: 'statue_of_seven',
+    secondaryPrefabId: 'sakura_tree',
+    label: 'Thất Thiên Thần Tượng Bậc Thang (Đắp 3D)',
+    defaultScale: 1.1,
+    minSpacingMeters: 18,
+  },
+  flatten: null,
+  smooth: null,
+};
+
+/**
+ * Spawns and grounds a 3D geological/ecosystem object (`PlacedObject`) at `(worldX, worldZ)`
+ * corresponding to the active sculpting tool (or an explicit `prefabOverride`), while syncing
+ * existing objects' Y coordinates to the newly sculpted terrain heightmap.
+ */
+export function spawnSculptLandformObject(
+  tool: SculptToolId,
+  worldX: number,
+  worldZ: number,
+  heightMap: Float32Array,
+  existingObjects: PlacedObject[],
+  options?: {
+    prefabOverride?: PrefabId | 'auto';
+    scale?: number;
+    rotationY?: number;
+    forcePlaceOnClick?: boolean;
+  }
+): {
+  updatedObjects: PlacedObject[];
+  spawnedObject: PlacedObject | null;
+} {
+  const half = WORLD_SIZE / 2;
+  const clampedX = Number(Math.max(-half + 10, Math.min(half - 10, worldX)).toFixed(1));
+  const clampedZ = Number(Math.max(-half + 10, Math.min(half - 10, worldZ)).toFixed(1));
+  const groundY = Number(
+    getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, clampedX, clampedZ).toFixed(2)
+  );
+
+  // Sync existing objects' Y elevations to the newly sculpted ground
+  const syncedExisting = existingObjects.map((obj) => {
+    const nextY = Number(
+      getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, obj.x, obj.z).toFixed(2)
+    );
+    return nextY === obj.y ? obj : { ...obj, y: nextY };
+  });
+
+  const mapping = SCULPT_TOOL_PREFAB_MAP[tool];
+  const overrideId =
+    options?.prefabOverride && options.prefabOverride !== 'auto'
+      ? options.prefabOverride
+      : null;
+
+  if (!overrideId && !mapping) {
+    return {
+      updatedObjects: syncedExisting,
+      spawnedObject: null,
+    };
+  }
+
+  const chosenPrefabId: PrefabId = overrideId ?? mapping!.prefabId;
+
+  const prefabMeta = PREFAB_CATALOG.find((p) => p.id === chosenPrefabId);
+  const label = overrideId
+    ? `${prefabMeta?.name ?? chosenPrefabId} (${Math.round(groundY)}m)`
+    : `${mapping?.label ?? prefabMeta?.name ?? chosenPrefabId} (${Math.round(groundY)}m)`;
+
+  const minSpacing = options?.forcePlaceOnClick
+    ? 1.0
+    : (mapping?.minSpacingMeters ?? 16);
+
+  const tooClose = syncedExisting.some(
+    (obj) => Math.hypot(obj.x - clampedX, obj.z - clampedZ) < minSpacing
+  );
+  if (tooClose) {
+    return {
+      updatedObjects: syncedExisting,
+      spawnedObject: null,
+    };
+  }
+
+  const scaleVal = Number(
+    Math.max(
+      0.3,
+      Math.min(3.0, options?.scale ?? mapping?.defaultScale ?? 1.2)
+    ).toFixed(2)
+  );
+  const rotVal = Number(
+    (
+      options?.rotationY ??
+      (((Math.abs(Math.round(clampedX * 13 + clampedZ * 29)) % 360) * Math.PI) / 180)
+    ).toFixed(3)
+  );
+
+  const spawnedObject: PlacedObject = {
+    id: `sculpt-obj-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    prefabId: chosenPrefabId,
+    label,
+    x: clampedX,
+    y: groundY,
+    z: clampedZ,
+    scale: scaleVal,
+    rotationY: rotVal,
+  };
+
+  return {
+    updatedObjects: [...syncedExisting, spawnedObject],
+    spawnedObject,
+  };
+}
+
+
 

@@ -1736,3 +1736,105 @@ export function deserializeWorldFromSavePayload(raw: unknown): DeserializedWorld
   return res.ok ? res.data : null;
 }
 
+export interface ReconstructionResult {
+  heightmap: Float32Array;
+  detectedBiomeId: BiomeId;
+  roughnessScore: number;
+}
+
+/**
+ * Reconstructs a 3D terrain heightmap and classifies the target biome from an RGBA image buffer
+ * using ITU-R BT.601 perceived luminance L(x,y) = 0.299R + 0.587G + 0.114B combined with a 3x3
+ * Sobel spatial gradient operator G(x,y) = sqrt(Gx^2 + Gy^2).
+ */
+export function reconstructTerrainFromRGBA(
+  rgbaData: Uint8ClampedArray,
+  width: number,
+  height: number,
+  heightScale = 60.0,
+  beta = 0.75
+): ReconstructionResult {
+  const size = Math.max(1, width * height);
+  const luminance = new Float32Array(size);
+  const gradientMag = new Float32Array(size);
+  const heightmap = new Float32Array(size);
+
+  let lMin = Infinity;
+  let lMax = -Infinity;
+  let avgR = 0;
+  let avgG = 0;
+  let avgB = 0;
+
+  for (let i = 0; i < size; i++) {
+    const r = rgbaData[i * 4] ?? 0;
+    const g = rgbaData[i * 4 + 1] ?? 0;
+    const b = rgbaData[i * 4 + 2] ?? 0;
+    avgR += r;
+    avgG += g;
+    avgB += b;
+
+    const l = 0.299 * r + 0.587 * g + 0.114 * b;
+    luminance[i] = l;
+    if (l < lMin) lMin = l;
+    if (l > lMax) lMax = l;
+  }
+
+  avgR /= size;
+  avgG /= size;
+  avgB /= size;
+
+  let gMax = 1e-5;
+  let totalGradient = 0;
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const gx =
+        -luminance[idx - width - 1] +
+        luminance[idx - width + 1] -
+        2 * luminance[idx - 1] +
+        2 * luminance[idx + 1] -
+        luminance[idx + width - 1] +
+        luminance[idx + width + 1];
+
+      const gy =
+        -luminance[idx - width - 1] -
+        2 * luminance[idx - width] -
+        luminance[idx - width + 1] +
+        luminance[idx + width - 1] +
+        2 * luminance[idx + width] +
+        luminance[idx + width + 1];
+
+      const mag = Math.hypot(gx, gy);
+      gradientMag[idx] = mag;
+      totalGradient += mag;
+      if (mag > gMax) gMax = mag;
+    }
+  }
+
+  const lRange = Math.max(1e-5, lMax - lMin);
+  for (let i = 0; i < size; i++) {
+    const normL = (luminance[i] - lMin) / lRange;
+    const normG = gradientMag[i] / gMax;
+    heightmap[i] = heightScale * (beta * normL + (1 - beta) * normG);
+  }
+
+  const roughnessScore = totalGradient / (size * 255);
+  let detectedBiomeId: BiomeId = 'mondstadt_meadow';
+
+  if (avgB > avgR + 25 && avgB > 140) {
+    detectedBiomeId = roughnessScore > 0.25 ? 'europa_chaos_ridge' : 'snowpeak_glacier';
+  } else if (avgR > avgG + 35 && avgR > avgB + 45) {
+    detectedBiomeId = roughnessScore > 0.3 ? 'natlan_volcano_abyss' : 'mars_olympus';
+  } else if (avgG > avgR + 15 && avgG > avgB + 15) {
+    detectedBiomeId = 'amazon_congo_rainforest';
+  } else if (roughnessScore > 0.35) {
+    detectedBiomeId = 'himalaya_alps_andes';
+  } else if (avgR > 160 && avgG > 130 && avgB < 110) {
+    detectedBiomeId = 'liyue_amber';
+  }
+
+  return { heightmap, detectedBiomeId, roughnessScore };
+}
+
+

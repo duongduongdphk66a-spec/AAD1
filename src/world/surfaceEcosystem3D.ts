@@ -1079,3 +1079,98 @@ export function animateSurfaceEcosystems(microStrokesRoot: THREE.Group, elapsed:
     }
   }
 }
+
+export interface EcosystemSpawnRule {
+  prefabId: string;
+  minAltitude: number;
+  maxAltitude: number;
+  maxSlopeRadians: number;
+  density: number; // Spawn probability per sample point in [0, 1]
+  scaleRange: [number, number];
+  alignToNormal: boolean;
+}
+
+export interface TerrainSamplePoint {
+  position: THREE.Vector3;
+  normal: THREE.Vector3;
+}
+
+/**
+ * Builds a GPU-instanced `THREE.InstancedMesh` for surface ecosystem entities,
+ * filtering sample points by altitude range `[minAltitude, maxAltitude]`, surface slope angle
+ * `acos(n · u) <= maxSlopeRadians`, and deterministic LCG spawn probability, packing all
+ * 4x4 homogeneous transforms into a single GPU draw call.
+ */
+export function buildInstancedEcosystem(
+  geometry: THREE.BufferGeometry,
+  material: THREE.Material,
+  samples: TerrainSamplePoint[],
+  rule: EcosystemSpawnRule,
+  seed = 1337
+): THREE.InstancedMesh {
+  const validTransforms: THREE.Matrix4[] = [];
+  const upVector = new THREE.Vector3(0, 1, 0);
+  const dummyObject = new THREE.Object3D();
+
+  // Deterministic LCG PRNG
+  let s = seed >>> 0;
+  const nextRand = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+
+  for (const sample of samples) {
+    const { position, normal } = sample;
+    if (position.y < rule.minAltitude || position.y > rule.maxAltitude) {
+      continue;
+    }
+
+    const unitNormal = normal.clone().normalize();
+    const slope = Math.acos(THREE.MathUtils.clamp(unitNormal.dot(upVector), -1, 1));
+    if (slope > rule.maxSlopeRadians) {
+      continue;
+    }
+
+    if (nextRand() > rule.density) {
+      continue;
+    }
+
+    dummyObject.position.copy(position);
+    dummyObject.rotation.set(0, 0, 0);
+
+    if (rule.alignToNormal) {
+      const alignQuat = new THREE.Quaternion().setFromUnitVectors(upVector, unitNormal);
+      const yawQuat = new THREE.Quaternion().setFromAxisAngle(
+        upVector,
+        nextRand() * Math.PI * 2
+      );
+      dummyObject.quaternion.copy(alignQuat.multiply(yawQuat));
+    } else {
+      dummyObject.rotation.y = nextRand() * Math.PI * 2;
+    }
+
+    const [minS, maxS] = rule.scaleRange;
+    const scale = minS + nextRand() * (maxS - minS);
+    dummyObject.scale.set(scale, scale, scale);
+
+    dummyObject.updateMatrix();
+    validTransforms.push(dummyObject.matrix.clone());
+  }
+
+  const instancedMesh = new THREE.InstancedMesh(
+    geometry,
+    material,
+    validTransforms.length
+  );
+  instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  instancedMesh.castShadow = true;
+  instancedMesh.receiveShadow = true;
+
+  for (let i = 0; i < validTransforms.length; i++) {
+    instancedMesh.setMatrixAt(i, validTransforms[i]);
+  }
+  instancedMesh.instanceMatrix.needsUpdate = true;
+
+  return instancedMesh;
+}
+

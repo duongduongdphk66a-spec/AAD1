@@ -5,21 +5,31 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   BiomeId,
   BIOMES,
+  BIOME_WEATHER_PRESETS,
+  createGPUWeatherSystem,
   GRID_SIZE,
+  mapBiomeOrWeatherToGPUPreset,
   MicroStrokeStamp,
   PlacedObject,
   PrefabId,
   SculptToolId,
   TextureBrushId,
-  TEXTURE_BRUSHES,
   WeatherId,
-  WEATHER_CATALOG,
+   WEATHER_CATALOG,
+  WeatherPresetType,
   WORLD_SIZE,
 } from '../world/registry';
-import { computePartialVertexNormals, getGroundHeightAt } from '../world/sculpting';
+import {
+  computePartialVertexNormals,
+  exportWorldToGLB,
+  getGroundHeightAt,
+} from '../world/sculpting';
 import type { GridDirtyRect } from '../world/brushes';
 import { computeDayNightLightingState } from '../world/generation';
-import { createTerrainDetailTextures } from '../world/materialsAndTextures';
+import {
+  createDynamicTerrainMaterial,
+  createTerrainDetailTextures,
+} from '../world/materialsAndTextures';
 import { ProceduralPrefabFactory } from '../world/proceduralModels';
 import {
   createSurfaceEcosystemPatch,
@@ -28,6 +38,103 @@ import {
 } from '../world/surfaceEcosystem3D';
 import { buildJunctionContinuumGroup } from '../world/junctionBridges3D';
 import { ActiveTabId } from './BottomControlDock';
+import type { TerrainV3EngineBundle } from '../core/terrainV3Controller';
+import { v3HudStore } from './TerrainV3HudAndPanels';
+
+export class WorldEnvironmentController {
+  private terrainMaterial: THREE.ShaderMaterial;
+  private weatherPoints: THREE.Points;
+  private targetSnowIntensity = 0.85;
+  private clock = new THREE.Clock();
+
+  constructor(scene: THREE.Scene, initialPreset: WeatherPresetType = 'snowstorm') {
+    this.terrainMaterial = createDynamicTerrainMaterial();
+    this.weatherPoints = createGPUWeatherSystem(initialPreset);
+    this.targetSnowIntensity = BIOME_WEATHER_PRESETS[initialPreset].snowCoverageRate;
+    scene.add(this.weatherPoints);
+  }
+
+  public getTerrainMaterial(): THREE.ShaderMaterial {
+    return this.terrainMaterial;
+  }
+
+  public getWeatherPoints(): THREE.Points {
+    return this.weatherPoints;
+  }
+
+  public setTargetSnowIntensity(val: number): void {
+    this.targetSnowIntensity = THREE.MathUtils.clamp(val, 0, 1);
+  }
+
+  public setShaderParameters(params: {
+    snowIntensity?: number;
+    snowAltitude?: number;
+    lavaLevel?: number;
+    lavaEmissiveIntensity?: number;
+    triplanarSharpness?: number;
+    sunDirection?: THREE.Vector3;
+  }): void {
+    const u = this.terrainMaterial.uniforms;
+    if (params.snowIntensity !== undefined) {
+      this.targetSnowIntensity = THREE.MathUtils.clamp(params.snowIntensity, 0, 1);
+      u.uSnowIntensity.value = this.targetSnowIntensity;
+    }
+    if (params.snowAltitude !== undefined) {
+      u.uSnowAltitude.value = params.snowAltitude;
+    }
+    if (params.lavaLevel !== undefined) {
+      u.uLavaLevel.value = params.lavaLevel;
+    }
+    if (params.lavaEmissiveIntensity !== undefined) {
+      u.uLavaEmissiveIntensity.value = params.lavaEmissiveIntensity;
+    }
+    if (params.triplanarSharpness !== undefined) {
+      u.uTriplanarSharpness.value = params.triplanarSharpness;
+    }
+    if (params.sunDirection !== undefined) {
+      u.uSunDirection.value.copy(params.sunDirection).normalize();
+    }
+  }
+
+  public switchWeatherPreset(preset: WeatherPresetType): void {
+    const cfg = BIOME_WEATHER_PRESETS[preset];
+    const mat = this.weatherPoints.material as THREE.ShaderMaterial;
+
+    mat.uniforms.uTerminalVelocity.value.copy(cfg.terminalVelocity);
+    mat.uniforms.uWindVelocity.value.copy(cfg.windVelocity);
+    mat.uniforms.uTurbulenceAmp.value.copy(cfg.turbulenceAmplitude);
+    mat.uniforms.uTurbulenceFreq.value = cfg.turbulenceFrequency;
+    mat.uniforms.uParticleSize.value = cfg.particleSize;
+    mat.uniforms.uParticleColor.value.copy(cfg.color);
+
+    this.targetSnowIntensity = cfg.snowCoverageRate;
+  }
+
+  public updateFrame(camera: THREE.Camera): void {
+    const elapsedTime = this.clock.getElapsedTime();
+
+    this.terrainMaterial.uniforms.uTime.value = elapsedTime;
+    const currentSnow = this.terrainMaterial.uniforms.uSnowIntensity.value;
+    this.terrainMaterial.uniforms.uSnowIntensity.value = THREE.MathUtils.lerp(
+      currentSnow,
+      this.targetSnowIntensity,
+      0.03
+    );
+
+    const weatherMat = this.weatherPoints.material as THREE.ShaderMaterial;
+    weatherMat.uniforms.uTime.value = elapsedTime;
+    weatherMat.uniforms.uCameraPosition.value.copy(camera.position);
+  }
+
+  public dispose(scene?: THREE.Scene): void {
+    if (scene) {
+      scene.remove(this.weatherPoints);
+    }
+    this.weatherPoints.geometry.dispose();
+    (this.weatherPoints.material as THREE.Material).dispose();
+    this.terrainMaterial.dispose();
+  }
+}
 
 export type CameraPresetId =
   | 'mountain_gallery'
@@ -61,6 +168,14 @@ interface WorldViewport3DProps {
   dirtyRectRef?: React.MutableRefObject<GridDirtyRect | null>;
   biomeId: BiomeId;
   activeWeather?: WeatherId;
+  gpuShaderEnabled?: boolean;
+  gpuWeatherPreset?: WeatherPresetType | 'auto';
+  snowCoverageIntensity?: number;
+  snowAltitudeMeters?: number;
+  lavaLevelMeters?: number;
+  triplanarSharpness?: number;
+  glbExportTrigger?: number;
+  onGlbExportComplete?: (ok: boolean, message: string) => void;
   sunElevation: number;
   sunAzimuth?: number;
   timeOfDay?: number;
@@ -80,8 +195,11 @@ interface WorldViewport3DProps {
   brushStrength: number;
   cameraPreset: CameraPresetId;
   cameraPresetTrigger: number;
+  v3Engine?: TerrainV3EngineBundle | null;
+  v3Enabled?: boolean;
   onTerrainStrokeStart?: () => void;
   onTerrainStroke: (worldX: number, worldZ: number) => void;
+  onTerrainStrokeEnd?: () => void;
   onPlacePrefabAt: (worldX: number, worldZ: number) => void;
   onSelectObject: (id: string | null) => void;
   onHoverCoordsChange?: (coords: { x: number; y: number; z: number } | null) => void;
@@ -95,6 +213,7 @@ interface WorldViewport3DProps {
 const _mouseNdc = new THREE.Vector2();
 const _camTargetGoal = new THREE.Vector3(0, 4, 0);
 const _camPosGoal = new THREE.Vector3(38, 24, 48);
+
 
 function buildPlanetaryWeatherGroup(weatherId: WeatherId): THREE.Group {
   const group = new THREE.Group();
@@ -822,6 +941,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   dirtyRectRef,
   biomeId,
   activeWeather = 'clear_sky',
+  gpuShaderEnabled = false,
+  gpuWeatherPreset = 'auto',
+  snowCoverageIntensity = 0.85,
+  snowAltitudeMeters = 28.0,
+  lavaLevelMeters = 2.5,
+  triplanarSharpness = 6.0,
+  glbExportTrigger = 0,
+  onGlbExportComplete,
   sunElevation,
   sunAzimuth = 135,
   timeOfDay = 10.5,
@@ -837,8 +964,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   brushRadius,
   cameraPreset,
   cameraPresetTrigger,
+  v3Engine = null,
+  v3Enabled = false,
   onTerrainStrokeStart,
   onTerrainStroke,
+  onTerrainStrokeEnd,
   onPlacePrefabAt,
   onSelectObject,
   onHoverCoordsChange,
@@ -846,14 +976,26 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 }) => {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
 
+  const isPointerDraggingTerrainRef = useRef(false);
+  const pendingJunctionRebuildRef = useRef(false);
+  const junctionDebounceTimerRef = useRef<number | null>(null);
+
   const latestPropsRef = useRef({
     activeTab,
     brushRadius,
     placementRotationDeg,
     placementScale,
     selectedObjectId,
+    placedObjects,
+    microStrokes,
+    heightMap,
+    biomeId,
+    autoJunctionBlend,
+    v3Engine,
+    v3Enabled,
     onTerrainStrokeStart,
     onTerrainStroke,
+    onTerrainStrokeEnd,
     onPlacePrefabAt,
     onSelectObject,
     onHoverCoordsChange,
@@ -866,14 +1008,64 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       placementRotationDeg,
       placementScale,
       selectedObjectId,
+      placedObjects,
+      microStrokes,
+      heightMap,
+      biomeId,
+      autoJunctionBlend,
+      v3Engine,
+      v3Enabled,
       onTerrainStrokeStart,
       onTerrainStroke,
+      onTerrainStrokeEnd,
       onPlacePrefabAt,
       onSelectObject,
       onHoverCoordsChange,
       onScaleMetricsChange,
     };
   });
+
+  const clearJunctionDebounceTimer = () => {
+    if (junctionDebounceTimerRef.current !== null) {
+      window.clearTimeout(junctionDebounceTimerRef.current);
+      junctionDebounceTimerRef.current = null;
+    }
+  };
+
+  const flushJunctionContinuumRebuild = () => {
+    clearJunctionDebounceTimer();
+    const handles = sceneHandlesRef.current;
+    if (!handles) return;
+    pendingJunctionRebuildRef.current = false;
+    const {
+      placedObjects: objs,
+      microStrokes: strokes,
+      heightMap: hMap,
+      biomeId: bId,
+      autoJunctionBlend: autoBlend,
+    } = latestPropsRef.current;
+    const { junctionContinuumRoot } = handles;
+    disposeObject3DTree(junctionContinuumRoot);
+    junctionContinuumRoot.clear();
+    if (autoBlend) {
+      junctionContinuumRoot.add(
+        buildJunctionContinuumGroup(objs, strokes, hMap, bId)
+      );
+    }
+  };
+
+  const scheduleDebouncedJunctionRebuild = (delayMs = 180) => {
+    clearJunctionDebounceTimer();
+    pendingJunctionRebuildRef.current = true;
+    junctionDebounceTimerRef.current = window.setTimeout(() => {
+      junctionDebounceTimerRef.current = null;
+      if (!isPointerDraggingTerrainRef.current) {
+        flushJunctionContinuumRebuild();
+      } else {
+        pendingJunctionRebuildRef.current = true;
+      }
+    }, delayMs);
+  };
 
   const sceneHandlesRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -882,6 +1074,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     controls: OrbitControls;
     terrainGeo: THREE.PlaneGeometry;
     terrainMesh: THREE.Mesh;
+    standardTerrainMat: THREE.MeshStandardMaterial;
+    envController: WorldEnvironmentController;
     waterMesh: THREE.Mesh;
     distantMat: THREE.MeshStandardMaterial;
     sunLight: THREE.DirectionalLight;
@@ -1042,7 +1236,16 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       metalness: 0.03,
     });
 
-    const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
+    const envController = new WorldEnvironmentController(
+      scene,
+      mapBiomeOrWeatherToGPUPreset(biomeId, activeWeather)
+    );
+    envController.getWeatherPoints().visible = activeWeather !== 'clear_sky' || gpuShaderEnabled;
+
+    const terrainMesh = new THREE.Mesh(
+      terrainGeo,
+      gpuShaderEnabled ? envController.getTerrainMaterial() : terrainMat
+    );
     terrainMesh.receiveShadow = true;
     terrainMesh.castShadow = true;
     terrainMesh.name = 'playable_terrain';
@@ -1343,6 +1546,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         const pt = raycastTerrainPoint(e);
         if (pt) {
           isPointerDraggingTerrain = true;
+          isPointerDraggingTerrainRef.current = true;
+          if (latestPropsRef.current.v3Engine) {
+            latestPropsRef.current.v3Engine.isBrushDragging = true;
+            latestPropsRef.current.v3Engine.brushEngine.beginStroke();
+          }
           controls.enabled = false;
           strokeStart?.();
           stroke(pt.x, pt.z);
@@ -1384,14 +1592,23 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const onPointerUp = (e: PointerEvent) => {
       if (isPointerDraggingTerrain) {
         isPointerDraggingTerrain = false;
+        isPointerDraggingTerrainRef.current = false;
+        if (latestPropsRef.current.v3Engine) {
+          latestPropsRef.current.v3Engine.isBrushDragging = false;
+          latestPropsRef.current.v3Engine.brushEngine.endStroke();
+        }
+        latestPropsRef.current.onTerrainStrokeEnd?.();
         controls.enabled = true;
+        if (pendingJunctionRebuildRef.current || latestPropsRef.current.autoJunctionBlend) {
+          scheduleDebouncedJunctionRebuild(180);
+        }
         return;
       }
 
       if (e.ctrlKey || e.altKey || e.metaKey) return;
 
       const moveDist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
-      if (moveDist > 6) return;
+      if (moveDist > 12) return;
 
       updateMouseFromEvent(e);
       raycaster.setFromCamera(_mouseNdc, camera);
@@ -1401,6 +1618,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         onPlacePrefabAt: placeCb,
         onSelectObject: selectCb,
       } = latestPropsRef.current;
+
+      if (tab === 'prefabs') {
+        const pt = raycastTerrainPoint(e);
+        if (pt) {
+          placeCb(pt.x, pt.z);
+          return;
+        }
+      }
 
       const propHits = raycaster.intersectObjects(propsRoot.children, true);
       if (propHits.length > 0) {
@@ -1414,14 +1639,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
       }
 
-      if (tab === 'prefabs') {
-        const pt = raycastTerrainPoint(e);
-        if (pt) {
-          placeCb(pt.x, pt.z);
-        }
-      } else {
-        selectCb(null);
-      }
+      selectCb(null);
     };
 
     // Keyboard WASD camera panning support (adaptive speed based on camera height)
@@ -1432,7 +1650,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
       if (isPointerDraggingTerrain) {
         isPointerDraggingTerrain = false;
+        isPointerDraggingTerrainRef.current = false;
         controls.enabled = true;
+        if (pendingJunctionRebuildRef.current) {
+          scheduleDebouncedJunctionRebuild(180);
+        }
       }
     };
     const onVisibilityChange = () => {
@@ -1712,6 +1934,28 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       // Animate 3-5cm 3D grass blades, 3D flowers, swirling desert sand, and rising lava smoke + magma currents
       animateSurfaceEcosystems(microStrokesRoot, elapsed);
 
+      // Update GPU Triplanar Terrain Shader & GPU Weather Particle Kinematics
+      envController.updateFrame(camera);
+
+      // Update V3 Clipmap rings & Scheduler within 3ms frame budget when V3 is enabled
+      const activeV3 = latestPropsRef.current.v3Engine;
+      const isV3On = Boolean(latestPropsRef.current.v3Enabled && activeV3);
+      if (activeV3 && isV3On) {
+        if (!activeV3.clipmap) {
+          activeV3.attachClipmap(scene, {
+            gpuProfile: isSoftwareGl ? 'software' : 'discrete',
+          });
+        }
+        activeV3.clipmap!.root.visible = true;
+        activeV3.linkSystem.getMergedGroup().visible = true;
+        activeV3.scheduler.tick(3);
+        activeV3.clipmap!.update(camera);
+        v3HudStore.publish(activeV3.getHudMetrics(Math.min(60, Math.round(1 / dt))));
+      } else if (activeV3 && activeV3.clipmap) {
+        activeV3.clipmap.root.visible = false;
+        activeV3.linkSystem.getMergedGroup().visible = false;
+      }
+
       controls.update();
       renderer.render(scene, camera);
 
@@ -1729,6 +1973,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       controls,
       terrainGeo,
       terrainMesh,
+      standardTerrainMat: terrainMat,
+      envController,
       waterMesh,
       distantMat,
       sunLight,
@@ -1759,6 +2005,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     return () => {
       unmounted = true;
+      clearJunctionDebounceTimer();
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       domElem.removeEventListener('pointerdown', onPointerDown);
@@ -1782,6 +2029,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (sunLight.shadow.map) {
         sunLight.shadow.map.dispose();
       }
+      envController.dispose(scene);
+      terrainMat.dispose();
       prefabFactory.dispose();
       contactShadowMap.userData.shared = false;
       contactShadowMap.dispose();
@@ -1867,6 +2116,17 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           }
         }
       });
+
+      let mIdx = 0;
+      handles.microMeshMap.forEach((patchGroup) => {
+        const wx = patchGroup.position.x;
+        const wz = patchGroup.position.z;
+        if (wx >= minWx && wx <= maxWx && wz >= minWz && wz <= maxWz) {
+          const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
+          patchGroup.position.y = wy + (mIdx % 12) * 0.003;
+        }
+        mIdx++;
+      });
     } else {
       for (let i = 0; i < posAttr.count; i++) {
         posAttr.setY(i, heightMap[i] ?? 0);
@@ -1899,6 +2159,15 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         if (id === currentSelectedId) {
           handles.selectionRing.position.set(wx, wy + 0.12, wz);
         }
+      });
+
+      let mIdx = 0;
+      handles.microMeshMap.forEach((patchGroup) => {
+        const wx = patchGroup.position.x;
+        const wz = patchGroup.position.z;
+        const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, wx, wz);
+        patchGroup.position.y = wy + (mIdx % 12) * 0.003;
+        mIdx++;
       });
     }
   }, [terrainVersion, heightMap, colorMap, dirtyRectRef]);
@@ -2021,23 +2290,28 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, st.x, st.z);
       patchGroup.position.set(st.x, wy + (idx % 12) * 0.003, st.z);
     }
-  }, [microStrokes, heightMap, terrainVersion]);
+  }, [microStrokes, heightMap]);
 
-  // 3c. Sync 3D Junction & Ground Continuum Bridges (overlapping volume fusion + ground-only distant corridors + terrain stroke blending)
+  // 3c. Sync 3D Junction & Ground Continuum Bridges:
+  // Rebuild ONLY when placedObjects, microStrokes, or autoJunctionBlend changes,
+  // and debounce events during sculpt or paint.
   useEffect(() => {
     const handles = sceneHandlesRef.current;
     if (!handles) return;
 
-    const { junctionContinuumRoot } = handles;
-    disposeObject3DTree(junctionContinuumRoot);
-    junctionContinuumRoot.clear();
-
-    if (autoJunctionBlend) {
-      junctionContinuumRoot.add(
-        buildJunctionContinuumGroup(placedObjects, microStrokes, heightMap, biomeId)
-      );
+    if (!autoJunctionBlend) {
+      flushJunctionContinuumRebuild();
+      return;
     }
-  }, [placedObjects, microStrokes, heightMap, terrainVersion, biomeId, autoJunctionBlend]);
+
+    const tab = latestPropsRef.current.activeTab;
+    if (isPointerDraggingTerrainRef.current || tab === 'sculpt' || tab === 'paint') {
+      scheduleDebouncedJunctionRebuild(180);
+      return;
+    }
+
+    flushJunctionContinuumRebuild();
+  }, [placedObjects, microStrokes, autoJunctionBlend]);
 
   // 4. Sync Biome Atmosphere, Planetary Weather, Day/Night Cycle, Sun Azimuth Shadows & Starry Sky
   useEffect(() => {
@@ -2204,6 +2478,60 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     if (!handles || cameraPresetTrigger === 0) return;
     handles.triggerCameraPreset(cameraPreset);
   }, [cameraPreset, cameraPresetTrigger]);
+
+  // 6. Sync GPU Triplanar ShaderMaterial & GPU Weather Particle Kinematics
+  useEffect(() => {
+    const handles = sceneHandlesRef.current;
+    if (!handles) return;
+
+    const targetPreset =
+      gpuWeatherPreset === 'auto'
+        ? mapBiomeOrWeatherToGPUPreset(biomeId, activeWeather)
+        : gpuWeatherPreset;
+
+    handles.envController.switchWeatherPreset(targetPreset);
+    handles.envController.getWeatherPoints().visible =
+      gpuWeatherPreset !== 'auto' || activeWeather !== 'clear_sky' || gpuShaderEnabled;
+
+    handles.terrainMesh.material = gpuShaderEnabled
+      ? handles.envController.getTerrainMaterial()
+      : handles.standardTerrainMat;
+
+    handles.envController.setShaderParameters({
+      snowIntensity: snowCoverageIntensity,
+      snowAltitude: snowAltitudeMeters,
+      lavaLevel: lavaLevelMeters,
+      triplanarSharpness,
+    });
+  }, [
+    gpuShaderEnabled,
+    gpuWeatherPreset,
+    snowCoverageIntensity,
+    snowAltitudeMeters,
+    lavaLevelMeters,
+    triplanarSharpness,
+    biomeId,
+    activeWeather,
+  ]);
+
+  // 7. Export 3D World Scene to .GLB when triggered from BottomControlDock
+  useEffect(() => {
+    const handles = sceneHandlesRef.current;
+    if (!handles || !glbExportTrigger) return;
+    exportWorldToGLB(handles.propsRoot, `aetherterra-3d-${biomeId}.glb`)
+      .then(() => {
+        onGlbExportComplete?.(
+          true,
+          `Đã xuất mô hình cảnh quan 3D sang tệp nhị phân aetherterra-3d-${biomeId}.glb.`
+        );
+      })
+      .catch((err) => {
+        onGlbExportComplete?.(
+          false,
+          `Không thể xuất GLB: ${err instanceof Error ? err.message : 'Lỗi định dạng'}`
+        );
+      });
+  }, [glbExportTrigger]);
 
   return (
     <div

@@ -33,8 +33,10 @@ import {
   TEXTURE_BRUSHES,
   TextureBrushId,
   TOTAL_VERTICES,
+  VERTEX_COUNT_PER_SIDE,
   WeatherId,
   WEATHER_CATALOG,
+  WeatherPresetType,
   WORLD_SIZE,
 } from './world/registry';
 import {
@@ -46,6 +48,8 @@ import {
   applySculptBrush,
   getGroundHeightAt,
   mergeDirtyRect,
+  SCULPT_TOOL_PREFAB_MAP,
+  spawnSculptLandformObject,
 } from './world/sculpting';
 import {
   executeTerrainRules,
@@ -58,10 +62,20 @@ import {
   validateWorldSavePayload,
 } from './world/generation';
 import { blendObjectsAndTerrainJunctions } from './world/junctionBlending';
+import { runHydraulicErosionAsync } from './world/terrainWorker';
 import { WorldViewport3D, CameraPresetId, ScaleMetrics } from './components/WorldViewport3D';
 import { BottomControlDock, ActiveTabId } from './components/BottomControlDock';
 import { DistanceScaleBar } from './components/DistanceScaleBar';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import {
+  createTerrainV3Engine,
+  TerrainV3EngineBundle,
+} from './core/terrainV3Controller';
+import {
+  BrushLevelBadgeV3,
+  LinkAndStampPopoverV3,
+  ResolutionHudV3,
+} from './components/TerrainV3HudAndPanels';
 
 const ImageReconstructModal = lazy(() =>
   import('./components/ImageReconstructModal').then((m) => ({
@@ -121,6 +135,8 @@ export default function App() {
   const [sculptTool, setSculptTool] = useState<SculptToolId>('sheer_cliff');
   const [brushRadius, setBrushRadius] = useState<number>(15); // 15m default brush radius on Page 2 (Thang 25m)
   const [brushStrength, setBrushStrength] = useState<number>(45);
+  const [spawnObjectOnSculpt, setSpawnObjectOnSculpt] = useState<boolean>(true);
+  const [sculptPrefabOverride, setSculptPrefabOverride] = useState<PrefabId | 'auto'>('auto');
   const [textureBrush, setTextureBrush] = useState<TextureBrushId>('emerald_grass');
   const [grassHeightCm, setGrassHeightCm] = useState<number>(DEFAULT_GRASS_HEIGHT_CM); // 4.0 cm (range 3.0 - 5.0 cm)
   const [flowerSpecies, setFlowerSpecies] = useState<FlowerSpeciesId>('sakura_bloom');
@@ -146,6 +162,13 @@ export default function App() {
   const [isDayNightAuto, setIsDayNightAuto] = useState<boolean>(false);
   const [starlightMode, setStarlightMode] = useState<boolean>(false);
   const [waterLevel, setWaterLevel] = useState<number>(BIOMES.mondstadt_meadow.waterLevel);
+  const [gpuShaderEnabled, setGpuShaderEnabled] = useState<boolean>(false);
+  const [gpuWeatherPreset, setGpuWeatherPreset] = useState<WeatherPresetType | 'auto'>('auto');
+  const [snowCoverageIntensity, setSnowCoverageIntensity] = useState<number>(0.85);
+  const [snowAltitudeMeters] = useState<number>(28.0);
+  const [lavaLevelMeters, setLavaLevelMeters] = useState<number>(2.5);
+  const [triplanarSharpness, setTriplanarSharpness] = useState<number>(6.0);
+  const [glbExportTrigger, setGlbExportTrigger] = useState<number>(0);
   const [cameraPreset, setCameraPreset] = useState<CameraPresetId>('mountain_gallery');
   const [cameraPresetTrigger, setCameraPresetTrigger] = useState<number>(0);
   const [showVolcanoRefCard, setShowVolcanoRefCard] = useState<boolean>(true);
@@ -166,6 +189,19 @@ export default function App() {
   const [isReconstructModalOpen, setIsReconstructModalOpen] = useState<boolean>(false);
   const dirtyRectRef = useRef<GridDirtyRect | null>(null);
 
+  // V3 Clipmap + Sparse Tile Pyramid + Non-Destructive Stamp/Link State
+  const [v3Enabled, setV3Enabled] = useState<boolean>(
+    () => import.meta.env.VITE_TERRAIN_V3 === 'true'
+  );
+  const [v3SnapEnabled, setV3SnapEnabled] = useState<boolean>(true);
+  const [v3DebugSdfOutline, setV3DebugSdfOutline] = useState<boolean>(false);
+  const [v3PanelOpen, setV3PanelOpen] = useState<boolean>(false);
+  const [v3UiTick, setV3UiTick] = useState<number>(0);
+  const v3EngineRef = useRef<TerrainV3EngineBundle | null>(null);
+  if (!v3EngineRef.current) {
+    v3EngineRef.current = createTerrainV3Engine(heightMapRef.current, 1337, false);
+  }
+
   const showToast = useCallback((msg: string) => {
     setStatusBanner(msg);
   }, []);
@@ -178,6 +214,8 @@ export default function App() {
     waterLevel,
     regionTitle,
     undoStack,
+    autoJunctionBlend,
+    starlightMode,
   });
   useEffect(() => {
     latestStateRef.current = {
@@ -188,8 +226,21 @@ export default function App() {
       waterLevel,
       regionTitle,
       undoStack,
+      autoJunctionBlend,
+      starlightMode,
     };
   });
+
+  const commitPlacedObjects = useCallback(
+    (nextOrUpdater: PlacedObject[] | ((prev: PlacedObject[]) => PlacedObject[])) => {
+      const prev = latestStateRef.current.placedObjects;
+      const next =
+        typeof nextOrUpdater === 'function' ? nextOrUpdater(prev) : nextOrUpdater;
+      latestStateRef.current.placedObjects = next;
+      setPlacedObjects(next);
+    },
+    []
+  );
 
   useEffect(() => {
     if (!statusBanner) return;
@@ -226,18 +277,30 @@ export default function App() {
     heightMapRef.current = new Float32Array(snapshot.heightMap);
     splatMapRef.current = new Uint8Array(snapshot.splatMap);
     colorMapRef.current = new Float32Array(snapshot.colorMap);
-    setPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
+    commitPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
     setMicroStrokes(snapshot.microStrokes.map((m) => ({ ...m })));
     setSelectedObjectId(snapshot.selectedObjectId);
     setBiomeId(snapshot.biomeId);
     setWaterLevel(snapshot.waterLevel);
     setRegionTitle(snapshot.regionTitle);
     dirtyRectRef.current = null;
+    if (v3EngineRef.current) {
+      v3EngineRef.current.brushEngine.undo();
+      v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
+      v3EngineRef.current.syncPlacedObjects(snapshot.placedObjects, latestStateRef.current.autoJunctionBlend);
+    }
     setTerrainVersion((v) => v + 1);
     showToast(
       `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
     );
   }, [showToast]);
+
+  // Keep V3 StampIndex and LinkSystem synchronized with placedObjects & autoJunctionBlend
+  useEffect(() => {
+    if (!v3EngineRef.current) return;
+    v3EngineRef.current.syncPlacedObjects(placedObjects, autoJunctionBlend);
+    setV3UiTick((t) => t + 1);
+  }, [placedObjects, autoJunctionBlend]);
 
   // Keyboard shortcuts: 'H' to toggle Cinema / Zen Mode, 'Ctrl+Z' / 'Cmd+Z' to Undo
   useEffect(() => {
@@ -418,18 +481,134 @@ export default function App() {
       { ensureMatchingTerrain: true }
     );
 
-    setPlacedObjects(result.newObjects);
+    commitPlacedObjects(result.newObjects);
     if (result.addedObjects.length > 0) {
       setSelectedObjectId(result.addedObjects[0].id);
     }
     dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(result.summary);
-  }, [terrainRules, biomeId, pushUndoSnapshot, showToast]);
+  }, [terrainRules, biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
+
+  const sculptSyncDebounceRef = useRef<number | null>(null);
+  const lastSculptCoordsRef = useRef<{ x: number; z: number }>({ x: 0, z: 0 });
+  const isFirstPaintStampInStrokeRef = useRef<boolean>(true);
+  const isFirstSculptStampInStrokeRef = useRef<boolean>(true);
+  const lastSculptSpawnPosRef = useRef<{ x: number; z: number } | null>(null);
+
+  const handleToggleSpawnObjectOnSculpt = useCallback(() => {
+    setSpawnObjectOnSculpt((prev) => {
+      const next = !prev;
+      showToast(
+        next
+          ? 'Đã bật Đặt Vật Thể 3D: Nhấp chuột sẽ đặt thẳng mô hình 3D lên mặt đất (không tự đắp đống đất ở dưới).'
+          : 'Đã chuyển sang Nâng/Hạ Nền Đất: Nhấp/kéo chuột sẽ đắp cao độ lưới địa hình.'
+      );
+      return next;
+    });
+  }, [showToast]);
+
+  const handleSelectSculptTool = useCallback(
+    (nextTool: SculptToolId) => {
+      setSculptTool(nextTool);
+      setSculptPrefabOverride('auto');
+      const mapped = SCULPT_TOOL_PREFAB_MAP[nextTool];
+      if (mapped) {
+        setSelectedPrefab(mapped.prefabId);
+      }
+    },
+    []
+  );
+
+  const handleChangeSculptPrefabOverride = useCallback(
+    (nextOverride: PrefabId | 'auto') => {
+      setSculptPrefabOverride(nextOverride);
+      if (nextOverride !== 'auto') {
+        setSelectedPrefab(nextOverride);
+        const meta = PREFAB_CATALOG.find((p) => p.id === nextOverride);
+        if (meta) {
+          showToast(`Đã chọn đặt mô hình 3D: "${meta.name}". Nhấp chuột lên mặt đất để đặt.`);
+        }
+      }
+    },
+    [showToast]
+  );
+
+  const handleSelectPrefab = useCallback(
+    (nextPrefab: PrefabId) => {
+      setSelectedPrefab(nextPrefab);
+      setSculptPrefabOverride(nextPrefab);
+      setSelectedObjectId(null);
+      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefab);
+      if (meta) {
+        showToast(`Đã chọn "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`);
+      }
+    },
+    [showToast]
+  );
+
+  const flushSculptObjectSync = useCallback(
+    (worldX: number, worldZ: number) => {
+      if (sculptSyncDebounceRef.current !== null) {
+        window.clearTimeout(sculptSyncDebounceRef.current);
+        sculptSyncDebounceRef.current = null;
+      }
+      const focusRadius = Math.max(brushRadius * 1.4, 80);
+      const half = WORLD_SIZE / 2;
+      const ruleBounds: GridDirtyRect = {
+        minIx: Math.max(0, Math.floor(((worldX - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+        maxIx: Math.min(GRID_SIZE, Math.ceil(((worldX + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+        minIz: Math.max(0, Math.floor(((worldZ - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+        maxIz: Math.min(GRID_SIZE, Math.ceil(((worldZ + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
+      };
+      if (autoRuleOnSculpt && terrainRules.some((r) => r.enabled)) {
+        dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, ruleBounds);
+        const ruleRes = executeTerrainRules(
+          heightMapRef.current,
+          splatMapRef.current,
+          colorMapRef.current,
+          biomeId,
+          terrainRules,
+          latestStateRef.current.placedObjects,
+          {
+            ensureMatchingTerrain: false,
+            focusAreaWorldX: worldX,
+            focusAreaWorldZ: worldZ,
+            focusRadiusMeters: focusRadius,
+          }
+        );
+        if (ruleRes.newObjects !== latestStateRef.current.placedObjects) {
+          commitPlacedObjects(ruleRes.newObjects);
+        }
+        if (ruleRes.paintedVerticesCount > 0 || ruleRes.sculptedVerticesCount > 0) {
+          setTerrainVersion((v) => v + 1);
+        }
+      } else {
+        const syncedObjs = syncObjectsToGround(
+          latestStateRef.current.placedObjects,
+          ruleBounds
+        );
+        if (syncedObjs !== latestStateRef.current.placedObjects) {
+          commitPlacedObjects(syncedObjs);
+        }
+      }
+    },
+    [
+      brushRadius,
+      autoRuleOnSculpt,
+      terrainRules,
+      biomeId,
+      commitPlacedObjects,
+      syncObjectsToGround,
+    ]
+  );
 
   // Record undo snapshot when a brush stroke starts on the 3D terrain
   const handleTerrainStrokeStart = useCallback(() => {
     lastStrokeSnapshotTimeRef.current = performance.now();
+    isFirstPaintStampInStrokeRef.current = true;
+    isFirstSculptStampInStrokeRef.current = true;
+    lastSculptSpawnPosRef.current = null;
     const label =
       activeTab === 'paint'
         ? `Vẽ ${TEXTURE_BRUSHES[textureBrush].name} (Cọ ${brushRadius}m)`
@@ -451,6 +630,49 @@ export default function App() {
       }
 
       if (activeTab === 'sculpt') {
+        const mapping = SCULPT_TOOL_PREFAB_MAP[sculptTool];
+        const hasObjectToSpawn =
+          spawnObjectOnSculpt && (Boolean(mapping) || sculptPrefabOverride !== 'auto');
+
+        if (hasObjectToSpawn) {
+          // Place the 3D landform/object directly onto the existing ground WITHOUT raising a dirt mound underneath
+          const isFirstSculpt = isFirstSculptStampInStrokeRef.current;
+          isFirstSculptStampInStrokeRef.current = false;
+          const minDragDist = Math.max(20, mapping?.minSpacingMeters ?? 22);
+          const prevSpawn = lastSculptSpawnPosRef.current;
+          const shouldAttemptSpawn =
+            isFirstSculpt ||
+            !prevSpawn ||
+            Math.hypot(worldX - prevSpawn.x, worldZ - prevSpawn.z) >= minDragDist;
+
+          if (shouldAttemptSpawn) {
+            const { updatedObjects, spawnedObject } = spawnSculptLandformObject(
+              sculptTool,
+              worldX,
+              worldZ,
+              heightMapRef.current,
+              latestStateRef.current.placedObjects,
+              {
+                prefabOverride: sculptPrefabOverride,
+                scale: placementScale,
+                rotationY:
+                  placementRotationDeg !== 0
+                    ? Number(((placementRotationDeg * Math.PI) / 180).toFixed(3))
+                    : undefined,
+                forcePlaceOnClick: isFirstSculpt,
+              }
+            );
+            if (updatedObjects !== latestStateRef.current.placedObjects) {
+              commitPlacedObjects(updatedObjects);
+            }
+            if (spawnedObject) {
+              lastSculptSpawnPosRef.current = { x: worldX, z: worldZ };
+              setSelectedObjectId(spawnedObject.id);
+            }
+          }
+          return;
+        }
+
         const bounds: GridDirtyRect = { minIx: 0, maxIx: GRID_SIZE, minIz: 0, maxIz: GRID_SIZE };
         const changed = applySculptBrush(
           heightMapRef.current,
@@ -466,38 +688,17 @@ export default function App() {
         );
         if (changed > 0) {
           dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, bounds);
-          if (autoRuleOnSculpt && terrainRules.some((r) => r.enabled)) {
-            const focusRadius = Math.max(brushRadius * 1.4, 80);
-            const half = WORLD_SIZE / 2;
-            const ruleBounds: GridDirtyRect = {
-              minIx: Math.max(0, Math.floor(((worldX - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
-              maxIx: Math.min(GRID_SIZE, Math.ceil(((worldX + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
-              minIz: Math.max(0, Math.floor(((worldZ - focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
-              maxIz: Math.min(GRID_SIZE, Math.ceil(((worldZ + focusRadius + half) / WORLD_SIZE) * GRID_SIZE)),
-            };
-            dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, ruleBounds);
-            const ruleRes = executeTerrainRules(
-              heightMapRef.current,
-              splatMapRef.current,
-              colorMapRef.current,
-              biomeId,
-              terrainRules,
-              latestStateRef.current.placedObjects,
-              {
-                ensureMatchingTerrain: false,
-                focusAreaWorldX: worldX,
-                focusAreaWorldZ: worldZ,
-                focusRadiusMeters: focusRadius,
-              }
-            );
-            setPlacedObjects(ruleRes.newObjects);
-          } else {
-            const syncedObjs = syncObjectsToGround(
-              latestStateRef.current.placedObjects,
-              bounds
-            );
-            setPlacedObjects(syncedObjs);
+          lastSculptCoordsRef.current = { x: worldX, z: worldZ };
+          if (sculptSyncDebounceRef.current !== null) {
+            window.clearTimeout(sculptSyncDebounceRef.current);
           }
+          sculptSyncDebounceRef.current = window.setTimeout(() => {
+            sculptSyncDebounceRef.current = null;
+            flushSculptObjectSync(
+              lastSculptCoordsRef.current.x,
+              lastSculptCoordsRef.current.z
+            );
+          }, 150);
           setTerrainVersion((v) => v + 1);
         }
       } else if (activeTab === 'paint') {
@@ -519,13 +720,28 @@ export default function App() {
         );
         if (painted > 0) {
           dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, bounds);
+          const rx = Number(worldX.toFixed(1));
+          const rz = Number(worldZ.toFixed(1));
+          const minStepDist = Math.max(1.5, brushRadius * 0.25);
+          const isFirst = isFirstPaintStampInStrokeRef.current;
+          isFirstPaintStampInStrokeRef.current = false;
+
           setMicroStrokes((prev) => {
+            const last = prev[prev.length - 1];
+            if (
+              !isFirst &&
+              last &&
+              last.brushId === textureBrush &&
+              Math.hypot(last.x - rx, last.z - rz) < minStepDist
+            ) {
+              return prev;
+            }
             const next = [
               ...prev.slice(-160),
               {
                 id: `ms-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-                x: Number(worldX.toFixed(1)),
-                z: Number(worldZ.toFixed(1)),
+                x: rx,
+                z: rz,
                 radius: Math.max(MIN_BRUSH_RADIUS, brushRadius),
                 brushId: textureBrush,
                 grassHeightCm,
@@ -538,6 +754,19 @@ export default function App() {
           setTerrainVersion((v) => v + 1);
         }
       }
+
+      if (v3EngineRef.current && v3Enabled) {
+        const splatIdx = activeTab === 'paint' ? getTextureIndex(textureBrush) % 6 : undefined;
+        v3EngineRef.current.applySculptStrokeStamp(
+          worldX,
+          worldZ,
+          brushRadius,
+          brushStrength,
+          sculptTool,
+          0.05,
+          splatIdx
+        );
+      }
     },
     [
       activeTab,
@@ -546,17 +775,39 @@ export default function App() {
       textureBrush,
       brushRadius,
       brushStrength,
+      spawnObjectOnSculpt,
+      sculptPrefabOverride,
+      placementScale,
+      placementRotationDeg,
       grassHeightCm,
       flowerSpecies,
       flowerColorHex,
       carveTerrainOnPaint,
       waterLevel,
-      autoRuleOnSculpt,
-      terrainRules,
-      syncObjectsToGround,
+      commitPlacedObjects,
+      flushSculptObjectSync,
       pushUndoSnapshot,
+      v3Enabled,
     ]
   );
+
+  const handleTerrainStrokeEnd = useCallback(() => {
+    isFirstPaintStampInStrokeRef.current = true;
+    isFirstSculptStampInStrokeRef.current = true;
+    lastSculptSpawnPosRef.current = null;
+    if (sculptSyncDebounceRef.current !== null) {
+      flushSculptObjectSync(
+        lastSculptCoordsRef.current.x,
+        lastSculptCoordsRef.current.z
+      );
+    }
+    if (v3EngineRef.current) {
+      v3EngineRef.current.syncPlacedObjects(
+        latestStateRef.current.placedObjects,
+        latestStateRef.current.autoJunctionBlend
+      );
+    }
+  }, [flushSculptObjectSync]);
 
   // Fill entire terrain with a chosen texture brush AND populate 3D surface ecosystems across the village
   const handleFillEntireTerrainTexture = useCallback(
@@ -607,7 +858,7 @@ export default function App() {
     splatMapRef.current = flatWorld.splatMap;
     colorMapRef.current = flatWorld.colorMap;
     setMicroStrokes(generateInitialSurfaceShowcaseStrokes());
-    setPlacedObjects(flatWorld.initialObjects);
+    commitPlacedObjects(flatWorld.initialObjects);
     setSelectedObjectId(flatWorld.initialObjects[0]?.id ?? null);
     setRegionTitle('Mặt Phẳng Đất Nguyên Bản · 10×10km (Vector 1:1)');
     dirtyRectRef.current = null;
@@ -615,7 +866,7 @@ export default function App() {
     showToast(
       `Đã đưa bản đồ 10×10km (lưới ${GRID_SIZE + 1}×${GRID_SIZE + 1} · ${TOTAL_VERTICES.toLocaleString()} đỉnh) về Mặt Phẳng Đất Nguyên Bản (Cao độ 0m).`
     );
-  }, [biomeId, pushUndoSnapshot, showToast]);
+  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
 
   // Place a 3D prefab at specific world coordinates with chosen orientation & scale (1:1 real dimensions)
   // Automatically fuses overlapping structures ("nối liền như 2 khối là 1") and interpolates/extrapolates bottom ground for distant objects
@@ -662,7 +913,7 @@ export default function App() {
             smoothTerrainSeams: true,
           }
         );
-        setPlacedObjects(blendRes.updatedObjects);
+        commitPlacedObjects(blendRes.updatedObjects);
         setSelectedObjectId(newObj.id);
         if (blendRes.dirtyRect) {
           dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, blendRes.dirtyRect);
@@ -678,7 +929,7 @@ export default function App() {
           );
         }
       } else {
-        setPlacedObjects(candidateList);
+        commitPlacedObjects(candidateList);
         setSelectedObjectId(newObj.id);
         showToast(
           `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] (Hướng ${placementRotationDeg}°, Cỡ ${finalScale}x) tại (${Math.round(worldX)}m, ${Math.round(worldZ)}m).`
@@ -691,6 +942,7 @@ export default function App() {
       placementScale,
       autoJunctionBlend,
       biomeId,
+      commitPlacedObjects,
       pushUndoSnapshot,
       showToast,
     ]
@@ -710,22 +962,21 @@ export default function App() {
         smoothTerrainSeams: true,
       }
     );
-    setPlacedObjects(blendRes.updatedObjects);
+    commitPlacedObjects(blendRes.updatedObjects);
     dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(blendRes.summary);
-  }, [biomeId, pushUndoSnapshot, showToast]);
+  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
 
   const handleToggleAutoJunctionBlend = useCallback(() => {
-    setAutoJunctionBlend((prev) => {
-      const next = !prev;
-      showToast(
-        next
-          ? 'Đã bật Tự Động Nối Liền Tiếp Giáp (Nội/Ngoại suy khối giao nhau & nền đất dưới cùng).'
-          : 'Đã tắt Tự Động Nối Liền Tiếp Giáp.'
-      );
-      return next;
-    });
+    const next = !latestStateRef.current.autoJunctionBlend;
+    latestStateRef.current.autoJunctionBlend = next;
+    setAutoJunctionBlend(next);
+    showToast(
+      next
+        ? 'Đã bật Tự Động Nối Liền Tiếp Giáp (Nội/Ngoại suy khối giao nhau & nền đất dưới cùng).'
+        : 'Đã tắt Tự Động Nối Liền Tiếp Giáp.'
+    );
   }, [showToast]);
 
   // Spawn prefab near map center at realistic 1:1 village distances (12m - 44m)
@@ -756,7 +1007,7 @@ export default function App() {
       heightMapRef.current = generated.heightMap;
       splatMapRef.current = generated.splatMap;
       colorMapRef.current = generated.colorMap;
-      setPlacedObjects(generated.initialObjects);
+      commitPlacedObjects(generated.initialObjects);
       setSelectedObjectId(generated.initialObjects[0]?.id ?? null);
 
       // Always reset 3D physical surface ecosystem patches to match the newly selected biome
@@ -788,7 +1039,7 @@ export default function App() {
         `Đã chuyển sang "${bConfig.name}" · Thời tiết: ${weatherMeta?.name || 'Trời Quang Đãng'}.`
       );
     },
-    [grassHeightCm, flowerSpecies, flowerColorHex, pushUndoSnapshot, showToast]
+    [grassHeightCm, flowerSpecies, flowerColorHex, commitPlacedObjects, pushUndoSnapshot, showToast]
   );
 
   // Switch active planetary weather mode
@@ -821,7 +1072,7 @@ export default function App() {
       setBiomeId(payload.biomeId);
       setWaterLevel(BIOMES[payload.biomeId].waterLevel);
       const synced = syncObjectsToGround(payload.placedObjects);
-      setPlacedObjects(synced);
+      commitPlacedObjects(synced);
       setSelectedObjectId(synced[0]?.id ?? null);
       setRegionTitle(payload.regionTitle);
       dirtyRectRef.current = null;
@@ -832,7 +1083,7 @@ export default function App() {
         `Tái tạo lục địa Vector 10×10km hoàn tất: ${payload.regionTitle} (${payload.placedObjects.length} vật thể 1:1).`
       );
     },
-    [syncObjectsToGround, pushUndoSnapshot, showToast]
+    [syncObjectsToGround, commitPlacedObjects, pushUndoSnapshot, showToast]
   );
 
   const handleResetWorld = useCallback(() => {
@@ -841,13 +1092,13 @@ export default function App() {
     heightMapRef.current = generated.heightMap;
     splatMapRef.current = generated.splatMap;
     colorMapRef.current = generated.colorMap;
-    setPlacedObjects(generated.initialObjects);
+    commitPlacedObjects(generated.initialObjects);
     setSelectedObjectId(generated.initialObjects[0]?.id ?? null);
     setRegionTitle(BIOMES[biomeId].name);
     dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast('Đã kiến tạo mẫu địa hình đồi núi Vector 10×10km (cao độ tối đa 1km).');
-  }, [biomeId, pushUndoSnapshot, showToast]);
+  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
 
   // Auto Day/Night Cycle progression timer when isDayNightAuto is active
   useEffect(() => {
@@ -886,20 +1137,19 @@ export default function App() {
   }, []);
 
   const handleToggleStarlightMode = useCallback(() => {
-    setStarlightMode((prev) => {
-      const next = !prev;
-      if (next && sunElevation > 15) {
-        setTimeOfDay(23.0);
-        setSunElevation(-52);
-        setSunAzimuth(320);
-      }
-      showToast(
-        next
-          ? 'Đã bật Chế Độ Ánh Sao Ban Đêm (Vòm sao Ngân Hà 3D, sao băng & bóng đổ ánh trăng).'
-          : 'Đã tắt khóa Chế Độ Ánh Sao Ban Đêm (Tự động theo chu kỳ mặt trời).'
-      );
-      return next;
-    });
+    const next = !latestStateRef.current.starlightMode;
+    latestStateRef.current.starlightMode = next;
+    setStarlightMode(next);
+    if (next && sunElevation > 15) {
+      setTimeOfDay(23.0);
+      setSunElevation(-52);
+      setSunAzimuth(320);
+    }
+    showToast(
+      next
+        ? 'Đã bật Chế Độ Ánh Sao Ban Đêm (Vòm sao Ngân Hà 3D, sao băng & bóng đổ ánh trăng).'
+        : 'Đã tắt khóa Chế Độ Ánh Sao Ban Đêm (Tự động theo chu kỳ mặt trời).'
+    );
   }, [sunElevation, showToast]);
 
   const handleApplyDayNightPreset = useCallback(
@@ -961,8 +1211,81 @@ export default function App() {
     showToast,
   ]);
 
+  const handleRunHydraulicErosion = useCallback(() => {
+    pushUndoSnapshot('Xói Mòn Thủy Lực (Web Worker)');
+    showToast('Đang mô phỏng xói mòn thủy lực theo hạt trên Web Worker...');
+    runHydraulicErosionAsync(heightMapRef.current, {
+      width: VERTEX_COUNT_PER_SIDE,
+      height: VERTEX_COUNT_PER_SIDE,
+      iterations: 18000,
+    }).then((eroded) => {
+      heightMapRef.current.set(eroded);
+      recomputeTerrainColors(
+        heightMapRef.current,
+        splatMapRef.current,
+        colorMapRef.current,
+        latestStateRef.current.biomeId
+      );
+      if (v3EngineRef.current) {
+        v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
+      }
+      commitPlacedObjects((prev) => syncObjectsToGround(prev));
+      dirtyRectRef.current = null;
+      setTerrainVersion((v) => v + 1);
+      showToast('Hoàn tất mô phỏng Xói Mòn Thủy Lực theo hạt (18.000 hạt nước).');
+    });
+  }, [commitPlacedObjects, pushUndoSnapshot, showToast, syncObjectsToGround]);
+
+  const handleExportWorldGlb = useCallback(() => {
+    setGlbExportTrigger((t) => t + 1);
+  }, []);
+
+  const handleGlbExportComplete = useCallback(
+    (_ok: boolean, message: string) => {
+      showToast(message);
+    },
+    [showToast]
+  );
+
+  const handleToggleGpuShader = useCallback(() => {
+    setGpuShaderEnabled((prev) => {
+      const next = !prev;
+      showToast(
+        next
+          ? 'Đã bật GLSL Triplanar Mapping + Tuyết phủ theo độ dốc + Dung nham phát sáng động.'
+          : 'Đã chuyển về chế độ tô màu đỉnh Vector tiêu chuẩn.'
+      );
+      return next;
+    });
+  }, [showToast]);
+
   const handleImportWorldJson = useCallback(
     (file: File) => {
+      if (file.name.toLowerCase().endsWith('.atw')) {
+        if (!v3EngineRef.current) return;
+        v3EngineRef.current
+          .importWorldSaveV3(file)
+          .then((stateV3) => {
+            pushUndoSnapshot('Nhập bản đồ nhị phân .ATW v3');
+            heightMapRef.current = stateV3.baseHeight;
+            commitPlacedObjects(stateV3.objects);
+            if (stateV3.microStrokes && stateV3.microStrokes.length > 0) {
+              setMicroStrokes(stateV3.microStrokes);
+            }
+            setSelectedObjectId(stateV3.objects[0]?.id ?? null);
+            dirtyRectRef.current = null;
+            setTerrainVersion((v) => v + 1);
+            setV3UiTick((t) => t + 1);
+            showToast(
+              `Đã nhập tệp nhị phân .ATW v3 (${stateV3.tiles.length} ô đa phân giải, ${stateV3.objects.length} vật thể, ${stateV3.links.length} đường nối).`
+            );
+          })
+          .catch((err) => {
+            showToast(`Không thể nhập tệp .ATW: ${err instanceof Error ? err.message : 'Lỗi định dạng'}`);
+          });
+        return;
+      }
+
       const reader = new FileReader();
       reader.onload = () => {
         try {
@@ -977,6 +1300,10 @@ export default function App() {
           heightMapRef.current = restored.heightMap;
           splatMapRef.current = restored.splatMap;
           colorMapRef.current = restored.colorMap;
+          if (v3EngineRef.current) {
+            v3EngineRef.current.terrainField.setBaseHeightMap(restored.heightMap);
+            v3EngineRef.current.syncPlacedObjects(restored.placedObjects, latestStateRef.current.autoJunctionBlend);
+          }
           setRegionTitle(restored.regionTitle);
           setBiomeId(restored.biomeId);
           setActiveWeather(restored.activeWeather);
@@ -988,7 +1315,7 @@ export default function App() {
           setGrassHeightCm(restored.grassHeightCm);
           setFlowerSpecies(restored.flowerSpecies);
           setFlowerColorHex(restored.flowerColorHex);
-          setPlacedObjects(restored.placedObjects);
+          commitPlacedObjects(restored.placedObjects);
           setMicroStrokes(restored.microStrokes);
           setSelectedObjectId(restored.placedObjects[0]?.id ?? null);
           dirtyRectRef.current = null;
@@ -1005,8 +1332,26 @@ export default function App() {
       };
       reader.readAsText(file);
     },
-    [pushUndoSnapshot, showToast]
+    [commitPlacedObjects, pushUndoSnapshot, showToast]
   );
+
+  const handleExportAtwV3 = useCallback(() => {
+    if (!v3EngineRef.current) return;
+    v3EngineRef.current
+      .exportWorldSaveV3(latestStateRef.current.placedObjects)
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `aetherterra-v3-${latestStateRef.current.biomeId}.atw`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('Đã xuất tệp bản đồ nhị phân nén .ATW (WorldSaveV3).');
+      })
+      .catch(() => {
+        showToast('Không thể xuất tệp .ATW.');
+      });
+  }, [showToast]);
 
   const selectedObject =
     placedObjects.find((o) => o.id === selectedObjectId) || null;
@@ -1015,14 +1360,14 @@ export default function App() {
     const selId = latestStateRef.current.selectedObjectId;
     if (!selId) return;
     pushUndoSnapshot('Xoay vật thể +45°');
-    setPlacedObjects((prev) =>
+    commitPlacedObjects((prev) =>
       prev.map((o) =>
         o.id === selId
           ? { ...o, rotationY: o.rotationY + Math.PI / 4 }
           : o
       )
     );
-  }, [pushUndoSnapshot]);
+  }, [commitPlacedObjects, pushUndoSnapshot]);
 
   const handleSetSelectedObjectRotationDeg = useCallback(
     (deg: number) => {
@@ -1036,11 +1381,11 @@ export default function App() {
         pushUndoSnapshot(`Xoay hướng vật thể (${clampedDeg}°)`);
       }
       const rad = Number(((clampedDeg * Math.PI) / 180).toFixed(4));
-      setPlacedObjects((prev) =>
+      commitPlacedObjects((prev) =>
         prev.map((o) => (o.id === selId ? { ...o, rotationY: rad } : o))
       );
     },
-    [pushUndoSnapshot]
+    [commitPlacedObjects, pushUndoSnapshot]
   );
 
   const handleScaleSelected = useCallback(
@@ -1048,7 +1393,7 @@ export default function App() {
       const selId = latestStateRef.current.selectedObjectId;
       if (!selId) return;
       pushUndoSnapshot('Đổi kích thước vật thể');
-      setPlacedObjects((prev) =>
+      commitPlacedObjects((prev) =>
         prev.map((o) =>
           o.id === selId
             ? {
@@ -1059,7 +1404,7 @@ export default function App() {
         )
       );
     },
-    [pushUndoSnapshot]
+    [commitPlacedObjects, pushUndoSnapshot]
   );
 
   const handleSetSelectedObjectScale = useCallback(
@@ -1073,11 +1418,11 @@ export default function App() {
         lastStrokeSnapshotTimeRef.current = now;
         pushUndoSnapshot(`Chỉnh cỡ vật thể (${clamped}x)`);
       }
-      setPlacedObjects((prev) =>
+      commitPlacedObjects((prev) =>
         prev.map((o) => (o.id === selId ? { ...o, scale: clamped } : o))
       );
     },
-    [pushUndoSnapshot]
+    [commitPlacedObjects, pushUndoSnapshot]
   );
 
   const handleDeleteSelected = useCallback(() => {
@@ -1085,10 +1430,10 @@ export default function App() {
     if (!selId) return;
     const target = latestStateRef.current.placedObjects.find((o) => o.id === selId);
     pushUndoSnapshot(`Xóa ${target?.label || 'vật thể'}`);
-    setPlacedObjects((prev) => prev.filter((o) => o.id !== selId));
+    commitPlacedObjects((prev) => prev.filter((o) => o.id !== selId));
     setSelectedObjectId(null);
     showToast('Đã xóa vật thể khỏi bản đồ (Có thể nhấn Hoàn Tác để khôi phục).');
-  }, [pushUndoSnapshot, showToast]);
+  }, [commitPlacedObjects, pushUndoSnapshot, showToast]);
 
   const handleToggleCollapse = useCallback(() => {
     setIsDockCollapsed((prev) => !prev);
@@ -1136,6 +1481,14 @@ export default function App() {
           dirtyRectRef={dirtyRectRef}
           biomeId={biomeId}
           activeWeather={activeWeather}
+          gpuShaderEnabled={gpuShaderEnabled}
+          gpuWeatherPreset={gpuWeatherPreset}
+          snowCoverageIntensity={snowCoverageIntensity}
+          snowAltitudeMeters={snowAltitudeMeters}
+          lavaLevelMeters={lavaLevelMeters}
+          triplanarSharpness={triplanarSharpness}
+          glbExportTrigger={glbExportTrigger}
+          onGlbExportComplete={handleGlbExportComplete}
           sunElevation={sunElevation}
           sunAzimuth={sunAzimuth}
           timeOfDay={timeOfDay}
@@ -1155,14 +1508,106 @@ export default function App() {
           brushStrength={brushStrength}
           cameraPreset={cameraPreset}
           cameraPresetTrigger={cameraPresetTrigger}
+          v3Engine={v3EngineRef.current}
+          v3Enabled={v3Enabled}
           onTerrainStrokeStart={handleTerrainStrokeStart}
           onTerrainStroke={handleTerrainStroke}
+          onTerrainStrokeEnd={handleTerrainStrokeEnd}
           onPlacePrefabAt={handleViewportPlacePrefab}
           onSelectObject={setSelectedObjectId}
           onHoverCoordsChange={setHoverCoords}
           onScaleMetricsChange={setScaleMetrics}
         />
       </ErrorBoundary>
+
+      {/* Top-Right V3 Clipmap Resolution HUD & Non-Destructive Stamp/Link Inspector */}
+      <div className="fixed top-14 right-2.5 z-20 pointer-events-none flex flex-col items-end gap-1.5">
+        <ResolutionHudV3 v3Enabled={v3Enabled} onToggleV3={setV3Enabled} />
+        {v3Enabled && v3EngineRef.current && (activeTab === 'sculpt' || activeTab === 'paint') && (() => {
+          const est = v3EngineRef.current.estimateBrush(brushRadius);
+          return (
+            <BrushLevelBadgeV3
+              radiusMeters={brushRadius}
+              targetLevel={est.level}
+              mbPerKm2={est.mbPerKm2}
+              warningQuota80Pct={est.quotaWarning80Pct}
+            />
+          );
+        })()}
+        {v3Enabled && v3EngineRef.current && (
+          <div className="pointer-events-auto flex flex-col items-end gap-1" data-tick={v3UiTick}>
+            <button
+              type="button"
+              data-testid="toggle-v3-link-stamp-btn"
+              onClick={() => setV3PanelOpen((p) => !p)}
+              className="px-2.5 py-1 rounded-lg bg-slate-950/85 hover:bg-slate-900 border border-cyan-500/40 text-[11px] font-medium text-cyan-200 shadow-lg cursor-pointer"
+            >
+              {v3PanelOpen ? 'Ẩn Tem SDF & Đường Nối V3' : 'Mở Tem SDF & Đường Nối V3'}
+            </button>
+            {v3PanelOpen && (
+              <LinkAndStampPopoverV3
+                linkProps={{
+                  snapEnabled: v3SnapEnabled,
+                  links: v3EngineRef.current.linkSystem.listLinks(),
+                  onToggleSnap: setV3SnapEnabled,
+                  onCreatePath: () => {
+                    const created = v3EngineRef.current!.linkSystem.autoConnectAll(160);
+                    setV3UiTick((t) => t + 1);
+                    showToast(`Đã tạo ${created.length} đường nối Spline + Capsule SDF.`);
+                  },
+                  onBakeUnion: (linkId) => {
+                    v3EngineRef.current!.linkSystem.bakeUnion(linkId).then(() => {
+                      setV3UiTick((t) => t + 1);
+                      showToast('Đã chốt hợp khối Boolean CSG (three-bvh-csg) thành công.');
+                    });
+                  },
+                  onDeleteLink: (linkId) => {
+                    v3EngineRef.current!.linkSystem.removeLink(linkId);
+                    setV3UiTick((t) => t + 1);
+                  },
+                }}
+                stampProps={
+                  selectedObjectId && v3EngineRef.current.stampIndex.get(`obj_${selectedObjectId}`)
+                    ? {
+                        stamp: v3EngineRef.current.stampIndex.get(`obj_${selectedObjectId}`)!,
+                        debugShowSdfOutline: v3DebugSdfOutline,
+                        onToggleDebugOutline: (v) => {
+                          setV3DebugSdfOutline(v);
+                          v3EngineRef.current?.splatHandle.setDebugShowSdfOutline(v);
+                        },
+                        onChangePadY: (padY) => {
+                          const cur = v3EngineRef.current!.stampOverrides.get(selectedObjectId) ?? {};
+                          v3EngineRef.current!.stampOverrides.set(selectedObjectId, { ...cur, padY });
+                          v3EngineRef.current!.syncPlacedObjects(placedObjects, autoJunctionBlend);
+                          setV3UiTick((t) => t + 1);
+                        },
+                        onChangeFalloff: (falloff) => {
+                          const cur = v3EngineRef.current!.stampOverrides.get(selectedObjectId) ?? {};
+                          v3EngineRef.current!.stampOverrides.set(selectedObjectId, { ...cur, falloff });
+                          v3EngineRef.current!.syncPlacedObjects(placedObjects, autoJunctionBlend);
+                          setV3UiTick((t) => t + 1);
+                        },
+                        onChangeEmbedDepth: (embedDepth) => {
+                          const cur = v3EngineRef.current!.stampOverrides.get(selectedObjectId) ?? {};
+                          v3EngineRef.current!.stampOverrides.set(selectedObjectId, { ...cur, embedDepth });
+                          v3EngineRef.current!.syncPlacedObjects(placedObjects, autoJunctionBlend);
+                          setV3UiTick((t) => t + 1);
+                        },
+                        onChangeSmoothK: (smoothK) => {
+                          const cur = v3EngineRef.current!.stampOverrides.get(selectedObjectId) ?? {};
+                          v3EngineRef.current!.stampOverrides.set(selectedObjectId, { ...cur, smoothK });
+                          v3EngineRef.current!.syncPlacedObjects(placedObjects, autoJunctionBlend);
+                          setV3UiTick((t) => t + 1);
+                        },
+                      }
+                    : null
+                }
+                onExportAtw={handleExportAtwV3}
+              />
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Ultra-Compact Single-Line Top Bar */}
       <header className="fixed top-2.5 left-2.5 right-2.5 z-20 pointer-events-none flex flex-nowrap items-center justify-between gap-2">
@@ -1413,6 +1858,7 @@ export default function App() {
                   onClick={() => {
                     setActiveRefModelIdx(idx);
                     setSelectedPrefab(item.prefabId);
+                    setSculptPrefabOverride(item.prefabId);
                     const found = placedObjects.find((o) => o.prefabId === item.prefabId);
                     if (found) {
                       setSelectedObjectId(found.id);
@@ -1470,9 +1916,11 @@ export default function App() {
                 type="button"
                 data-testid="spawn-volcano-model-btn"
                 onClick={() => {
-                  setSelectedPrefab(currentRef.prefabId);
+                  const targetPrefab = selectedPrefab || currentRef.prefabId;
+                  setSelectedPrefab(targetPrefab);
+                  setSculptPrefabOverride(targetPrefab);
                   setActiveTab('prefabs');
-                  handleSpawnPrefabAtCenter(currentRef.prefabId);
+                  handleSpawnPrefabAtCenter(targetPrefab);
                 }}
                 className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-amber-300 text-[10px] font-semibold transition-colors cursor-pointer"
               >
@@ -1501,11 +1949,15 @@ export default function App() {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         sculptTool={sculptTool}
-        onSelectSculptTool={setSculptTool}
+        onSelectSculptTool={handleSelectSculptTool}
         brushRadius={brushRadius}
         onChangeBrushRadius={setBrushRadius}
         brushStrength={brushStrength}
         onChangeBrushStrength={setBrushStrength}
+        spawnObjectOnSculpt={spawnObjectOnSculpt}
+        onToggleSpawnObjectOnSculpt={handleToggleSpawnObjectOnSculpt}
+        sculptPrefabOverride={sculptPrefabOverride}
+        onChangeSculptPrefabOverride={handleChangeSculptPrefabOverride}
         textureBrush={textureBrush}
         onSelectTextureBrush={setTextureBrush}
         grassHeightCm={grassHeightCm}
@@ -1526,7 +1978,7 @@ export default function App() {
         onDeleteTerrainRule={handleDeleteTerrainRule}
         onExecuteTerrainRules={handleExecuteTerrainRules}
         selectedPrefab={selectedPrefab}
-        onSelectPrefab={setSelectedPrefab}
+        onSelectPrefab={handleSelectPrefab}
         prefabCategoryFilter={prefabCategoryFilter}
         onChangePrefabCategoryFilter={setPrefabCategoryFilter}
         placementRotationDeg={placementRotationDeg}
@@ -1568,6 +2020,18 @@ export default function App() {
         onResetWorld={handleResetWorld}
         onExportWorldJson={handleExportWorldJson}
         onImportWorldJson={handleImportWorldJson}
+        onExportWorldGlb={handleExportWorldGlb}
+        onRunHydraulicErosion={handleRunHydraulicErosion}
+        gpuShaderEnabled={gpuShaderEnabled}
+        onToggleGpuShader={handleToggleGpuShader}
+        gpuWeatherPreset={gpuWeatherPreset}
+        onChangeGpuWeatherPreset={setGpuWeatherPreset}
+        snowCoverageIntensity={snowCoverageIntensity}
+        onChangeSnowCoverageIntensity={setSnowCoverageIntensity}
+        lavaLevelMeters={lavaLevelMeters}
+        onChangeLavaLevelMeters={setLavaLevelMeters}
+        triplanarSharpness={triplanarSharpness}
+        onChangeTriplanarSharpness={setTriplanarSharpness}
       />
 
       {/* Bottom-Right Live Vector Distance Scale Bar / Ruler (1:1 Real-World Scale) */}

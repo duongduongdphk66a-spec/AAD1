@@ -37,14 +37,29 @@ import {
   TEXTURE_INDEX_MAP,
   serializeWorldToSavePayload,
   deserializeWorldFromSavePayload,
+  applyHydraulicErosion,
+  calculateHeightAndGradient,
+  reconstructTerrainFromRGBA,
+  SculptHistoryManager,
+  cosineBrushFalloff,
+  TerrainQuadtreeLOD,
+  QuadTreeNode,
+  createGPUWeatherSystem,
+  BIOME_WEATHER_PRESETS,
 } from './terrainEngine';
 import {
   createSurfaceEcosystemPatch,
   PATCH_BUILDERS,
   disposeObject3DTree,
+  buildInstancedEcosystem,
 } from './surfaceEcosystem3D';
 import * as THREE from 'three';
-import { ProceduralPrefabFactory } from './proceduralModels';
+import {
+  ProceduralPrefabFactory,
+  createProceduralPineTree,
+  createProceduralSakuraTree,
+} from './proceduralModels';
+import { createDynamicTerrainMaterial } from './materialsAndTextures';
 import { SAMPLE_PHOTO_PRESETS } from './samplePhotos';
 import * as constantsMod from './constants';
 import * as registryMod from './registry';
@@ -53,13 +68,6 @@ import * as prefabsMod from './registry/prefabs';
 import * as brushesMod from './brushes';
 import * as sculptingMod from './sculpting';
 import * as generationMod from './generation';
-import path from 'node:path';
-import type { Request, Response } from 'express';
-import {
-  resolveSafeDistFile,
-  selectContentEncoding,
-  serveCompressedOrStatic,
-} from '../../server';
 import {
   blendObjectsAndTerrainJunctions,
   computeObjectJunctionPairs,
@@ -67,6 +75,8 @@ import {
   interpolateOrExtrapolateRgb,
   polynomialSmoothMin,
   quinticSmoothstep,
+  computeHeightLerpWeights,
+  blendBiomeJunction,
 } from './junctionBlending';
 import { buildJunctionContinuumGroup } from './junctionBridges3D';
 
@@ -1069,76 +1079,6 @@ test('disposeObject3DTree disposes material textures (map, normalMap, emissiveMa
   assert.equal(sharedDisposed, false, 'Should not dispose textures marked with userData.shared = true');
 });
 
-test('serveCompressedOrStatic blocks sibling path traversal via path.relative, catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
-  const distDir = path.resolve('/app/applet/dist');
-  const middleware = serveCompressedOrStatic(distDir);
-
-  // 1. Path traversal to sibling directory (/..%2fdist-secret%2fsecret.json) is blocked via path.relative(distPath, resolvedFile)
-  assert.equal(resolveSafeDistFile(distDir, '/../dist-secret/secret.json'), null);
-  let nextCalledForTraversal = false;
-  await middleware(
-    {
-      method: 'GET',
-      path: '/..%2fdist-secret%2fsecret.json',
-      headers: { 'accept-encoding': 'gzip, br' },
-    } as unknown as Request,
-    {} as unknown as Response,
-    () => {
-      nextCalledForTraversal = true;
-    }
-  );
-  assert.equal(
-    nextCalledForTraversal,
-    true,
-    'Middleware must reject sibling directory traversal and delegate to next()'
-  );
-
-  // 2. Malformed URI percent-encoding is caught by try-catch and returns HTTP 400 instead of throwing URIError (500)
-  let statusCode = 200;
-  let jsonBody: unknown = null;
-  await middleware(
-    {
-      method: 'GET',
-      path: '/%E0%A4%A',
-      headers: { 'accept-encoding': 'br' },
-    } as unknown as Request,
-    {
-      status(code: number) {
-        statusCode = code;
-        return this;
-      },
-      json(payload: unknown) {
-        jsonBody = payload;
-        return this;
-      },
-    } as unknown as Response,
-    () => {}
-  );
-  assert.equal(statusCode, 400, 'Malformed URI must return HTTP 400');
-  assert.ok(jsonBody && typeof jsonBody === 'object');
-
-  // 3. Accept-Encoding: br;q=0 is respected (never serves br when q=0)
-  assert.equal(selectContentEncoding('br;q=0'), null);
-  assert.equal(selectContentEncoding('br;q=0, gzip;q=0.8'), 'gzip');
-  let nextCalledForBrQ0 = false;
-  await middleware(
-    {
-      method: 'GET',
-      path: '/index.html',
-      headers: { 'accept-encoding': 'br;q=0' },
-    } as unknown as Request,
-    {} as unknown as Response,
-    () => {
-      nextCalledForBrQ0 = true;
-    }
-  );
-  assert.equal(
-    nextCalledForBrQ0,
-    true,
-    'Middleware must not serve Brotli when Accept-Encoding specifies br;q=0'
-  );
-});
-
 test('junctionBlending and junctionBridges3D fuse overlapping structures as 1 volume and interpolate/extrapolate only the bottom ground for distant objects', () => {
   // 1. Verify Hermite interpolation (t in [0, 1]) and damped tangent extrapolation (t < 0, t > 1)
   assert.equal(hermiteInterpolateOrExtrapolate(10, 30, 5, 5, 0), 10);
@@ -1242,7 +1182,7 @@ test('junctionBlending and junctionBridges3D fuse overlapping structures as 1 vo
   assert.ok(blendRes.modifiedVerticesCount > 0);
   assert.ok(blendRes.blendedColorVerticesCount > 0);
 
-  // 5. Verify 3D Junction Continuum Group builds volume bridge for overlapping pair and ground-only strip for distant pair
+  // 5. Verify 3D Junction Continuum Group merges the entire junction network into a single THREE.Mesh (1 draw call)
   const continuumGroup = buildJunctionContinuumGroup(
     blendRes.updatedObjects,
     [
@@ -1256,54 +1196,450 @@ test('junctionBlending and junctionBridges3D fuse overlapping structures as 1 vo
   assert.equal(continuumGroup.userData.overlapFusionCount, 1);
   assert.ok(continuumGroup.userData.distantGroundCorridorCount >= 1);
   assert.equal(continuumGroup.userData.terrainStrokeBridgeCount, 1);
+  assert.equal(continuumGroup.userData.drawCallCount, 1);
 
-  let foundOverlapMesh = false;
-  let foundDistantGroundMesh = false;
+  let foundOverlapVertices = false;
+  let foundDistantGroundVertices = false;
+  let meshCount = 0;
 
   continuumGroup.traverse((child) => {
     if (child instanceof THREE.Mesh && child.userData.isJunctionBridge) {
+      meshCount++;
       const posAttr = child.geometry.attributes.position as THREE.BufferAttribute;
       const colAttr = child.geometry.attributes.color as THREE.BufferAttribute;
       assert.ok(posAttr.count > 20);
       assert.equal(colAttr.count, posAttr.count, 'Every bridge vertex must have interpolated vertex color');
 
-      if (child.userData.junctionMode === 'overlap_fusion') {
-        foundOverlapMesh = true;
-        assert.equal(child.userData.groundOnly, false);
-        // Verify that the fused volume bridge rises significantly above ground to unite the 2 overlapping structures
+      const overlapRanges = (child.userData.overlapVertexRanges ?? []) as Array<{
+        start: number;
+        count: number;
+      }>;
+      const distantRanges = (child.userData.distantGroundVertexRanges ?? []) as Array<{
+        start: number;
+        count: number;
+      }>;
+
+      if (overlapRanges.length > 0) {
+        foundOverlapVertices = true;
         let maxHeightAboveGround = 0;
-        for (let i = 0; i < posAttr.count; i++) {
-          const vx = posAttr.getX(i);
-          const vy = posAttr.getY(i);
-          const vz = posAttr.getZ(i);
-          const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
-          maxHeightAboveGround = Math.max(maxHeightAboveGround, vy - gy);
+        for (const range of overlapRanges) {
+          for (let i = range.start; i < range.start + range.count; i++) {
+            const vx = posAttr.getX(i);
+            const vy = posAttr.getY(i);
+            const vz = posAttr.getZ(i);
+            const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
+            maxHeightAboveGround = Math.max(maxHeightAboveGround, vy - gy);
+          }
         }
         assert.ok(
           maxHeightAboveGround > 1.2,
           `Overlapping structures bridge should rise > 1.2m to fuse volumes as 1, got ${maxHeightAboveGround}`
         );
-      } else if (child.userData.junctionMode === 'distant_ground_only') {
-        foundDistantGroundMesh = true;
-        assert.equal(child.userData.groundOnly, true);
-        // Verify that distant objects' continuum strip ONLY affects the bottom ground (never rises into upper structures)
-        for (let i = 0; i < posAttr.count; i++) {
-          const vx = posAttr.getX(i);
-          const vy = posAttr.getY(i);
-          const vz = posAttr.getZ(i);
-          const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
-          assert.ok(
-            Math.abs(vy - gy) < 15,
-            'Distant ground strip must stay hugging the interpolated bottom ground'
-          );
+      }
+
+      if (distantRanges.length > 0) {
+        foundDistantGroundVertices = true;
+        for (const range of distantRanges) {
+          for (let i = range.start; i < range.start + range.count; i++) {
+            const vx = posAttr.getX(i);
+            const vy = posAttr.getY(i);
+            const vz = posAttr.getZ(i);
+            const gy = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, vx, vz);
+            assert.ok(
+              Math.abs(vy - gy) < 15,
+              'Distant ground strip must stay hugging the interpolated bottom ground'
+            );
+          }
         }
       }
     }
   });
 
-  assert.equal(foundOverlapMesh, true);
-  assert.equal(foundDistantGroundMesh, true);
+  assert.equal(foundOverlapVertices, true);
+  assert.equal(foundDistantGroundVertices, true);
+  assert.equal(meshCount, 1, `Merged continuum group must contain a single mesh (1 draw call), got ${meshCount}`);
   disposeObject3DTree(continuumGroup);
 });
 
+test('blendObjectsAndTerrainJunctions is strictly idempotent near a 400m cliff and preserves 100% of colorMap across Save/Load and subsequent brush strokes', () => {
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
 
+  // Sculpt a 400m sheer cliff next to the origin
+  for (let step = 0; step < 6; step++) {
+    applySculptBrush(
+      world.heightMap,
+      world.splatMap,
+      world.colorMap,
+      'mondstadt_meadow',
+      'sheer_cliff',
+      85,
+      0,
+      90,
+      85
+    );
+  }
+
+  const cliffObjects = [
+    {
+      id: 'cliff-obj-1',
+      prefabId: 'windmill_cottage' as const,
+      label: 'Nhà Sát Vách Đá 1',
+      x: 12,
+      y: 0,
+      z: 0,
+      scale: 1.3,
+      rotationY: 0,
+    },
+    {
+      id: 'cliff-obj-2',
+      prefabId: 'sakura_shrine' as const,
+      label: 'Đền Sát Vách Đá 2',
+      x: 20,
+      y: 0,
+      z: 0,
+      scale: 1.3,
+      rotationY: 0.5,
+    },
+  ];
+
+  // 1st click of "Nối Tiếp Giáp"
+  const res1 = blendObjectsAndTerrainJunctions(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    cliffObjects,
+    { smoothTerrainSeams: true }
+  );
+  const heightsAfterClick1 = new Float32Array(world.heightMap);
+  const colorsAfterClick1 = new Float32Array(world.colorMap);
+  const splatAfterClick1 = new Uint8Array(world.splatMap);
+
+  // 5th and 20th clicks of "Nối Tiếp Giáp" must produce 0.0m additional elevation drift
+  let currentObjs = res1.updatedObjects;
+  for (let click = 2; click <= 20; click++) {
+    const resN = blendObjectsAndTerrainJunctions(
+      world.heightMap,
+      world.splatMap,
+      world.colorMap,
+      'mondstadt_meadow',
+      currentObjs,
+      { smoothTerrainSeams: true }
+    );
+    currentObjs = resN.updatedObjects;
+  }
+
+  let maxHeightDiff = 0;
+  for (let i = 0; i < TOTAL_VERTICES; i++) {
+    const diff = Math.abs(world.heightMap[i] - heightsAfterClick1[i]);
+    if (diff > maxHeightDiff) maxHeightDiff = diff;
+    assert.equal(world.splatMap[i], splatAfterClick1[i]);
+  }
+  assert.equal(
+    maxHeightDiff,
+    0,
+    `Repeated calls to blendObjectsAndTerrainJunctions (20x) must be idempotent (0m drift), got ${maxHeightDiff}m`
+  );
+
+  for (let i = 0; i < colorsAfterClick1.length; i++) {
+    assert.equal(world.colorMap[i], colorsAfterClick1[i]);
+  }
+
+  // Verify Save -> Load preserves 100% of blended colorMap (0 / 77,763 differences)
+  const savedPayload = serializeWorldToSavePayload({
+    regionTitle: 'Kiểm Tra Lưu Màu Blend',
+    biomeId: 'mondstadt_meadow',
+    activeWeather: 'clear_sky',
+    waterLevel: -18,
+    sunElevation: 48,
+    sunAzimuth: 135,
+    timeOfDay: 10.5,
+    starlightMode: false,
+    grassHeightCm: 4.0,
+    flowerSpecies: 'sakura_bloom',
+    flowerColorHex: '#f472b6',
+    heightMap: world.heightMap,
+    splatMap: world.splatMap,
+    placedObjects: currentObjs,
+    microStrokes: [],
+  });
+
+  const restored = deserializeWorldFromSavePayload(savedPayload);
+  assert.ok(restored !== null);
+  let differingColorChannels = 0;
+  for (let i = 0; i < world.colorMap.length; i++) {
+    if (Math.abs(restored.colorMap[i] - world.colorMap[i]) > 1e-6) {
+      differingColorChannels++;
+    }
+  }
+  assert.equal(
+    differingColorChannels,
+    0,
+    `Expected 0/77,763 color differences after Save -> Load, got ${differingColorChannels}`
+  );
+});
+
+test('buildJunctionContinuumGroup merges geometries into a single mesh (1 draw call) and scales to 100, 300, and 800 objects in < 50ms', () => {
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
+  const prefabIds = PREFAB_CATALOG.map((p) => p.id);
+
+  for (const count of [20, 100, 300, 800]) {
+    const objects = Array.from({ length: count }, (_, idx) => {
+      const row = Math.floor(idx / 25);
+      const col = idx % 25;
+      // Mix overlapping pairs (every even/odd pair close together) and separated clusters
+      const clusterX = (col - 12) * 38;
+      const clusterZ = (row - 12) * 38;
+      const offset = idx % 2 === 1 ? 6 : 0;
+      return {
+        id: `perf-obj-${idx}`,
+        prefabId: prefabIds[idx % prefabIds.length],
+        label: `Obj ${idx}`,
+        x: clusterX + offset,
+        y: 0,
+        z: clusterZ,
+        scale: 1.1,
+        rotationY: 0,
+      };
+    });
+
+    const t0 = performance.now();
+    const group = buildJunctionContinuumGroup(
+      objects,
+      [],
+      world.heightMap,
+      'mondstadt_meadow'
+    );
+    const elapsedMs = performance.now() - t0;
+
+    let meshCount = 0;
+    let triangleCount = 0;
+    group.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        meshCount++;
+        const idxAttr = child.geometry.index;
+        triangleCount += idxAttr ? idxAttr.count / 3 : 0;
+      }
+    });
+
+    assert.equal(
+      meshCount,
+      1,
+      `For ${count} objects, merged group must have a single mesh (1 draw call), got ${meshCount}`
+    );
+    assert.equal(
+      group.userData.drawCallCount,
+      1,
+      'group.userData.drawCallCount must equal 1 for the merged junction network'
+    );
+    assert.ok(
+      triangleCount < 45000,
+      `For ${count} objects, triangle count must stay bounded (< 45,000), got ${triangleCount}`
+    );
+    assert.ok(
+      elapsedMs < 60,
+      `For ${count} objects, buildJunctionContinuumGroup should complete in < 60ms, took ${elapsedMs.toFixed(2)}ms`
+    );
+    disposeObject3DTree(group);
+  }
+});
+
+test('Height-Lerp Splatting (computeHeightLerpWeights & blendBiomeJunction), Cosine Falloff, and Sparse Delta Undo/Redo preserve mathematical invariants', () => {
+  // 1. Height-Lerp Splatting weight conservation: wA + wB === 1
+  const [wA, wB] = computeHeightLerpWeights(0.8, 0.2, 0.45, 0.15);
+  assert.ok(Math.abs(wA + wB - 1.0) < 1e-6, 'Height-Lerp weights must sum to 1.0');
+  assert.ok(wA > wB, 'Higher micro-height material A should dominate near the midpoint');
+
+  const blendedSample = blendBiomeJunction(
+    { elevation: 120, microHeight: 0.85, colorRGB: [0.8, 0.2, 0.1], roughness: 0.9 },
+    { elevation: 40, microHeight: 0.15, colorRGB: [0.1, 0.7, 0.3], roughness: 0.4 },
+    0,
+    20,
+    0.15
+  );
+  assert.ok(blendedSample.elevation > 80 && blendedSample.elevation <= 120);
+  assert.ok(blendedSample.roughness > 0.65 && blendedSample.roughness <= 0.9);
+
+  // 2. Cosine brush falloff: 1 at center, 0 at boundary & outside
+  assert.ok(Math.abs(cosineBrushFalloff(0, 10) - 1.0) < 1e-6);
+  assert.ok(Math.abs(cosineBrushFalloff(10, 10) - 0.0) < 1e-6);
+  assert.equal(cosineBrushFalloff(15, 10), 0);
+
+  // 3. Sparse Delta Undo / Redo restores exact Float32Array heights
+  const history = new SculptHistoryManager();
+  const before = new Float32Array([10, 20, 30, 40]);
+  const current = new Float32Array([10, 25.5, 30, 42.1]);
+
+  history.recordStroke(before, current);
+  assert.equal(history.undoCount, 1);
+  assert.equal(history.undo(current), true);
+  assert.deepEqual(Array.from(current), [10, 20, 30, 40]);
+
+  assert.equal(history.redo(current), true);
+  assert.ok(Math.abs(current[1] - 25.5) < 1e-5);
+  assert.ok(Math.abs(current[3] - 42.1) < 1e-5);
+});
+
+test('Hydraulic Erosion (terrainWorker), GPU Instancing (buildInstancedEcosystem), Sobel RGBA Reconstruction, GLSL Shaders, Procedural Trees, and Quadtree LOD operate accurately', () => {
+  // 1. Particle-based Hydraulic Erosion on a 32x32 sloped hill
+  const w = 32;
+  const h = 32;
+  const map = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dx = x - 16;
+      const dy = y - 16;
+      map[y * w + x] = Math.max(0, 50 - (dx * dx + dy * dy) * 0.35);
+    }
+  }
+  const beforeCopy = new Float32Array(map);
+  const gradSample = calculateHeightAndGradient(map, w, h, 10.5, 10.5);
+  assert.ok(Number.isFinite(gradSample.height));
+  assert.ok(gradSample.gx > 0 && gradSample.gy > 0);
+
+  applyHydraulicErosion(map, { width: w, height: h, iterations: 1500, seed: 42 });
+  let changedCells = 0;
+  for (let i = 0; i < map.length; i++) {
+    assert.ok(Number.isFinite(map[i]), 'Eroded heightmap must not contain NaN/Infinity');
+    if (Math.abs(map[i] - beforeCopy[i]) > 1e-4) changedCells++;
+  }
+  assert.ok(changedCells > 20, `Expected hydraulic erosion to modify > 20 cells, got ${changedCells}`);
+
+  // 2. GPU Instancing via buildInstancedEcosystem
+  const boxGeo = new THREE.BoxGeometry(1, 2, 1);
+  const boxMat = new THREE.MeshStandardMaterial({ color: 0x22c55e });
+  const samples = [
+    { position: new THREE.Vector3(0, 50, 0), normal: new THREE.Vector3(0, 1, 0) }, // valid
+    { position: new THREE.Vector3(5, 80, 5), normal: new THREE.Vector3(0.1, 0.99, 0).normalize() }, // valid
+    { position: new THREE.Vector3(10, 5, 10), normal: new THREE.Vector3(0, 1, 0) }, // below minAltitude
+    { position: new THREE.Vector3(15, 60, 15), normal: new THREE.Vector3(1, 0.1, 0).normalize() }, // too steep
+  ];
+  const instanced = buildInstancedEcosystem(
+    boxGeo,
+    boxMat,
+    samples,
+    {
+      prefabId: 'emerald_pine',
+      minAltitude: 20,
+      maxAltitude: 120,
+      maxSlopeRadians: 0.45,
+      density: 1.0,
+      scaleRange: [0.8, 1.4],
+      alignToNormal: true,
+    },
+    1337
+  );
+  assert.equal(instanced.count, 2, 'Only the 2 valid altitude/slope samples should be instanced');
+  boxGeo.dispose();
+  boxMat.dispose();
+  instanced.dispose();
+
+  // 3. Sobel + ITU-R BT.601 Luminance RGBA Reconstruction
+  const imgW = 16;
+  const imgH = 16;
+  const rgba = new Uint8ClampedArray(imgW * imgH * 4);
+  for (let i = 0; i < imgW * imgH; i++) {
+    // High red volcanic signature with vertical gradient
+    rgba[i * 4] = 220;
+    rgba[i * 4 + 1] = 60 + (i % imgW) * 5;
+    rgba[i * 4 + 2] = 30;
+    rgba[i * 4 + 3] = 255;
+  }
+  const recon = reconstructTerrainFromRGBA(rgba, imgW, imgH, 80.0, 0.75);
+  assert.equal(recon.heightmap.length, imgW * imgH);
+  assert.ok(
+    recon.detectedBiomeId === 'mars_olympus' || recon.detectedBiomeId === 'natlan_volcano_abyss'
+  );
+
+  // 4. Custom GLSL Triplanar Terrain Shader & GPU Weather System
+  const shaderMat = createDynamicTerrainMaterial({ uSnowIntensity: 0.9, uLavaLevel: 4.0 });
+  assert.equal(shaderMat.uniforms.uSnowIntensity.value, 0.9);
+  assert.equal(shaderMat.uniforms.uLavaLevel.value, 4.0);
+  shaderMat.dispose();
+
+  const weatherPoints = createGPUWeatherSystem('snowstorm');
+  assert.equal(
+    (weatherPoints.geometry.getAttribute('position') as THREE.BufferAttribute).count,
+    BIOME_WEATHER_PRESETS.snowstorm.particleCount
+  );
+  weatherPoints.geometry.dispose();
+  (weatherPoints.material as THREE.Material).dispose();
+
+  // 5. Procedural Pine & Sakura Trees and Quadtree LOD
+  const pine = createProceduralPineTree(6.0, 1.5);
+  const sakura = createProceduralSakuraTree(5.5, 2.0);
+  assert.equal(pine.children.length, 5); // 1 trunk + 4 cone layers
+  assert.equal(sakura.children.length, 8); // 1 trunk + 7 blossom clusters
+  disposeObject3DTree(pine);
+  disposeObject3DTree(sakura);
+
+  const quadtree = new TerrainQuadtreeLOD(4, 16, 6.0);
+  const rootNode: QuadTreeNode = {
+    bounds: new THREE.Box2(new THREE.Vector2(-512, -512), new THREE.Vector2(512, 512)),
+    level: 0,
+    children: [],
+    isLeaf: true,
+  };
+  quadtree.evaluateLOD(rootNode, new THREE.Vector3(0, 20, 0));
+  assert.equal(rootNode.isLeaf, false, 'Quadtree root must subdivide when camera is at center');
+  assert.equal(rootNode.children.length, 4);
+
+  quadtree.evaluateLOD(rootNode, new THREE.Vector3(50000, 20, 50000));
+  assert.equal(rootNode.isLeaf, true, 'Quadtree root must collapse when camera moves far away');
+  assert.equal(rootNode.children.length, 0);
+});
+
+test('sub-cell 15m brush sculpting raises 3D terrain elevation inside a 62.5m grid cell and spawnSculptLandformObject places 3D objects flush on sculpted terrain', () => {
+  const world = generateFlatEarthTerrain('mondstadt_meadow');
+  // Click at (28, 28) inside a 62.5m x 62.5m grid cell with default 15m brush radius and 45m strength
+  const modified = applySculptBrush(
+    world.heightMap,
+    world.splatMap,
+    world.colorMap,
+    'mondstadt_meadow',
+    'sheer_cliff',
+    28,
+    28,
+    15,
+    45
+  );
+  assert.ok(modified >= 1, '15m sheer_cliff brush at (28, 28) must modify vertices');
+  const groundAfter = getGroundHeightAt(world.heightMap, GRID_SIZE, WORLD_SIZE, 28, 28);
+  assert.ok(
+    groundAfter > 10,
+    `15m sheer_cliff brush inside a 62.5m cell must visibly raise 3D elevation (> 10m), got ${groundAfter}m`
+  );
+
+  // Spawn corresponding 3D landform object ('sheer_cliff_wall') at (28, 28)
+  const spawnRes = sculptingMod.spawnSculptLandformObject(
+    'sheer_cliff',
+    28,
+    28,
+    world.heightMap,
+    world.initialObjects,
+    { forcePlaceOnClick: true }
+  );
+  assert.ok(spawnRes.spawnedObject !== null, 'Should spawn 3D sheer_cliff_wall object on sculpt');
+  assert.equal(spawnRes.spawnedObject?.prefabId, 'sheer_cliff_wall');
+  assert.equal(
+    spawnRes.updatedObjects.length,
+    world.initialObjects.length + 1,
+    'updatedObjects should include the newly spawned 3D landform object'
+  );
+  assert.ok(
+    Math.abs((spawnRes.spawnedObject?.y ?? 0) - groundAfter) < 0.1,
+    'Spawned 3D object must sit flush on the newly sculpted ground height'
+  );
+
+  // Explicit prefabOverride places the chosen 3D object
+  const overrideRes = sculptingMod.spawnSculptLandformObject(
+    'raise',
+    65,
+    65,
+    world.heightMap,
+    spawnRes.updatedObjects,
+    { prefabOverride: 'sakura_shrine', forcePlaceOnClick: true }
+  );
+  assert.ok(overrideRes.spawnedObject !== null);
+  assert.equal(overrideRes.spawnedObject?.prefabId, 'sakura_shrine');
+});

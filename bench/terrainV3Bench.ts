@@ -1,0 +1,93 @@
+import { createTerrainV3Engine } from '../src/core/terrainV3Controller';
+import { BASE_N, TILE, snapToGrid, spacing } from '../src/core/units';
+import { PlacedObject } from '../src/world/registry';
+
+function generateObjects(count: number): PlacedObject[] {
+  const list: PlacedObject[] = [];
+  const cols = Math.ceil(Math.sqrt(count));
+  for (let i = 0; i < count; i++) {
+    const gx = (i % cols) * 32 - (cols * 32) / 2;
+    const gz = Math.floor(i / cols) * 32 - (cols * 32) / 2;
+    list.push({
+      id: `bench_obj_${i}`,
+      prefabId: i % 2 === 0 ? 'windmill_cottage' : 'ancient_bridge',
+      label: `Object ${i}`,
+      x: gx,
+      y: 0,
+      z: gz,
+      scale: 1,
+      rotationY: (i % 4) * (Math.PI / 2),
+    });
+  }
+  return list;
+}
+
+function runBenchmark(): void {
+  console.log('=== AetherTerra 3D v3 Performance Benchmark ===\n');
+
+  const baseHeight = new Float32Array(BASE_N * BASE_N);
+  for (let i = 0; i < baseHeight.length; i++) {
+    baseHeight[i] = Math.sin(i * 0.03) * 25;
+  }
+
+  // 1. Link building benchmark for N = 20 / 100 / 300 / 800 objects
+  console.log('1. Non-Destructive Link & Stamp Build (N = 20 / 100 / 300 / 800):');
+  console.log('   Count | Build Time (ms) | Mesh Count | Links Created');
+  console.log('   ------+-----------------+------------+--------------');
+
+  for (const n of [20, 100, 300, 800]) {
+    const engine = createTerrainV3Engine(baseHeight, 1337, false);
+    const objs = generateObjects(n);
+    const t0 = performance.now();
+    engine.stampIndex.deriveFromObjects(objs, (x, z) =>
+      engine.terrainField.sampleHeightNoStamps(x, z, 2)
+    );
+    engine.linkSystem.syncObjects(objs);
+    const links = engine.linkSystem.autoConnectAll(45);
+    const dt = performance.now() - t0;
+    const meshCount = engine.linkSystem.getMergedGroup().children.length;
+    console.log(
+      `   ${String(n).padStart(5)} | ${dt.toFixed(2).padStart(12)} ms | ${String(meshCount).padStart(10)} | ${String(links.length).padStart(13)}`
+    );
+    engine.dispose();
+  }
+
+  // 2. composeWindow (256x256 samples at L0 = 0.1m)
+  console.log('\n2. composeWindow (256x256 samples at L0 = 0.1m):');
+  const engine = createTerrainV3Engine(baseHeight, 1337, false);
+  const outWin = new Float32Array(TILE * TILE);
+  const originX = snapToGrid(0, 2 * spacing(0));
+  const originZ = snapToGrid(0, 2 * spacing(0));
+
+  const w0 = performance.now();
+  const iterations = 10;
+  for (let i = 0; i < iterations; i++) {
+    engine.composeWindow(0, originX, originZ, TILE, TILE, outWin);
+  }
+  const avgWinMs = (performance.now() - w0) / iterations;
+  console.log(`   Average 256×256 L0 window compose: ${avgWinMs.toFixed(2)} ms`);
+
+  // 3. 1,000 brush stamps at radii 1m, 10m, 100m
+  console.log('\n3. 1,000 Brush Stamps across Radii (1 m / 10 m / 100 m):');
+  for (const r of [1, 10, 100]) {
+    const bEngine = createTerrainV3Engine(baseHeight, 1337, false);
+    bEngine.brushEngine.beginStroke();
+    const b0 = performance.now();
+    for (let i = 0; i < 1000; i++) {
+      const wx = ((i * 17) % 600) - 300;
+      const wz = ((i * 31) % 600) - 300;
+      bEngine.applySculptStrokeStamp(wx, wz, r, 50, 'raise', 0.02);
+    }
+    bEngine.brushEngine.endStroke();
+    const totalMs = performance.now() - b0;
+    const stats = bEngine.tileStore.stats();
+    console.log(
+      `   Radius ${String(r).padStart(3)} m (L${bEngine.brushEngine.selectLevel(r)}): ${(totalMs / 1000).toFixed(3)} ms/stamp (Total: ${totalMs.toFixed(1)} ms, Resident tiles: ${stats.tiles}, ${(stats.bytes / (1024 * 1024)).toFixed(2)} MB)`
+    );
+    bEngine.dispose();
+  }
+
+  engine.dispose();
+}
+
+runBenchmark();

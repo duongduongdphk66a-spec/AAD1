@@ -3983,5 +3983,72 @@ export class ProceduralPrefabFactory {
   }
 }
 
+export function createProceduralPineTree(height = 6.0, radius = 1.5): THREE.Group {
+  const group = new THREE.Group();
+
+  // Cylindrical trunk
+  const trunkGeo = new THREE.CylinderGeometry(radius * 0.15, radius * 0.25, height * 0.4, 6);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5c4033, roughness: 0.9 });
+  const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+  trunk.position.y = (height * 0.4) / 2;
+  trunk.castShadow = true;
+  group.add(trunk);
+
+  // Stacked conical foliage layers
+  const layers = 4;
+  const foliageMat = new THREE.MeshStandardMaterial({ color: 0x1b4d3e, roughness: 0.8 });
+
+  for (let i = 0; i < layers; i++) {
+    const layerHeight = height * 0.35;
+    const layerRadius = radius * (1 - i * 0.2);
+    const coneGeo = new THREE.ConeGeometry(layerRadius, layerHeight, 7);
+    const cone = new THREE.Mesh(coneGeo, foliageMat);
+
+    cone.position.y = height * 0.3 + i * (height * 0.18);
+    cone.castShadow = true;
+    cone.receiveShadow = true;
+    group.add(cone);
+  }
+
+  return group;
+}
+
+export function createProceduralSakuraTree(height = 5.5, spread = 2.0): THREE.Group {
+  const group = new THREE.Group();
+
+  // Trunk
+  const trunkGeo = new THREE.CylinderGeometry(0.2, 0.35, height * 0.5, 8);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3b32, roughness: 0.85 });
+  const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+  trunk.position.y = (height * 0.5) / 2;
+  group.add(trunk);
+
+  // Spherical sakura blossom clusters
+  const clusterMat = new THREE.MeshStandardMaterial({
+    color: 0xffb7c5,
+    roughness: 0.6,
+    emissive: 0x331118,
+  });
+  const clusterCount = 7;
+
+  for (let i = 0; i < clusterCount; i++) {
+    const sphereGeo = new THREE.SphereGeometry(spread * (0.4 + Math.random() * 0.3), 7, 7);
+    const sphere = new THREE.Mesh(sphereGeo, clusterMat);
+
+    const angle = (i / clusterCount) * Math.PI * 2;
+    const dist = spread * 0.5 * Math.random();
+    sphere.position.set(
+      Math.cos(angle) * dist,
+      height * 0.5 + Math.random() * (height * 0.4),
+      Math.sin(angle) * dist
+    );
+    sphere.castShadow = true;
+    group.add(sphere);
+  }
+
+  return group;
+}
+
+
 
 

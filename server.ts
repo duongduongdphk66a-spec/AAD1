@@ -523,9 +523,14 @@ async function startServer() {
   });
 }
 
-const isMainModule =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === __filename;
-if (isMainModule && process.env.NODE_ENV !== 'test') {
+const isTestExecution =
+  process.env.NODE_ENV === 'test' ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.execArgv.includes('--test') ||
+  process.argv.includes('--test') ||
+  Boolean(process.argv[1] && /\.test\.[cm]?[jt]sx?$/.test(process.argv[1]));
+
+if (!isTestExecution) {
   startServer();
 }
 

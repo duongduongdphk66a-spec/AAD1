@@ -86,19 +86,35 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     setIsAnalyzing(false);
   };
 
-  // Helper to draw an image onto a square canvas using either 'fill' (center-crop) or 'fit' (full frame)
+  // Helper to draw an image onto a square canvas using either 'fill' (center-crop) or 'fit' (proportional full frame with edge-clamped margins)
   const drawImageWithCropMode = (
     ctx: CanvasRenderingContext2D,
     img: HTMLImageElement,
     targetSize: number,
-    activeCropMode: 'fill' | 'fit'
+    activeCropMode: 'fill' | 'fit',
+    padWithEdgePixels = true
   ) => {
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, targetSize, targetSize);
     const iw = Math.max(1, img.naturalWidth || img.width);
     const ih = Math.max(1, img.naturalHeight || img.height);
     if (activeCropMode === 'fit') {
-      ctx.drawImage(img, 0, 0, iw, ih, 0, 0, targetSize, targetSize);
+      const scale = Math.min(targetSize / iw, targetSize / ih);
+      const dw = Math.max(1, Math.round(iw * scale));
+      const dh = Math.max(1, Math.round(ih * scale));
+      const dx = Math.floor((targetSize - dw) * 0.5);
+      const dy = Math.floor((targetSize - dh) * 0.5);
+      if (padWithEdgePixels) {
+        if (dy > 0) {
+          ctx.drawImage(img, 0, 0, iw, 1, dx, 0, dw, dy);
+          ctx.drawImage(img, 0, ih - 1, iw, 1, dx, dy + dh, dw, targetSize - (dy + dh));
+        }
+        if (dx > 0) {
+          ctx.drawImage(img, 0, 0, 1, ih, 0, 0, dx, targetSize);
+          ctx.drawImage(img, iw - 1, 0, 1, ih, dx + dw, 0, targetSize - (dx + dw), targetSize);
+        }
+      }
+      ctx.drawImage(img, 0, 0, iw, ih, dx, dy, dw, dh);
       return;
     }
     const scale = Math.max(targetSize / iw, targetSize / ih);
@@ -109,7 +125,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetSize, targetSize);
   };
 
-  // Helper to encode a high-resolution (up to 896px) square JPEG matching the active cropMode for both preview & Gemini Vision
+  // Helper to encode a high-resolution (up to 896px) JPEG matching the active cropMode for both preview & Gemini Vision
   const buildMatchedPreviewAndAiUrl = (
     img: HTMLImageElement,
     activeCropMode: 'fill' | 'fit',
@@ -117,13 +133,27 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   ): string => {
     const iw = Math.max(1, img.naturalWidth || img.width);
     const ih = Math.max(1, img.naturalHeight || img.height);
+    if (activeCropMode === 'fit') {
+      const scale = Math.min(1, maxDimension / Math.max(iw, ih));
+      const outW = Math.max(1, Math.round(iw * scale));
+      const outH = Math.max(1, Math.round(ih * scale));
+      const aiCanvas = document.createElement('canvas');
+      aiCanvas.width = outW;
+      aiCanvas.height = outH;
+      const aiCtx = aiCanvas.getContext('2d');
+      if (!aiCtx) return '';
+      aiCtx.fillStyle = '#0f172a';
+      aiCtx.fillRect(0, 0, outW, outH);
+      aiCtx.drawImage(img, 0, 0, iw, ih, 0, 0, outW, outH);
+      return aiCanvas.toDataURL('image/jpeg', 0.86);
+    }
     const targetDim = Math.max(1, Math.min(maxDimension, Math.max(iw, ih)));
     const aiCanvas = document.createElement('canvas');
     aiCanvas.width = targetDim;
     aiCanvas.height = targetDim;
     const aiCtx = aiCanvas.getContext('2d');
     if (!aiCtx) return '';
-    drawImageWithCropMode(aiCtx, img, targetDim, activeCropMode);
+    drawImageWithCropMode(aiCtx, img, targetDim, 'fill', false);
     return aiCanvas.toDataURL('image/jpeg', 0.86);
   };
 
@@ -390,6 +420,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   };
 
   const handleCropModeChange = (nextCropMode: 'fill' | 'fit') => {
+    cancelPendingAiRequest();
     setCropMode(nextCropMode);
     const img = loadedImageElementRef.current;
     if (!img) return;
@@ -822,7 +853,9 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                       src={previewDataUrl}
                       alt="Ảnh thực tế đầu vào"
                       referrerPolicy="no-referrer"
-                      className="w-full h-full object-cover"
+                      className={`w-full h-full ${
+                        cropMode === 'fit' ? 'object-contain' : 'object-cover'
+                      }`}
                     />
                   ) : (
                     <Mountain className="w-8 h-8 text-slate-600" />
