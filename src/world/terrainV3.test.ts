@@ -577,4 +577,67 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     sched.tick(10, ep1);
     assert.deepEqual(order, [1, 4]);
   });
+
+  it('10. Global-grid sampleEditAtLevel eliminates tile boundary jumps with seam error <= 1 cm (Gate G2)', () => {
+    const baseMap = new Float32Array(BASE_N * BASE_N);
+    const store = new SparseTileStore(256);
+    const detail = new DeterministicDetailGenerator(1337);
+    const stamps = new SpatialStampIndex();
+    const field = new UnifiedTerrainField(baseMap, store, detail, stamps);
+    const brush = new MultiResBrushEngine(store, field);
+
+    // 1. Test brush stroke straddling L0 (25.6m tile span) and L4 (409.6m tile span) tile boundaries
+    for (const [level, radius] of [
+      [0 as Level, 1.2],
+      [2 as Level, 4.0],
+      [4 as Level, 15.0],
+    ] as const) {
+      const span = tileSpan(level);
+      const step = spacing(level);
+      // Pick tile boundary between tx=10 and tx=11, tz=10 and tz=11
+      const boundaryX = -5000 + 11 * span;
+      const boundaryZ = -5000 + 11 * span;
+
+      brush.applyStamp(
+        {
+          x: boundaryX,
+          z: boundaryZ,
+          radius,
+          strength: 1.0,
+          kernel: createSculptKernel('raise', 1.0),
+        },
+        0.15
+      );
+
+      // Probe across X boundary and Z boundary with +/- 0.5 mm offset
+      const eps = 0.0005;
+      for (let offset = -radius * 0.8; offset <= radius * 0.8; offset += step * 0.35) {
+        const hLeft = field.sampleHeight(boundaryX - eps, boundaryZ + offset, 0);
+        const hRight = field.sampleHeight(boundaryX + eps, boundaryZ + offset, 0);
+        const seamJumpX = Math.abs(hRight - hLeft);
+        assert.ok(
+          seamJumpX <= 0.01,
+          `Gate G2 failed on X boundary at L${level}: jump=${seamJumpX.toFixed(5)}m > 0.01m (1cm)`
+        );
+
+        const hBottom = field.sampleHeight(boundaryX + offset, boundaryZ - eps, 0);
+        const hTop = field.sampleHeight(boundaryX + offset, boundaryZ + eps, 0);
+        const seamJumpZ = Math.abs(hTop - hBottom);
+        assert.ok(
+          seamJumpZ <= 0.01,
+          `Gate G2 failed on Z boundary at L${level}: jump=${seamJumpZ.toFixed(5)}m > 0.01m (1cm)`
+        );
+      }
+
+      // Verify linear ramp interpolation across the last cell [boundaryX - step, boundaryX]
+      const hAt255 = field.sampleHeightNoStamps(boundaryX - step, boundaryZ, level);
+      const hAt256 = field.sampleHeightNoStamps(boundaryX, boundaryZ, level);
+      const hMid = field.sampleHeightNoStamps(boundaryX - 0.5 * step, boundaryZ, level);
+      const expectedMid = 0.5 * (hAt255 + hAt256);
+      assert.ok(
+        Math.abs(hMid - expectedMid) <= 0.01,
+        `Gate G2 midpoint interpolation across tile seam at L${level} deviated by ${Math.abs(hMid - expectedMid).toFixed(5)}m`
+      );
+    }
+  });
 });

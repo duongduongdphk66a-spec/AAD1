@@ -46,9 +46,13 @@ export function snapToGrid(val: number, step: number): number {
   return Math.floor(val / step) * step;
 }
 
+export function maxTileCoordForLevel(level: number): number {
+  return Math.max(0, Math.ceil(WORLD_SIZE / tileSpan(level)) - 1);
+}
+
 export function worldToTileCoord(x: number, z: number, level: number): [number, number] {
   const span = tileSpan(level);
-  const maxIdx = Math.max(0, Math.ceil(WORLD_SIZE / span) - 1);
+  const maxIdx = maxTileCoordForLevel(level);
   const tx = clamp(Math.floor((x + HALF) / span), 0, maxIdx);
   const tz = clamp(Math.floor((z + HALF) / span), 0, maxIdx);
   return [tx, tz];
@@ -59,18 +63,39 @@ export type TileKey = number;
 /**
  * Packs (L, tx, tz, kind) into a 25-bit unsigned integer TileKey:
  * ((kind === 'splat' ? 1 : 0) << 24) | ((L & 0xf) << 20) | ((tx & 0x3ff) << 10) | (tz & 0x3ff).
- * Valid for L in [0..15] and tx, tz in [0..1023].
+ * Valid for L in [0..9] and 0 <= tx, tz <= maxTileCoordForLevel(L) (< 1024).
  */
 export const tileKey = (
   L: number,
   tx: number,
   tz: number,
   kind: 'edit' | 'height' | 'splat' = 'height'
-): TileKey =>
-  ((kind === 'splat' ? 1 : 0) << 24) |
-  ((L & 0xf) << 20) |
-  ((tx & 0x3ff) << 10) |
-  (tz & 0x3ff);
+): TileKey => {
+  if (!Number.isInteger(L) || L < 0 || L > MAX_LEVEL) {
+    throw new RangeError(`Mức LOD tile không hợp lệ: L=${L} (phải từ 0 đến ${MAX_LEVEL})`);
+  }
+  const maxCoord = maxTileCoordForLevel(L);
+  if (
+    !Number.isInteger(tx) ||
+    !Number.isInteger(tz) ||
+    tx < 0 ||
+    tz < 0 ||
+    tx > maxCoord ||
+    tz > maxCoord ||
+    tx > 0x3ff ||
+    tz > 0x3ff
+  ) {
+    throw new RangeError(
+      `Tọa độ tile ngoài phạm vi tại L${L}: (${tx}, ${tz}), giới hạn hợp lệ [0..${maxCoord}]`
+    );
+  }
+  return (
+    ((kind === 'splat' ? 1 : 0) << 24) |
+    ((L & 0xf) << 20) |
+    ((tx & 0x3ff) << 10) |
+    (tz & 0x3ff)
+  );
+};
 
 /**
  * Unpacks a TileKey back into its exact { level, tx, tz, kind } coordinates.

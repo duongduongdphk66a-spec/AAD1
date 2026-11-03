@@ -29,10 +29,15 @@ export interface Tile {
 
 export interface TilePersistence {
   load(worldId: string, kind: TileKind, key: TileKey): Promise<Uint8Array | null>;
+  loadSync?(worldId: string, kind: TileKind, key: TileKey): Uint8Array | null;
   saveBatch(
     worldId: string,
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
   ): Promise<void>;
+  saveBatchSync?(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
+  ): void;
   listKeys(worldId: string, kind: TileKind): Promise<TileKey[]>;
   clear(worldId: string): Promise<void>;
 }
@@ -46,6 +51,8 @@ export interface TileStoreStats {
   bytesResident: number;
   bytesEdited: number;
   fineEditTilesL0: number;
+  maxResidentTiles: number;
+  softCapExceeded: boolean;
 }
 
 export interface TileStore {
@@ -61,10 +68,11 @@ export interface TileStore {
   ensure(kind: TileKind, key: TileKey, create?: boolean): Promise<Tile | undefined>;
   read(kind: TileKind, level: number, ix: number, iz: number): number;
   write(kind: TileKind, level: number, ix: number, iz: number, v: number): void;
+  markTileDirty(tile: Tile): void;
   edited(kind: TileKind): Iterable<TileKey>;
   stats(): TileStoreStats;
   flush(): Promise<void>;
-  evict(): void;
+  evict(excludeKey?: TileKey): void;
   onDirty(fn: (key: TileKey, rect: Rect) => void): () => void;
 }
 
@@ -207,18 +215,29 @@ export class InMemoryTilePersistence implements TilePersistence {
     return `${worldId}:${normKind}:${key}`;
   }
 
-  async load(worldId: string, kind: TileKind, key: TileKey): Promise<Uint8Array | null> {
+  loadSync(worldId: string, kind: TileKind, key: TileKey): Uint8Array | null {
     const found = this.store.get(this.makeKey(worldId, kind, key));
     return found ? new Uint8Array(found) : null;
+  }
+
+  async load(worldId: string, kind: TileKind, key: TileKey): Promise<Uint8Array | null> {
+    return this.loadSync(worldId, kind, key);
+  }
+
+  saveBatchSync(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
+  ): void {
+    for (const entry of entries) {
+      this.store.set(this.makeKey(worldId, entry.kind, entry.key), new Uint8Array(entry.bytes));
+    }
   }
 
   async saveBatch(
     worldId: string,
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
   ): Promise<void> {
-    for (const entry of entries) {
-      this.store.set(this.makeKey(worldId, entry.kind, entry.key), new Uint8Array(entry.bytes));
-    }
+    this.saveBatchSync(worldId, entries);
   }
 
   async listKeys(worldId: string, kind: TileKind): Promise<TileKey[]> {
@@ -281,9 +300,16 @@ export class IndexedDbTilePersistence implements TilePersistence {
     return this.dbPromise;
   }
 
+  loadSync(worldId: string, kind: TileKind, key: TileKey): Uint8Array | null {
+    return this.fallback.loadSync(worldId, kind, key);
+  }
+
   async load(worldId: string, kind: TileKind, key: TileKey): Promise<Uint8Array | null> {
+    const syncHit = this.fallback.loadSync(worldId, kind, key);
+    if (syncHit) return syncHit;
+
     const db = await this.getDb();
-    if (!db) return this.fallback.load(worldId, kind, key);
+    if (!db) return null;
     const normKind = kind === 'edit' ? 'height' : kind;
     return new Promise((resolve) => {
       try {
@@ -292,21 +318,33 @@ export class IndexedDbTilePersistence implements TilePersistence {
         const req = store.get(`${worldId}:${normKind}:${key}`);
         req.onsuccess = () => {
           const res = req.result;
-          resolve(res instanceof Uint8Array ? res : null);
+          if (res instanceof Uint8Array) {
+            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: res }]);
+            resolve(new Uint8Array(res));
+          } else {
+            resolve(null);
+          }
         };
-        req.onerror = () => resolve(this.fallback.load(worldId, kind, key));
+        req.onerror = () => resolve(null);
       } catch {
         this.hasIndexedDbError = true;
-        resolve(this.fallback.load(worldId, kind, key));
+        resolve(null);
       }
     });
+  }
+
+  saveBatchSync(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
+  ): void {
+    this.fallback.saveBatchSync(worldId, entries);
   }
 
   async saveBatch(
     worldId: string,
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
   ): Promise<void> {
-    await this.fallback.saveBatch(worldId, entries);
+    this.fallback.saveBatchSync(worldId, entries);
     const db = await this.getDb();
     if (!db) return;
 
@@ -346,6 +384,8 @@ export class IndexedDbTilePersistence implements TilePersistence {
 export class SparseTileStore implements TileStore {
   private editTiles = new Map<TileKey, Tile>();
   private splatTiles = new Map<TileKey, Tile>();
+  private persistedEditKeys = new Set<TileKey>();
+  private persistedSplatKeys = new Set<TileKey>();
   private dirtyListeners = new Set<(key: TileKey, rect: Rect) => void>();
   private persistence: TilePersistence;
   private worldId: string;
@@ -363,14 +403,17 @@ export class SparseTileStore implements TileStore {
     persistenceArg?: TilePersistence
   ) {
     if (typeof maxResidentOrOptions === 'number') {
-      this.maxResidentTiles = maxResidentOrOptions;
+      this.maxResidentTiles = Math.max(1, maxResidentOrOptions);
       this.persistence = persistenceArg ?? new InMemoryTilePersistence();
       this.worldId = 'default-world';
     } else {
       this.worldId = maxResidentOrOptions?.worldId ?? 'default-world';
       this.persistence =
         persistenceArg ?? maxResidentOrOptions?.persistence ?? new InMemoryTilePersistence();
-      this.maxResidentTiles = maxResidentOrOptions?.maxResidentTiles ?? DEFAULT_MAX_RESIDENT_TILES;
+      this.maxResidentTiles = Math.max(
+        1,
+        maxResidentOrOptions?.maxResidentTiles ?? DEFAULT_MAX_RESIDENT_TILES
+      );
     }
   }
 
@@ -378,37 +421,79 @@ export class SparseTileStore implements TileStore {
     return kind === 'splat' ? this.splatTiles : this.editTiles;
   }
 
+  private getPersistedSet(kind: TileKind = 'height'): Set<TileKey> {
+    return kind === 'splat' ? this.persistedSplatKeys : this.persistedEditKeys;
+  }
+
+  private emitDirty(key: TileKey): void {
+    if (this.dirtyListeners.size === 0) return;
+    const rect = tileKeyToWorldRect(key);
+    for (const fn of this.dirtyListeners) {
+      fn(key, rect);
+    }
+  }
+
+  markTileDirty(tile: Tile): void {
+    tile.dirty = true;
+    tile.lastUsed = ++this.accessCounter;
+    tile.version++;
+    this.emitDirty(tile.key);
+  }
+
   get(level: Level, tx: number, tz: number, kind: TileKind = 'height'): Tile | undefined {
-    const key = tileKey(level, tx, tz, kind);
-    return this.getByKey(kind, key);
+    try {
+      const key = tileKey(level, tx, tz, kind);
+      return this.getByKey(kind, key);
+    } catch {
+      return undefined;
+    }
   }
 
   getByKey(kind: TileKind, key: TileKey): Tile | undefined {
     const map = this.getMap(kind);
-    const tile = map.get(key);
+    let tile = map.get(key);
     if (tile) {
       tile.lastUsed = ++this.accessCounter;
+      return tile;
     }
-    return tile;
+
+    // Transparently page back in if this tile was flushed to persistence and later evicted
+    const persistedSet = this.getPersistedSet(kind);
+    if (persistedSet.has(key) && this.persistence.loadSync) {
+      const bytes = this.persistence.loadSync(this.worldId, kind, key);
+      if (bytes) {
+        this.evictBeforeInsert(key);
+        tile = deserializeTileFromBytes(kind, key, bytes);
+        tile.dirty = false;
+        tile.lastUsed = ++this.accessCounter;
+        map.set(key, tile);
+        return tile;
+      }
+    }
+    return undefined;
   }
 
   getOrCreate(level: Level, tx: number, tz: number, kind: TileKind = 'height'): Tile {
     const key = tileKey(level, tx, tz, kind);
-    const map = this.getMap(kind);
-    let tile = map.get(key);
-    if (!tile) {
-      tile = createZeroTile(kind, key);
-      tile.lastUsed = ++this.accessCounter;
-      map.set(key, tile);
-      this.evictIfNeeded();
-    } else {
-      tile.lastUsed = ++this.accessCounter;
+    const existing = this.getByKey(kind, key);
+    if (existing) {
+      existing.lastUsed = ++this.accessCounter;
+      return existing;
     }
+
+    // Evict clean tiles BEFORE inserting the newly created tile, and never evict `key`
+    this.evictBeforeInsert(key);
+    const tile = createZeroTile(kind, key);
+    tile.dirty = true;
+    tile.lastUsed = ++this.accessCounter;
+    this.getMap(kind).set(key, tile);
+    this.emitDirty(key);
     return tile;
   }
 
   delete(level: Level, tx: number, tz: number, kind: TileKind = 'height'): boolean {
     const key = tileKey(level, tx, tz, kind);
+    this.getPersistedSet(kind).delete(key);
     return this.getMap(kind).delete(key);
   }
 
@@ -419,6 +504,7 @@ export class SparseTileStore implements TileStore {
     if (!tile) return false;
     if (this.isTileAllZero(tile)) {
       map.delete(key);
+      this.getPersistedSet(kind).delete(key);
       return true;
     }
     return false;
@@ -426,34 +512,71 @@ export class SparseTileStore implements TileStore {
 
   countTilesAtLevel(level: Level, kind: TileKind = 'height'): number {
     const map = this.getMap(kind);
-    let count = 0;
-    for (const t of map.values()) {
-      if (t.level === level) count++;
+    const persisted = this.getPersistedSet(kind);
+    const seen = new Set<TileKey>();
+    for (const [k, t] of map.entries()) {
+      if (t.level === level && (t.scale !== 0 || t.min !== 0)) {
+        seen.add(k);
+      }
     }
-    return count;
+    for (const k of persisted) {
+      if (unpackTileKey(k).level === level) {
+        seen.add(k);
+      }
+    }
+    return seen.size;
   }
 
   activeLevelMask(): number {
-    if (this.editTiles.size === 0) return 0;
     let mask = 0;
     for (const t of this.editTiles.values()) {
       if (t.scale !== 0 || t.min !== 0) {
         mask |= 1 << t.level;
       }
     }
+    for (const k of this.persistedEditKeys) {
+      const { level } = unpackTileKey(k);
+      mask |= 1 << level;
+    }
     return mask;
   }
 
   entries(): Tile[] {
-    return [
-      ...Array.from(this.editTiles.values()),
-      ...Array.from(this.splatTiles.values()),
-    ];
+    const allEdit = new Map<TileKey, Tile>();
+    for (const k of this.persistedEditKeys) {
+      if (!this.editTiles.has(k) && this.persistence.loadSync) {
+        const bytes = this.persistence.loadSync(this.worldId, 'height', k);
+        if (bytes) {
+          allEdit.set(k, deserializeTileFromBytes('height', k, bytes));
+        }
+      }
+    }
+    for (const [k, t] of this.editTiles.entries()) {
+      allEdit.set(k, t);
+    }
+
+    const allSplat = new Map<TileKey, Tile>();
+    for (const k of this.persistedSplatKeys) {
+      if (!this.splatTiles.has(k) && this.persistence.loadSync) {
+        const bytes = this.persistence.loadSync(this.worldId, 'splat', k);
+        if (bytes) {
+          allSplat.set(k, deserializeTileFromBytes('splat', k, bytes));
+        }
+      }
+    }
+    for (const [k, t] of this.splatTiles.entries()) {
+      allSplat.set(k, t);
+    }
+
+    return [...Array.from(allEdit.values()), ...Array.from(allSplat.values())];
   }
 
   clear(): void {
     this.editTiles.clear();
     this.splatTiles.clear();
+    this.persistedEditKeys.clear();
+    this.persistedSplatKeys.clear();
+    void this.persistence.clear(this.worldId);
   }
 
   async ensure(kind: TileKind, key: TileKey, create = false): Promise<Tile | undefined> {
@@ -462,18 +585,22 @@ export class SparseTileStore implements TileStore {
 
     const bytes = await this.persistence.load(this.worldId, kind, key);
     if (bytes) {
+      this.evictBeforeInsert(key);
       const loaded = deserializeTileFromBytes(kind, key, bytes);
+      loaded.dirty = false;
       loaded.lastUsed = ++this.accessCounter;
       this.getMap(kind).set(key, loaded);
-      this.evictIfNeeded();
+      this.getPersistedSet(kind).add(key);
       return loaded;
     }
 
     if (create) {
+      this.evictBeforeInsert(key);
       const created = createZeroTile(kind, key);
+      created.dirty = true;
       created.lastUsed = ++this.accessCounter;
       this.getMap(kind).set(key, created);
-      this.evictIfNeeded();
+      this.emitDirty(key);
       return created;
     }
     return undefined;
@@ -481,32 +608,40 @@ export class SparseTileStore implements TileStore {
 
   read(kind: TileKind, level: number, ix: number, iz: number): number {
     if (level < 0 || level > MAX_LEVEL || ix < 0 || iz < 0) return 0;
-    const tx = Math.floor(ix / TILE);
-    const tz = Math.floor(iz / TILE);
-    if (tx >= 1024 || tz >= 1024) return 0;
-
-    const key = tileKey(level, tx, tz, kind);
+    const tx = ix >>> 8;
+    const tz = iz >>> 8;
+    let key: TileKey;
+    try {
+      key = tileKey(level, tx, tz, kind);
+    } catch {
+      return 0;
+    }
     const tile = this.getByKey(kind, key);
-    if (!tile) return 0;
+    if (!tile || tile.scale === 0) return 0;
 
-    const lx = ix - tx * TILE;
-    const lz = iz - tz * TILE;
-    const raw = tile.data[lz * TILE + lx];
+    const lx = ix & 255;
+    const lz = iz & 255;
+    const raw = tile.data[(lz << 8) | lx];
     return dequantizeSample(raw, tile.min, tile.scale);
   }
 
   write(kind: TileKind, level: number, ix: number, iz: number, v: number): void {
     if (level < 0 || level > MAX_LEVEL || ix < 0 || iz < 0) return;
-    const tx = Math.floor(ix / TILE);
-    const tz = Math.floor(iz / TILE);
-    if (tx >= 1024 || tz >= 1024) return;
+    const tx = ix >>> 8;
+    const tz = iz >>> 8;
+    let key: TileKey;
+    try {
+      key = tileKey(level, tx, tz, kind);
+    } catch {
+      return;
+    }
 
-    const key = tileKey(level, tx, tz, kind);
     const map = this.getMap(kind);
-    let tile = map.get(key);
+    let tile = this.getByKey(kind, key);
 
     if (!tile) {
       if (Math.abs(v) < 1e-6) return;
+      this.evictBeforeInsert(key);
       tile = createZeroTile(kind, key);
       if (kind === 'splat') {
         tile.min = 0;
@@ -518,8 +653,9 @@ export class SparseTileStore implements TileStore {
         const zeroQ = quantizeSample(0, tile.min, tile.scale);
         tile.data.fill(zeroQ);
       }
+      tile.dirty = true;
+      tile.lastUsed = ++this.accessCounter;
       map.set(key, tile);
-      this.evictIfNeeded();
     }
 
     const currentMax = tile.min + QUANT_STEPS * tile.scale;
@@ -527,9 +663,9 @@ export class SparseTileStore implements TileStore {
       this.requantizeTileToInclude(tile, v);
     }
 
-    const lx = ix - tx * TILE;
-    const lz = iz - tz * TILE;
-    const idx = lz * TILE + lx;
+    const lx = ix & 255;
+    const lz = iz & 255;
+    const idx = (lz << 8) | lx;
     const q = quantizeSample(v, tile.min, tile.scale);
     tile.data[idx] = q;
     tile.dirty = true;
@@ -538,12 +674,10 @@ export class SparseTileStore implements TileStore {
 
     if (Math.abs(v) < 1e-5 && this.isTileAllZero(tile)) {
       map.delete(key);
+      this.getPersistedSet(kind).delete(key);
     }
 
-    const rect = tileKeyToWorldRect(key);
-    for (const fn of this.dirtyListeners) {
-      fn(key, rect);
-    }
+    this.emitDirty(key);
   }
 
   private requantizeTileToInclude(tile: Tile, incomingValue: number): void {
@@ -587,32 +721,49 @@ export class SparseTileStore implements TileStore {
   }
 
   edited(kind: TileKind): Iterable<TileKey> {
-    return Array.from(this.getMap(kind).keys());
+    const set = new Set<TileKey>(this.getMap(kind).keys());
+    for (const k of this.getPersistedSet(kind)) {
+      set.add(k);
+    }
+    return set;
   }
 
   stats(): TileStoreStats {
     const editCount = this.editTiles.size;
     const splatCount = this.splatTiles.size;
     const resident = editCount + splatCount;
+
+    const allEditKeys = new Set<TileKey>(this.editTiles.keys());
+    for (const k of this.persistedEditKeys) allEditKeys.add(k);
+    const allSplatKeys = new Set<TileKey>(this.splatTiles.keys());
+    for (const k of this.persistedSplatKeys) allSplatKeys.add(k);
+    const edited = allEditKeys.size + allSplatKeys.size;
+
     let fineEditTilesL0 = 0;
+    for (const k of allEditKeys) {
+      if (unpackTileKey(k).level === 0) fineEditTilesL0++;
+    }
+
     let dirty = 0;
     for (const t of this.editTiles.values()) {
-      if (t.level === 0) fineEditTilesL0++;
       if (t.dirty) dirty++;
     }
     for (const t of this.splatTiles.values()) {
       if (t.dirty) dirty++;
     }
-    const bytes = resident * BYTES_PER_TILE;
+    const bytesResident = resident * BYTES_PER_TILE;
+    const bytesEdited = edited * BYTES_PER_TILE;
     return {
       tiles: resident,
-      bytes,
+      bytes: bytesResident,
       dirty,
       resident,
-      edited: resident,
-      bytesResident: bytes,
-      bytesEdited: bytes,
+      edited,
+      bytesResident,
+      bytesEdited,
       fineEditTilesL0,
+      maxResidentTiles: this.maxResidentTiles,
+      softCapExceeded: resident > this.maxResidentTiles,
     };
   }
 
@@ -622,42 +773,107 @@ export class SparseTileStore implements TileStore {
       if (tile.dirty) {
         batch.push({ kind: 'height', key: tile.key, bytes: serializeTileToBytes(tile) });
         tile.dirty = false;
+        this.persistedEditKeys.add(tile.key);
       }
     }
     for (const tile of this.splatTiles.values()) {
       if (tile.dirty) {
         batch.push({ kind: 'splat', key: tile.key, bytes: serializeTileToBytes(tile) });
         tile.dirty = false;
+        this.persistedSplatKeys.add(tile.key);
       }
     }
     if (batch.length > 0) {
       await this.persistence.saveBatch(this.worldId, batch);
     }
+    // Once dirty tiles have been flushed to persistence and marked clean, evict excess clean tiles
+    this.evict();
   }
 
-  private evictIfNeeded(): void {
+  /**
+   * Called BEFORE inserting a new tile into resident memory so the resident count stays
+   * within maxResidentTiles when clean tiles are available, and never evicts `excludeKey` or dirty tiles.
+   */
+  private evictBeforeInsert(excludeKey?: TileKey): void {
     const total = this.editTiles.size + this.splatTiles.size;
-    if (total > this.maxResidentTiles) {
-      this.evict();
+    if (total >= this.maxResidentTiles) {
+      this.evictToTarget(this.maxResidentTiles - 1, excludeKey);
     }
   }
 
-  evict(): void {
-    const total = this.editTiles.size + this.splatTiles.size;
-    if (total <= this.maxResidentTiles) return;
+  evict(excludeKey?: TileKey): void {
+    this.evictToTarget(this.maxResidentTiles, excludeKey);
+  }
 
-    const candidates: Array<{ map: Map<TileKey, Tile>; key: TileKey; lastUsed: number }> = [];
+  private evictToTarget(targetMax: number, excludeKey?: TileKey): void {
+    const total = this.editTiles.size + this.splatTiles.size;
+    if (total <= targetMax) return;
+
+    const candidates: Array<{
+      kind: TileKind;
+      map: Map<TileKey, Tile>;
+      persistedSet: Set<TileKey>;
+      key: TileKey;
+      tile: Tile;
+      lastUsed: number;
+    }> = [];
+
     for (const [k, t] of this.editTiles.entries()) {
-      if (!t.dirty) candidates.push({ map: this.editTiles, key: k, lastUsed: t.lastUsed });
+      if (!t.dirty && k !== excludeKey) {
+        candidates.push({
+          kind: 'height',
+          map: this.editTiles,
+          persistedSet: this.persistedEditKeys,
+          key: k,
+          tile: t,
+          lastUsed: t.lastUsed,
+        });
+      }
     }
     for (const [k, t] of this.splatTiles.entries()) {
-      if (!t.dirty) candidates.push({ map: this.splatTiles, key: k, lastUsed: t.lastUsed });
+      if (!t.dirty && k !== excludeKey) {
+        candidates.push({
+          kind: 'splat',
+          map: this.splatTiles,
+          persistedSet: this.persistedSplatKeys,
+          key: k,
+          tile: t,
+          lastUsed: t.lastUsed,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      // Soft-cap overflow: all resident tiles are dirty; keep them in memory without data loss
+      return;
     }
 
     candidates.sort((a, b) => a.lastUsed - b.lastUsed);
-    const toRemove = Math.min(candidates.length, total - this.maxResidentTiles);
+    const toRemove = Math.min(candidates.length, total - Math.max(0, targetMax));
+    const syncSaveBatch: { kind: TileKind; key: TileKey; bytes: Uint8Array }[] = [];
+
     for (let i = 0; i < toRemove; i++) {
-      candidates[i].map.delete(candidates[i].key);
+      const c = candidates[i];
+      if (
+        !c.persistedSet.has(c.key) &&
+        (c.tile.scale !== 0 || c.tile.min !== 0)
+      ) {
+        syncSaveBatch.push({
+          kind: c.kind,
+          key: c.key,
+          bytes: serializeTileToBytes(c.tile),
+        });
+        c.persistedSet.add(c.key);
+      }
+      c.map.delete(c.key);
+    }
+
+    if (syncSaveBatch.length > 0) {
+      if (this.persistence.saveBatchSync) {
+        this.persistence.saveBatchSync(this.worldId, syncSaveBatch);
+      } else {
+        void this.persistence.saveBatch(this.worldId, syncSaveBatch);
+      }
     }
   }
 

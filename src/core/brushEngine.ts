@@ -295,21 +295,31 @@ export class MultiResBrushEngine implements BrushEngine {
             const baseH = this.terrainField.sampleBaseHeight(wx, wz);
             const curTotalH = this.terrainField.sampleHeight(wx, wz, level);
 
+            const globalIx = (tx << 8) | lx;
+            const globalIz = (tz << 8) | lz;
+
             const accessor: SampleAccessor = {
               height: curTotalH,
               baseHeight: baseH,
               editDelta: curEditDelta,
               neighborAvg4: () => {
-                const xm = Math.max(0, lx - 1);
-                const xp = Math.min(TILE - 1, lx + 1);
-                const zm = Math.max(0, lz - 1);
-                const zp = Math.min(TILE - 1, lz + 1);
-                const dAvg =
-                  0.25 *
-                  (prevBuf[lz * TILE + xm] +
-                    prevBuf[lz * TILE + xp] +
-                    prevBuf[zm * TILE + lx] +
-                    prevBuf[zp * TILE + lx]);
+                const dXm =
+                  lx > 0
+                    ? prevBuf[lz * TILE + (lx - 1)]
+                    : this.tileStore.read('height', level, globalIx - 1, globalIz);
+                const dXp =
+                  lx < TILE - 1
+                    ? prevBuf[lz * TILE + (lx + 1)]
+                    : this.tileStore.read('height', level, globalIx + 1, globalIz);
+                const dZm =
+                  lz > 0
+                    ? prevBuf[(lz - 1) * TILE + lx]
+                    : this.tileStore.read('height', level, globalIx, globalIz - 1);
+                const dZp =
+                  lz < TILE - 1
+                    ? prevBuf[(lz + 1) * TILE + lx]
+                    : this.tileStore.read('height', level, globalIx, globalIz + 1);
+                const dAvg = 0.25 * (dXm + dXp + dZm + dZp);
                 return curTotalH - curEditDelta + dAvg;
               },
             };
@@ -325,6 +335,7 @@ export class MultiResBrushEngine implements BrushEngine {
         if (modified) {
           const targetTile = this.tileStore.getOrCreate(level, tx, tz, 'height');
           writeFloatTile(targetTile, floatBuf);
+          this.tileStore.markTileDirty(targetTile);
           this.tileStore.compactIfZero(level, tx, tz, 'height');
         }
       }
@@ -401,6 +412,7 @@ export class MultiResBrushEngine implements BrushEngine {
         if (modified) {
           const tile = this.tileStore.getOrCreate(splatLevel, tx, tz, 'splat');
           writeFloatTile(tile, floatBuf);
+          this.tileStore.markTileDirty(tile);
         }
       }
     }
@@ -481,7 +493,7 @@ export class MultiResBrushEngine implements BrushEngine {
         tile.min = snap.beforeMin;
         tile.scale = snap.beforeScale;
         tile.data.set(snap.beforeData);
-        tile.dirty = true;
+        this.tileStore.markTileDirty(tile);
       }
     }
 
@@ -503,7 +515,7 @@ export class MultiResBrushEngine implements BrushEngine {
         tile.min = snap.afterMin;
         tile.scale = snap.afterScale;
         tile.data.set(snap.afterData);
-        tile.dirty = true;
+        this.tileStore.markTileDirty(tile);
       }
     }
 

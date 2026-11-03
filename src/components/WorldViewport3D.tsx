@@ -37,7 +37,7 @@ import {
   disposeObject3DTree,
 } from '../world/surfaceEcosystem3D';
 import { buildJunctionContinuumGroup } from '../world/junctionBridges3D';
-import { ActiveTabId } from './BottomControlDock';
+import { ActiveTabId, computeSunDirection } from './BottomControlDock';
 import type { TerrainV3EngineBundle } from '../core/terrainV3Controller';
 import { v3HudStore } from './TerrainV3HudAndPanels';
 
@@ -173,6 +173,7 @@ interface WorldViewport3DProps {
   snowCoverageIntensity?: number;
   snowAltitudeMeters?: number;
   lavaLevelMeters?: number;
+  lavaEmissiveIntensity?: number;
   triplanarSharpness?: number;
   glbExportTrigger?: number;
   onGlbExportComplete?: (ok: boolean, message: string) => void;
@@ -946,6 +947,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   snowCoverageIntensity = 0.85,
   snowAltitudeMeters = 28.0,
   lavaLevelMeters = 2.5,
+  lavaEmissiveIntensity = 2.2,
   triplanarSharpness = 6.0,
   glbExportTrigger = 0,
   onGlbExportComplete,
@@ -1001,29 +1003,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onHoverCoordsChange,
     onScaleMetricsChange,
   });
-  useEffect(() => {
-    latestPropsRef.current = {
-      activeTab,
-      brushRadius,
-      placementRotationDeg,
-      placementScale,
-      selectedObjectId,
-      placedObjects,
-      microStrokes,
-      heightMap,
-      biomeId,
-      autoJunctionBlend,
-      v3Engine,
-      v3Enabled,
-      onTerrainStrokeStart,
-      onTerrainStroke,
-      onTerrainStrokeEnd,
-      onPlacePrefabAt,
-      onSelectObject,
-      onHoverCoordsChange,
-      onScaleMetricsChange,
-    };
-  });
+  latestPropsRef.current = {
+    activeTab,
+    brushRadius,
+    placementRotationDeg,
+    placementScale,
+    selectedObjectId,
+    placedObjects,
+    microStrokes,
+    heightMap,
+    biomeId,
+    autoJunctionBlend,
+    v3Engine,
+    v3Enabled,
+    onTerrainStrokeStart,
+    onTerrainStroke,
+    onTerrainStrokeEnd,
+    onPlacePrefabAt,
+    onSelectObject,
+    onHoverCoordsChange,
+    onScaleMetricsChange,
+  };
 
   const clearJunctionDebounceTimer = () => {
     if (junctionDebounceTimerRef.current !== null) {
@@ -2497,11 +2497,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       ? handles.envController.getTerrainMaterial()
       : handles.standardTerrainMat;
 
+    const sunDir = computeSunDirection(timeOfDay);
     handles.envController.setShaderParameters({
       snowIntensity: snowCoverageIntensity,
       snowAltitude: snowAltitudeMeters,
       lavaLevel: lavaLevelMeters,
+      lavaEmissiveIntensity,
       triplanarSharpness,
+      sunDirection: new THREE.Vector3(sunDir.x, sunDir.y, sunDir.z),
     });
   }, [
     gpuShaderEnabled,
@@ -2509,7 +2512,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     snowCoverageIntensity,
     snowAltitudeMeters,
     lavaLevelMeters,
+    lavaEmissiveIntensity,
     triplanarSharpness,
+    timeOfDay,
     biomeId,
     activeWeather,
   ]);

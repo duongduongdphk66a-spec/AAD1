@@ -1,3 +1,4 @@
+import * as THREE from 'three';
 import { createTerrainV3Engine } from '../src/core/terrainV3Controller';
 import { BASE_N, TILE, snapToGrid, spacing } from '../src/core/units';
 import { PlacedObject } from '../src/world/registry';
@@ -85,6 +86,37 @@ function runBenchmark(): void {
       `   Radius ${String(r).padStart(3)} m (L${bEngine.brushEngine.selectLevel(r)}): ${(totalMs / 1000).toFixed(3)} ms/stamp (Total: ${totalMs.toFixed(1)} ms, Resident tiles: ${stats.tiles}, ${(stats.bytes / (1024 * 1024)).toFixed(2)} MB)`
     );
     bEngine.dispose();
+  }
+
+  // 4. Clipmap Toroidal Strip Update across Camera Speeds (1.2 m/s, 6 m/s, 30 m/s, 4.5 km teleport)
+  console.log('\n4. Clipmap Toroidal Strip Update (300 frames per speed):');
+  console.log('   Camera Speed | Avg (ms) | p95 (ms) | Frames > 16.6 ms');
+  console.log('   -------------+----------+----------+-----------------');
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(60, 16 / 9, 0.1, 20000);
+  const clipmap = engine.attachClipmap(scene);
+  clipmap.update(camera);
+  clipmap.flushPendingCompositions();
+
+  for (const speed of [1.2, 6, 30]) {
+    const step = speed / 60;
+    const frameTimes: number[] = [];
+    let overBudget = 0;
+    for (let f = 0; f < 300; f++) {
+      camera.position.x += step;
+      camera.position.z += step * 0.5;
+      const f0 = performance.now();
+      clipmap.update(camera);
+      const dt = performance.now() - f0;
+      frameTimes.push(dt);
+      if (dt > 16.6) overBudget++;
+    }
+    frameTimes.sort((a, b) => a - b);
+    const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+    const p95 = frameTimes[Math.floor(frameTimes.length * 0.95)];
+    console.log(
+      `   ${ `${speed} m/s`.padStart(12) } | ${avg.toFixed(2).padStart(8)} | ${p95.toFixed(2).padStart(8)} | ${`${overBudget}/300`.padStart(16)}`
+    );
   }
 
   engine.dispose();

@@ -1,3 +1,5 @@
+import { ComposeWorkerPool, WorkerComposeResult } from './clipmapWorker';
+import { DetailParams } from './detailGenerator';
 import { Stamp } from './stampSystem';
 import { Level, Rect } from './units';
 
@@ -54,11 +56,12 @@ export interface ScheduledJob {
 }
 
 /**
- * Priority-based frame scheduler with epoch cancellation, dirty rect coalescing,
- * and strict main-thread budget enforcement (default 3.0 ms per tick).
+ * Priority-based frame scheduler with background Worker pool (`ComposeWorkerPool`),
+ * epoch cancellation, dirty rect coalescing, and strict main-thread budget enforcement (default 2.2 ms).
  */
 export class Scheduler {
   private epochCounter = 1;
+  public readonly workerPool: ComposeWorkerPool;
   private readonly queues: Record<JobPriority, ScheduledJob[]> = {
     1: [], // Active brush stroke window (L = L*)
     2: [], // Inner clipmap rings (L0..L2)
@@ -66,13 +69,59 @@ export class Scheduler {
     4: [], // Autosave & background CSG
   };
 
+  constructor(enableWorker = true) {
+    this.workerPool = enableWorker ? new ComposeWorkerPool() : (null as unknown as ComposeWorkerPool);
+  }
+
   get currentEpoch(): number {
     return this.epochCounter;
   }
 
   bumpEpoch(): number {
     this.epochCounter++;
+    if (this.workerPool) {
+      this.workerPool.cancelBeforeEpoch(this.epochCounter);
+    }
     return this.epochCounter;
+  }
+
+  syncWorkerTerrainState(
+    baseMap: Float32Array,
+    params?: DetailParams,
+    detailEnabled = true
+  ): void {
+    if (this.workerPool) {
+      this.workerPool.syncState(baseMap, params, detailEnabled);
+    }
+  }
+
+  dispatchWorkerCompose(
+    level: Level,
+    originX: number,
+    originZ: number,
+    w: number,
+    h: number,
+    onComplete: (res: WorkerComposeResult) => void
+  ): boolean {
+    if (!this.workerPool || !this.workerPool.isAvailable()) {
+      return false;
+    }
+    const reqEpoch = this.epochCounter;
+    const id = this.workerPool.requestComposeWindow(
+      reqEpoch,
+      level,
+      originX,
+      originZ,
+      w,
+      h,
+      (res) => {
+        if (res.epoch < this.epochCounter) {
+          return; // Stale epoch discarded
+        }
+        onComplete(res);
+      }
+    );
+    return id !== -1;
   }
 
   enqueue(job: ScheduledJob): void {
@@ -107,7 +156,8 @@ export class Scheduler {
       this.queues[1].length +
       this.queues[2].length +
       this.queues[3].length +
-      this.queues[4].length
+      this.queues[4].length +
+      (this.workerPool ? this.workerPool.pendingCount() : 0)
     );
   }
 
@@ -119,10 +169,10 @@ export class Scheduler {
   }
 
   /**
-   * Executes queued jobs in priority order (1 -> 4) within budgetMs (default 3 ms),
+   * Executes queued jobs in priority order (1 -> 4) within budgetMs (default 2.2 ms),
    * automatically discarding stale jobs whose epoch < minValidEpoch.
    */
-  tick(budgetMs = 3, minValidEpoch = 0): number {
+  tick(budgetMs = 2.2, minValidEpoch = 0): number {
     const start = performance.now();
     let executed = 0;
 
@@ -143,4 +193,12 @@ export class Scheduler {
 
     return executed;
   }
+
+  dispose(): void {
+    this.clear();
+    if (this.workerPool) {
+      this.workerPool.dispose();
+    }
+  }
 }
+

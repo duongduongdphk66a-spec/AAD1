@@ -159,16 +159,60 @@ interface BottomControlDockProps {
   onImportWorldJson?: (file: File) => void;
   onExportWorldGlb?: () => void;
   onRunHydraulicErosion?: () => void;
+  isEroding?: boolean;
   gpuShaderEnabled?: boolean;
   onToggleGpuShader?: () => void;
   gpuWeatherPreset?: WeatherPresetType | 'auto';
   onChangeGpuWeatherPreset?: (preset: WeatherPresetType | 'auto') => void;
   snowCoverageIntensity?: number;
   onChangeSnowCoverageIntensity?: (val: number) => void;
+  snowAltitudeMeters?: number;
+  onChangeSnowAltitudeMeters?: (val: number) => void;
   lavaLevelMeters?: number;
   onChangeLavaLevelMeters?: (val: number) => void;
+  lavaEmissiveIntensity?: number;
+  onChangeLavaEmissiveIntensity?: (val: number) => void;
   triplanarSharpness?: number;
   onChangeTriplanarSharpness?: (val: number) => void;
+}
+
+export interface ShaderControlState {
+  weatherPreset: WeatherPresetType;
+  timeOfDay: number; // [0, 24]
+  snowAltitude: number;
+  snowIntensity: number;
+  lavaLevel: number;
+  lavaEmissiveIntensity: number;
+  brushRadius: number;
+  brushStrength: number;
+}
+
+/**
+ * Computes unit 3D solar direction vector l_sun(t_hour) in spherical coordinates
+ * from solar hour angle omega = (pi / 12) * (t_hour - 12), latitude Phi, and declination delta.
+ */
+export function computeSunDirection(
+  timeOfDay: number,
+  latitudeRad = 0.42,
+  declinationRad = 0.2
+): { x: number; y: number; z: number } {
+  const hourAngle = (Math.PI / 12) * (timeOfDay - 12);
+  const cosZenith =
+    Math.sin(latitudeRad) * Math.sin(declinationRad) +
+    Math.cos(latitudeRad) * Math.cos(declinationRad) * Math.cos(hourAngle);
+
+  const sx = -Math.cos(declinationRad) * Math.sin(hourAngle);
+  const sy = Math.max(cosZenith, 0.08);
+  const sz =
+    Math.sin(declinationRad) * Math.cos(latitudeRad) -
+    Math.cos(declinationRad) * Math.sin(latitudeRad) * Math.cos(hourAngle);
+
+  const len = Math.hypot(sx, sy, sz) || 1;
+  return {
+    x: sx / len,
+    y: sy / len,
+    z: sz / len,
+  };
 }
 
 const SCULPT_TOOLS: Array<{ id: SculptToolId; name: string }> = [
@@ -297,14 +341,19 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
   onImportWorldJson,
   onExportWorldGlb,
   onRunHydraulicErosion,
+  isEroding = false,
   gpuShaderEnabled = false,
   onToggleGpuShader,
   gpuWeatherPreset = 'auto',
   onChangeGpuWeatherPreset,
   snowCoverageIntensity = 0.85,
   onChangeSnowCoverageIntensity,
+  snowAltitudeMeters = 28.0,
+  onChangeSnowAltitudeMeters,
   lavaLevelMeters = 2.5,
   onChangeLavaLevelMeters,
+  lavaEmissiveIntensity = 2.2,
+  onChangeLavaEmissiveIntensity,
   triplanarSharpness = 6.0,
   onChangeTriplanarSharpness,
 }) => {
@@ -617,12 +666,13 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                 <button
                   type="button"
                   onClick={onRunHydraulicErosion}
+                  disabled={isEroding}
                   data-testid="run-hydraulic-erosion-btn"
-                  title="Mô phỏng Xói Mòn Thủy Lực theo hạt (Web Worker)"
-                  className="px-2 py-0.5 rounded-lg bg-cyan-950/70 hover:bg-cyan-900/80 border border-cyan-500/40 text-cyan-200 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                  title="Mô phỏng Xói Mòn Thủy Lực Đa Luồng (Parallel Halo-Blended Worker Pool)"
+                  className="px-2 py-0.5 rounded-lg bg-cyan-950/70 hover:bg-cyan-900/80 disabled:opacity-50 border border-cyan-500/40 text-cyan-200 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer"
                 >
                   <Sparkles className="w-3 h-3 text-cyan-300" />
-                  Xói Mòn
+                  {isEroding ? 'Đang Xói Mòn...' : 'Xói Mòn'}
                 </button>
               )}
               <button
@@ -1500,6 +1550,24 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Cao tuyết:</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={80}
+                    step={1}
+                    value={snowAltitudeMeters}
+                    onChange={(e) => onChangeSnowAltitudeMeters?.(Number(e.target.value))}
+                    aria-label="Độ cao tuyết GLSL"
+                    data-testid="gpu-snow-altitude-slider"
+                    className="w-12 h-1 accent-sky-400 cursor-pointer"
+                  />
+                  <span className="font-mono text-sky-200 tabular-nums">
+                    {Math.round(snowAltitudeMeters)}m
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
                   <span className="text-slate-400">Tuyết:</span>
                   <input
                     type="range"
@@ -1532,6 +1600,24 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                   />
                   <span className="font-mono text-orange-300 tabular-nums">
                     {lavaLevelMeters}m
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-slate-400">Bức xạ:</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={5}
+                    step={0.1}
+                    value={lavaEmissiveIntensity}
+                    onChange={(e) => onChangeLavaEmissiveIntensity?.(Number(e.target.value))}
+                    aria-label="Phát xạ nhiệt dung nham GLSL"
+                    data-testid="gpu-lava-emissive-slider"
+                    className="w-12 h-1 accent-red-500 cursor-pointer"
+                  />
+                  <span className="font-mono text-red-300 tabular-nums">
+                    {lavaEmissiveIntensity.toFixed(1)}
                   </span>
                 </div>
 

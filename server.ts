@@ -45,12 +45,21 @@ app.get('/healthz', (_req, res) => {
   res.status(200).json({ status: 'ok', mode: isProd ? 'production' : 'development' });
 });
 
-// Lightweight in-memory rate limiter per IP (max 20 requests / minute) with periodic eviction
+// Lightweight in-memory rate limiter & byte quota per IP (max 20 requests or 25 MB / minute) with periodic eviction
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 20;
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_MAX_BYTES = 25 * 1024 * 1024;
+const rateLimitMap = new Map<string, { count: number; bytes: number; resetAt: number }>();
 
-function checkRateLimit(ip: string): boolean {
+export interface ApiQuotaResult {
+  allowed: boolean;
+  remainingRequests: number;
+  remainingBytes: number;
+  resetAt: number;
+  reason?: 'rate_limit' | 'byte_quota';
+}
+
+export function checkApiQuota(ip: string, payloadBytes = 0): ApiQuotaResult {
   const now = Date.now();
   if (rateLimitMap.size > 500) {
     for (const [key, val] of rateLimitMap.entries()) {
@@ -59,14 +68,76 @@ function checkRateLimit(ip: string): boolean {
       }
     }
   }
+  const safeBytes = Math.max(0, Math.floor(payloadBytes));
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    const resetAt = now + RATE_LIMIT_WINDOW_MS;
+    if (safeBytes > RATE_LIMIT_MAX_BYTES) {
+      return {
+        allowed: false,
+        remainingRequests: RATE_LIMIT_MAX_REQUESTS,
+        remainingBytes: 0,
+        resetAt,
+        reason: 'byte_quota',
+      };
+    }
+    rateLimitMap.set(ip, { count: 1, bytes: safeBytes, resetAt });
+    return {
+      allowed: true,
+      remainingRequests: RATE_LIMIT_MAX_REQUESTS - 1,
+      remainingBytes: RATE_LIMIT_MAX_BYTES - safeBytes,
+      resetAt,
+    };
+  }
+  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return {
+      allowed: false,
+      remainingRequests: 0,
+      remainingBytes: Math.max(0, RATE_LIMIT_MAX_BYTES - entry.bytes),
+      resetAt: entry.resetAt,
+      reason: 'rate_limit',
+    };
+  }
+  if (entry.bytes + safeBytes > RATE_LIMIT_MAX_BYTES) {
+    return {
+      allowed: false,
+      remainingRequests: Math.max(0, RATE_LIMIT_MAX_REQUESTS - entry.count),
+      remainingBytes: Math.max(0, RATE_LIMIT_MAX_BYTES - entry.bytes),
+      resetAt: entry.resetAt,
+      reason: 'byte_quota',
+    };
+  }
+  entry.count += 1;
+  entry.bytes += safeBytes;
+  return {
+    allowed: true,
+    remainingRequests: RATE_LIMIT_MAX_REQUESTS - entry.count,
+    remainingBytes: RATE_LIMIT_MAX_BYTES - entry.bytes,
+    resetAt: entry.resetAt,
+  };
+}
+
+export function resetRateLimitsForTest(): void {
+  rateLimitMap.clear();
+}
+
+export function verifyApiAuth(
+  headers: Record<string, string | string[] | undefined>,
+  configuredToken = process.env.API_AUTH_TOKEN
+): boolean {
+  const token = configuredToken?.trim();
+  if (!token) {
+    // When API_AUTH_TOKEN is not configured, public preview requests are allowed
     return true;
   }
-  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) return false;
-  entry.count += 1;
-  return true;
+  const authHeader = String(headers['authorization'] || '').trim();
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer === token) return true;
+  }
+  const apiKeyHeader = String(headers['x-api-key'] || '').trim();
+  if (apiKeyHeader === token) return true;
+  return false;
 }
 
 const cleanupTimer = setInterval(() => {
@@ -140,13 +211,27 @@ function getGeminiClient(): GoogleGenAI | null {
 
 app.post('/api/reconstruct', async (req, res) => {
   try {
-    const clientIp = req.ip || 'local';
-    if (!checkRateLimit(clientIp)) {
-      res.status(429).json({ error: 'Quá nhiều yêu cầu phân tích AI. Vui lòng thử lại sau 1 phút.' });
+    if (!verifyApiAuth(req.headers)) {
+      res.status(401).json({ error: 'Yêu cầu thiếu hoặc sai khóa xác thực API (API_AUTH_TOKEN).' });
       return;
     }
 
     const { imageBase64, mimeType, mode = 'both', clientMetrics } = req.body || {};
+    const payloadBytes = typeof imageBase64 === 'string' ? imageBase64.length : 0;
+
+    const clientIp = req.ip || 'local';
+    const quota = checkApiQuota(clientIp, payloadBytes);
+    res.setHeader('X-RateLimit-Remaining', String(quota.remainingRequests));
+    res.setHeader('X-RateLimit-Reset', String(Math.ceil(quota.resetAt / 1000)));
+    if (!quota.allowed) {
+      res.status(429).json({
+        error:
+          quota.reason === 'byte_quota'
+            ? 'Đã vượt hạn mức băng thông phân tích AI trong 1 phút (tối đa 25MB/phút).'
+            : 'Quá nhiều yêu cầu phân tích AI. Vui lòng thử lại sau 1 phút.',
+      });
+      return;
+    }
 
     if (!imageBase64 || typeof imageBase64 !== 'string') {
       res.status(400).json({ error: 'Thiếu dữ liệu ảnh đầu vào (imageBase64).' });

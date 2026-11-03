@@ -1643,3 +1643,77 @@ test('sub-cell 15m brush sculpting raises 3D terrain elevation inside a 62.5m gr
   assert.ok(overrideRes.spawnedObject !== null);
   assert.equal(overrideRes.spawnedObject?.prefabId, 'sakura_shrine');
 });
+
+test('20-biome Mahalanobis + Shannon entropy classifier (analyzeAndClassifyImage) and ParallelErosionPool with Radial LUT operate accurately', async () => {
+  assert.equal(
+    generationMod.BIOME_SIGNATURES.length,
+    20,
+    'BIOME_SIGNATURES must contain all 20 biomes'
+  );
+
+  // 1. High red/orange lava image -> classifies to corot_lava_ocean or natlan_volcano_abyss / mars_olympus
+  const w = 16;
+  const h = 16;
+  const lavaRgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    lavaRgba[i * 4] = 220;
+    lavaRgba[i * 4 + 1] = 45 + (i % 15);
+    lavaRgba[i * 4 + 2] = 12;
+    lavaRgba[i * 4 + 3] = 255;
+  }
+  const lavaOut = generationMod.analyzeAndClassifyImage(lavaRgba, w, h);
+  assert.ok(
+    ['corot_lava_ocean', 'natlan_volcano_abyss', 'mars_olympus'].includes(
+      lavaOut.bestMatch.biomeId
+    ),
+    `Expected lava image to match volcanic biome, got ${lavaOut.bestMatch.biomeId}`
+  );
+  assert.ok(lavaOut.confidence > 0 && lavaOut.confidence <= 1);
+  assert.equal(lavaOut.topCandidates.length, 4);
+  assert.equal(lavaOut.featureVector.length, 6);
+  assert.equal(lavaOut.heightmap.length, w * h);
+
+  // 2. High white/blue snow image -> classifies to snowpeak_glacier or celestia_sky_isles
+  const snowRgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    snowRgba[i * 4] = 225;
+    snowRgba[i * 4 + 1] = 235;
+    snowRgba[i * 4 + 2] = 248;
+    snowRgba[i * 4 + 3] = 255;
+  }
+  const snowOut = generationMod.analyzeAndClassifyImage(snowRgba, w, h);
+  assert.ok(
+    ['snowpeak_glacier', 'celestia_sky_isles', 'europa_chaos_ridge'].includes(
+      snowOut.bestMatch.biomeId
+    ),
+    `Expected snow image to match snowy/ice biome, got ${snowOut.bestMatch.biomeId}`
+  );
+
+  // 3. Precomputed Radial Brush LUT weights sum to 1.0
+  const lut = generationMod.buildErosionBrushLUT(32, 3);
+  assert.ok(lut.IndexOffsets.length > 0);
+  assert.equal(lut.IndexOffsets.length, lut.Weights.length);
+  const weightSum = lut.Weights.reduce((acc, val) => acc + val, 0);
+  assert.ok(
+    Math.abs(weightSum - 1.0) < 1e-5,
+    `Expected radial LUT weights to sum to 1.0, got ${weightSum}`
+  );
+
+  // 4. ParallelErosionPool executes multi-strip halo-blended erosion cleanly
+  const testMap = new Float32Array(32 * 32);
+  for (let y = 0; y < 32; y++) {
+    for (let x = 0; x < 32; x++) {
+      testMap[y * 32 + x] = 50 - Math.hypot(x - 16, y - 16) * 2;
+    }
+  }
+  const pool = new generationMod.ParallelErosionPool(2, 4);
+  const erodedMap = await pool.executeParallelErosion(testMap, 32, 32, 400);
+  assert.equal(erodedMap.length, 32 * 32);
+  let diffSum = 0;
+  for (let i = 0; i < testMap.length; i++) {
+    assert.ok(Number.isFinite(erodedMap[i]));
+    diffSum += Math.abs(erodedMap[i] - testMap[i]);
+  }
+  assert.ok(diffSum > 0, 'ParallelErosionPool must modify heightmap elevations');
+});
+

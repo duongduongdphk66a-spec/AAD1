@@ -29,6 +29,7 @@ import {
   WEATHER_CATALOG,
   WORLD_SIZE,
   WeatherId,
+  WeatherPresetType,
   generateInitialSurfaceShowcaseStrokes,
   getTextureIndex,
 } from './registry';
@@ -1836,5 +1837,529 @@ export function reconstructTerrainFromRGBA(
 
   return { heightmap, detectedBiomeId, roughnessScore };
 }
+
+export interface BiomeSignature {
+  biomeId: BiomeId;
+  label: string;
+  centroid: [number, number, number, number, number, number]; // [R, G, B, Saturation, Gradient, Entropy]
+  recommendedPrefabs: PrefabId[];
+  defaultWeather: WeatherPresetType;
+}
+
+// Danh mục đầy đủ 20 quần xã từ src/world/registry/biomes/ và prefabs từ src/world/registry/prefabs/
+export const BIOME_SIGNATURES: BiomeSignature[] = [
+  {
+    biomeId: 'amazon_congo_rainforest',
+    label: 'Amazon & Congo Rainforest',
+    centroid: [0.18, 0.48, 0.2, 0.62, 0.45, 0.78],
+    recommendedPrefabs: ['amazon_congo_canopy_tree', 'ancient_bridge'],
+    defaultWeather: 'methane_rain',
+  },
+  {
+    biomeId: 'boreal_taiga_forest',
+    label: 'Boreal Taiga Forest',
+    centroid: [0.22, 0.36, 0.28, 0.38, 0.4, 0.72],
+    recommendedPrefabs: ['taiga_spruce_grove', 'emerald_pine'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'celestia_sky_isles',
+    label: 'Celestia Sky Isles',
+    centroid: [0.78, 0.84, 0.95, 0.25, 0.3, 0.6],
+    recommendedPrefabs: ['floating_sky_island', 'statue_of_seven', 'aether_crystal'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'corot_lava_ocean',
+    label: 'CoRoT-7b Lava Ocean',
+    centroid: [0.85, 0.22, 0.05, 0.92, 0.55, 0.75],
+    recommendedPrefabs: ['active_volcano', 'volcanic_peak'],
+    defaultWeather: 'volcanic_ash',
+  },
+  {
+    biomeId: 'europa_chaos_ridge',
+    label: 'Europa Chaos Ridge',
+    centroid: [0.62, 0.78, 0.88, 0.32, 0.68, 0.84],
+    recommendedPrefabs: ['europa_penitentes_spire', 'sheer_cliff_wall'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'hawaii_shield_volcano',
+    label: 'Hawaii Shield Volcano',
+    centroid: [0.35, 0.28, 0.24, 0.35, 0.38, 0.65],
+    recommendedPrefabs: ['hawaii_kilauea_shield', 'island_volcano_icon'],
+    defaultWeather: 'volcanic_ash',
+  },
+  {
+    biomeId: 'himalaya_alps_andes',
+    label: 'Himalaya, Alps & Andes',
+    centroid: [0.58, 0.62, 0.68, 0.18, 0.82, 0.88],
+    recommendedPrefabs: ['himalaya_matterhorn_peak', 'himalaya_fishtail_peak', 'sheer_cliff_wall'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'inazuma_sakura',
+    label: 'Inazuma Sakura Realm',
+    centroid: [0.76, 0.48, 0.68, 0.52, 0.42, 0.74],
+    recommendedPrefabs: ['sakura_tree', 'sakura_shrine', 'statue_of_seven'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'kepler_crystalline',
+    label: 'Kepler Crystalline Exoworld',
+    centroid: [0.3, 0.75, 0.85, 0.7, 0.65, 0.8],
+    recommendedPrefabs: ['exoplanet_crystal_spire', 'aether_crystal'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'liyue_amber',
+    label: 'Liyue Amber Karst',
+    centroid: [0.72, 0.56, 0.28, 0.64, 0.62, 0.82],
+    recommendedPrefabs: ['karst_mountain', 'ancient_bridge', 'statue_of_seven'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'mars_olympus',
+    label: 'Mars Olympus Mons',
+    centroid: [0.74, 0.36, 0.2, 0.72, 0.35, 0.58],
+    recommendedPrefabs: ['mars_olympus_shield', 'meteor_impact_crater'],
+    defaultWeather: 'volcanic_ash',
+  },
+  {
+    biomeId: 'mondstadt_meadow',
+    label: 'Mondstadt Wind Meadow',
+    centroid: [0.38, 0.68, 0.34, 0.55, 0.25, 0.55],
+    recommendedPrefabs: ['windmill_cottage', 'statue_of_seven', 'emerald_pine'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'natlan_volcano_abyss',
+    label: 'Natlan Volcano & Abyss',
+    centroid: [0.68, 0.18, 0.22, 0.82, 0.74, 0.86],
+    recommendedPrefabs: ['abyss_chasm_vortex', 'active_volcano', 'volcanic_peak'],
+    defaultWeather: 'volcanic_ash',
+  },
+  {
+    biomeId: 'paldea_coast',
+    label: 'Paldea Coastal Peninsula',
+    centroid: [0.42, 0.66, 0.58, 0.48, 0.32, 0.66],
+    recommendedPrefabs: ['pokemon_center', 'pokemon_gym_stadium', 'berry_apricorn_tree'],
+    defaultWeather: 'sakura_petals',
+  },
+  {
+    biomeId: 'pluto_cryovolcano',
+    label: 'Pluto Cryovolcano Wright Mons',
+    centroid: [0.48, 0.54, 0.64, 0.22, 0.52, 0.7],
+    recommendedPrefabs: ['pluto_cryo_volcano', 'meteor_impact_crater'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'sahara_atacama_gobi',
+    label: 'Sahara, Atacama & Gobi Desert',
+    centroid: [0.82, 0.68, 0.42, 0.52, 0.22, 0.48],
+    recommendedPrefabs: ['sahara_atacama_oasis'],
+    defaultWeather: 'volcanic_ash',
+  },
+  {
+    biomeId: 'snowpeak_glacier',
+    label: 'Snowpeak Glacier',
+    centroid: [0.86, 0.9, 0.96, 0.1, 0.46, 0.62],
+    recommendedPrefabs: ['himalaya_fishtail_peak', 'emerald_pine'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'titan_methane_sea',
+    label: 'Titan Kraken Methane Sea',
+    centroid: [0.66, 0.5, 0.22, 0.68, 0.28, 0.54],
+    recommendedPrefabs: ['titan_methane_geyser', 'titan_mithrim_montes'],
+    defaultWeather: 'methane_rain',
+  },
+  {
+    biomeId: 'trappist_tidally_locked',
+    label: 'TRAPPIST-1e Terminator Zone',
+    centroid: [0.45, 0.32, 0.52, 0.44, 0.58, 0.76],
+    recommendedPrefabs: ['exoplanet_crystal_spire', 'meteor_impact_crater'],
+    defaultWeather: 'snowstorm',
+  },
+  {
+    biomeId: 'venus_ishtar',
+    label: 'Venus Ishtar Terra',
+    centroid: [0.78, 0.58, 0.18, 0.78, 0.48, 0.68],
+    recommendedPrefabs: ['venus_pancake_dome', 'volcanic_peak'],
+    defaultWeather: 'volcanic_ash',
+  },
+];
+
+export interface BiomeClassificationOutput {
+  bestMatch: BiomeSignature;
+  confidence: number;
+  topCandidates: Array<{ signature: BiomeSignature; probability: number }>;
+  featureVector: [number, number, number, number, number, number];
+  heightmap: Float32Array;
+}
+
+const FEATURE_WEIGHTS = [1.4, 1.4, 1.4, 1.1, 1.8, 1.3];
+
+/**
+ * Classifies an RGBA image across all 20 biomes using 6D weighted Mahalanobis distance
+ * on [meanR, meanG, meanB, meanSaturation, normalizedSobelGradient, normalizedShannonEntropy]
+ * with temperature-scaled Softmax probabilities (tau = 0.18).
+ */
+export function analyzeAndClassifyImage(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  heightScale = 65.0
+): BiomeClassificationOutput {
+  const N = Math.max(1, width * height);
+  const lum = new Float32Array(N);
+  const grad = new Float32Array(N);
+  const heightmap = new Float32Array(N);
+  const hist = new Uint32Array(32);
+
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  let sumSat = 0;
+  let lMin = Infinity;
+  let lMax = -Infinity;
+
+  for (let i = 0; i < N; i++) {
+    const r = (rgba[i * 4] ?? 0) / 255;
+    const g = (rgba[i * 4 + 1] ?? 0) / 255;
+    const b = (rgba[i * 4 + 2] ?? 0) / 255;
+
+    sumR += r;
+    sumG += g;
+    sumB += b;
+
+    const cMax = Math.max(r, g, b);
+    const cMin = Math.min(r, g, b);
+    sumSat += cMax === 0 ? 0 : (cMax - cMin) / cMax;
+
+    const l = 0.299 * r + 0.587 * g + 0.114 * b;
+    lum[i] = l;
+    if (l < lMin) lMin = l;
+    if (l > lMax) lMax = l;
+
+    const bin = Math.min(31, Math.floor(l * 32));
+    hist[bin]++;
+  }
+
+  let entropy = 0;
+  const invLog32 = 1 / Math.log2(32);
+  for (let k = 0; k < 32; k++) {
+    if (hist[k] > 0) {
+      const p = hist[k] / N;
+      entropy -= p * Math.log2(p) * invLog32;
+    }
+  }
+
+  let sumGrad = 0;
+  let maxGrad = 1e-5;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const gx =
+        -lum[idx - width - 1] +
+        lum[idx - width + 1] -
+        2 * lum[idx - 1] +
+        2 * lum[idx + 1] -
+        lum[idx + width - 1] +
+        lum[idx + width + 1];
+      const gy =
+        -lum[idx - width - 1] -
+        2 * lum[idx - width] -
+        lum[idx - width + 1] +
+        lum[idx + width - 1] +
+        2 * lum[idx + width] +
+        lum[idx + width + 1];
+      const gMag = Math.hypot(gx, gy);
+      grad[idx] = gMag;
+      sumGrad += gMag;
+      if (gMag > maxGrad) maxGrad = gMag;
+    }
+  }
+
+  const lSpan = Math.max(1e-5, lMax - lMin);
+  for (let i = 0; i < N; i++) {
+    const normL = (lum[i] - lMin) / lSpan;
+    const normG = grad[i] / maxGrad;
+    heightmap[i] = heightScale * (0.72 * normL + 0.28 * normG);
+  }
+
+  const featureVector: [number, number, number, number, number, number] = [
+    sumR / N,
+    sumG / N,
+    sumB / N,
+    sumSat / N,
+    Math.min(1.0, (sumGrad / N) * 1.8),
+    entropy,
+  ];
+
+  const temperature = 0.18;
+  const scored = BIOME_SIGNATURES.map((sig) => {
+    let distSq = 0;
+    for (let m = 0; m < 6; m++) {
+      const diff = featureVector[m] - sig.centroid[m];
+      distSq += FEATURE_WEIGHTS[m] * diff * diff;
+    }
+    const distance = Math.sqrt(distSq);
+    return { signature: sig, distance, expScore: Math.exp(-distance / temperature) };
+  });
+
+  scored.sort((a, b) => a.distance - b.distance);
+  const sumExp = scored.reduce((acc, item) => acc + item.expScore, 0) || 1;
+
+  const topCandidates = scored.slice(0, 4).map((item) => ({
+    signature: item.signature,
+    probability: item.expScore / sumExp,
+  }));
+
+  return {
+    bestMatch: topCandidates[0].signature,
+    confidence: topCandidates[0].probability,
+    topCandidates,
+    featureVector,
+    heightmap,
+  };
+}
+
+export interface PrecomputedBrushLUT {
+  IndexOffsets: Int32Array;
+  Weights: Float32Array;
+}
+
+/**
+ * Precomputes radial erosion brush index offsets and normalized linear falloff weights (sum = 1.0)
+ * for a given map width and brush radius.
+ */
+export function buildErosionBrushLUT(
+  mapWidth: number,
+  radius: number
+): PrecomputedBrushLUT {
+  const offsets: number[] = [];
+  const weights: number[] = [];
+  let weightSum = 0;
+
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const dist = Math.hypot(dx, dy);
+      if (dist < radius) {
+        const w = radius - dist;
+        weightSum += w;
+        offsets.push(dy * mapWidth + dx);
+        weights.push(w);
+      }
+    }
+  }
+
+  const normalizedWeights = new Float32Array(weights.length);
+  const safeSum = weightSum || 1;
+  for (let i = 0; i < weights.length; i++) {
+    normalizedWeights[i] = weights[i] / safeSum;
+  }
+
+  return {
+    IndexOffsets: new Int32Array(offsets),
+    Weights: normalizedWeights,
+  };
+}
+
+/**
+ * Executes particle hydraulic erosion on a horizontal terrain strip using a precomputed radial brush LUT.
+ */
+export function erodeStripWithLUT(
+  stripMap: Float32Array,
+  width: number,
+  stripHeight: number,
+  iterations: number,
+  brushRadius = 3
+): Float32Array {
+  const lut = buildErosionBrushLUT(width, brushRadius);
+  const margin = brushRadius + 2;
+  if (width <= margin * 2 || stripHeight <= margin * 2) {
+    return stripMap;
+  }
+
+  for (let iter = 0; iter < iterations; iter++) {
+    let posX = margin + Math.random() * (width - margin * 2);
+    let posY = margin + Math.random() * (stripHeight - margin * 2);
+    let dirX = 0;
+    let dirY = 0;
+    let speed = 1.0;
+    let water = 1.0;
+    let sediment = 0.0;
+
+    for (let step = 0; step < 30; step++) {
+      const x0 = Math.floor(posX);
+      const y0 = Math.floor(posY);
+      const u = posX - x0;
+      const v = posY - y0;
+      const idx = y0 * width + x0;
+
+      const h00 = stripMap[idx];
+      const h10 = stripMap[idx + 1];
+      const h01 = stripMap[idx + width];
+      const h11 = stripMap[idx + width + 1];
+
+      const gx = (h10 - h00) * (1 - v) + (h11 - h01) * v;
+      const gy = (h01 - h00) * (1 - u) + (h11 - h10) * u;
+      const hCurr =
+        h00 * (1 - u) * (1 - v) +
+        h10 * u * (1 - v) +
+        h01 * (1 - u) * v +
+        h11 * u * v;
+
+      dirX = dirX * 0.05 - gx * 0.95;
+      dirY = dirY * 0.05 - gy * 0.95;
+      const len = Math.hypot(dirX, dirY) || 1;
+      posX += dirX / len;
+      posY += dirY / len;
+
+      if (
+        posX < margin ||
+        posX >= width - margin ||
+        posY < margin ||
+        posY >= stripHeight - margin
+      ) {
+        break;
+      }
+
+      const nx0 = Math.floor(posX);
+      const ny0 = Math.floor(posY);
+      const nu = posX - nx0;
+      const nv = posY - ny0;
+      const nIdx = ny0 * width + nx0;
+
+      const hNext =
+        stripMap[nIdx] * (1 - nu) * (1 - nv) +
+        stripMap[nIdx + 1] * nu * (1 - nv) +
+        stripMap[nIdx + width] * (1 - nu) * nv +
+        stripMap[nIdx + width + 1] * nu * nv;
+
+      const dH = hNext - hCurr;
+      const capacity = Math.max(-dH, 0.01) * speed * water * 4.0;
+
+      if (sediment > capacity || dH > 0) {
+        const dep = dH > 0 ? Math.min(dH, sediment) : (sediment - capacity) * 0.3;
+        sediment -= dep;
+        stripMap[idx] += dep * (1 - u) * (1 - v);
+        stripMap[idx + 1] += dep * u * (1 - v);
+        stripMap[idx + width] += dep * (1 - u) * v;
+        stripMap[idx + width + 1] += dep * u * v;
+      } else {
+        const erodeAmt = Math.min((capacity - sediment) * 0.3, -dH);
+        sediment += erodeAmt;
+        for (let k = 0; k < lut.IndexOffsets.length; k++) {
+          const targetIdx = idx + lut.IndexOffsets[k];
+          if (targetIdx >= 0 && targetIdx < stripMap.length) {
+            stripMap[targetIdx] -= erodeAmt * lut.Weights[k];
+          }
+        }
+      }
+
+      speed = Math.sqrt(Math.max(0, speed * speed - dH * 4.0));
+      water *= 0.99;
+    }
+  }
+
+  return stripMap;
+}
+
+/**
+ * Multi-worker spatial domain decomposition pool with ghost halo blending (`ParallelErosionPool`).
+ */
+export class ParallelErosionPool {
+  private workerCount: number;
+  private haloWidth: number;
+
+  constructor(
+    workerCount = Math.min(
+      4,
+      typeof navigator !== 'undefined' && navigator.hardwareConcurrency
+        ? navigator.hardwareConcurrency
+        : 4
+    ),
+    haloWidth = 16
+  ) {
+    this.workerCount = Math.max(1, workerCount);
+    this.haloWidth = Math.max(2, haloWidth);
+  }
+
+  public async executeParallelErosion(
+    fullMap: Float32Array,
+    width: number,
+    height: number,
+    totalIterations = 80000
+  ): Promise<Float32Array> {
+    const P = this.workerCount;
+    const Lh = this.haloWidth;
+    const rowsPerWorker = Math.floor(height / P);
+    const iterPerWorker = Math.floor(totalIterations / P);
+
+    const tasks = Array.from({ length: P }, (_, p) => {
+      const yStart = p * rowsPerWorker;
+      const yEnd = p === P - 1 ? height : (p + 1) * rowsPerWorker;
+      const extStart = Math.max(0, yStart - Lh);
+      const extEnd = Math.min(height, yEnd + Lh);
+      const extHeight = extEnd - extStart;
+
+      const slice = fullMap.slice(extStart * width, extEnd * width);
+
+      return new Promise<{
+        p: number;
+        yStart: number;
+        yEnd: number;
+        extStart: number;
+        extEnd: number;
+        data: Float32Array;
+      }>((resolve) => {
+        setTimeout(() => {
+          const processed = erodeStripWithLUT(slice, width, extHeight, iterPerWorker, 3);
+          resolve({ p, yStart, yEnd, extStart, extEnd, data: processed });
+        }, 0);
+      });
+    });
+
+    const results = await Promise.all(tasks);
+    const merged = new Float32Array(fullMap.length);
+
+    for (const res of results) {
+      const { yStart, yEnd, extStart, data } = res;
+      for (let y = yStart; y < yEnd; y++) {
+        const localY = y - extStart;
+        const rowOffset = y * width;
+        const localOffset = localY * width;
+        for (let x = 0; x < width; x++) {
+          merged[rowOffset + x] = data[localOffset + x];
+        }
+      }
+    }
+
+    for (let p = 0; p < P - 1; p++) {
+      const upper = results[p];
+      const lower = results[p + 1];
+      const yBoundary = upper.yEnd;
+      const blendStart = Math.max(0, yBoundary - Lh);
+      const blendEnd = Math.min(height, yBoundary + Lh);
+
+      for (let y = blendStart; y < blendEnd; y++) {
+        const alpha = (y - blendStart) / Math.max(1, blendEnd - blendStart);
+        const upperLocalY = y - upper.extStart;
+        const lowerLocalY = y - lower.extStart;
+
+        for (let x = 0; x < width; x++) {
+          const valUpper = upper.data[upperLocalY * width + x];
+          const valLower = lower.data[lowerLocalY * width + x];
+          merged[y * width + x] = (1 - alpha) * valUpper + alpha * valLower;
+        }
+      }
+    }
+
+    return merged;
+  }
+}
+
 
 

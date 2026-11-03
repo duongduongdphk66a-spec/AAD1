@@ -20,6 +20,10 @@ import {
 } from '../world/registry';
 import { getGroundHeightAt } from '../world/sculpting';
 import {
+  analyzeAndClassifyImage,
+  BIOME_SIGNATURES,
+  BiomeClassificationOutput,
+  BiomeSignature,
   reconstructFromRgbaBuffer,
   ReconstructedWorldData,
 } from '../world/generation';
@@ -28,6 +32,9 @@ import {
   SamplePhotoPreset,
   renderSamplePresetToDataUrl,
 } from '../world/samplePhotos';
+
+export { analyzeAndClassifyImage, BIOME_SIGNATURES };
+export type { BiomeClassificationOutput, BiomeSignature };
 
 interface ImageReconstructModalProps {
   isOpen: boolean;
@@ -65,6 +72,8 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     'Hệ thống đã trích xuất bản đồ độ cao 161×161 đỉnh, phân tách vùng nước, sườn cỏ ngọc lục bảo và tự động đặt 9 vật thể 3D khớp với bố cục bức ảnh.'
   );
   const [reconstructed, setReconstructed] = useState<ReconstructedWorldData | null>(null);
+  const [mahalanobisAnalysis, setMahalanobisAnalysis] =
+    useState<BiomeClassificationOutput | null>(null);
 
   const rgbaBufferRef = useRef<{
     rgba: Uint8ClampedArray;
@@ -211,10 +220,13 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     nextBiome: BiomeId | 'auto',
     nextMode: 'both' | 'terrain' | 'object'
   ) => {
+    const classification = analyzeAndClassifyImage(rgba, width, height);
+    setMahalanobisAnalysis(classification);
     const result = reconstructFromRgbaBuffer(rgba, width, height, {
       reliefScale: nextRelief,
       terraceSteps: nextTerrace,
-      overrideBiome: nextBiome === 'auto' ? undefined : nextBiome,
+      overrideBiome:
+        nextBiome === 'auto' ? classification.bestMatch.biomeId : nextBiome,
       mode: nextMode,
     });
     setReconstructed(result);
@@ -943,6 +955,41 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
                     <span className="text-slate-400 block text-[11px]">Vật Thể 3D Phát Hiện</span>
                     <span className="font-mono tabular-nums font-semibold text-pink-400">
                       {reconstructed.detectedObjects.length} mô hình
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {mahalanobisAnalysis && (
+                <div
+                  data-testid="mahalanobis-biome-analysis"
+                  className="pt-2 border-t border-slate-800 flex flex-col gap-1 text-[11px]"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">
+                      Phân loại Mahalanobis 20 quần xã + Entropy Shannon:
+                    </span>
+                    <span className="font-bold text-emerald-400">
+                      {mahalanobisAnalysis.bestMatch.label} (
+                      {(mahalanobisAnalysis.confidence * 100).toFixed(1)}%)
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Prefab đề xuất:</span>
+                    <span className="text-cyan-300 font-mono">
+                      {mahalanobisAnalysis.bestMatch.recommendedPrefabs.join(', ')}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">
+                      Vector đặc trưng [R, G, B, Sat, Grad, Ent]:
+                    </span>
+                    <span className="font-mono text-slate-300">
+                      [
+                      {mahalanobisAnalysis.featureVector
+                        .map((v) => v.toFixed(2))
+                        .join(', ')}
+                      ]
                     </span>
                   </div>
                 </div>

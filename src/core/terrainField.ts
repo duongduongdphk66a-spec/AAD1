@@ -160,46 +160,49 @@ export class UnifiedTerrainField implements TerrainField {
 
   private getTileCached(level: Level, tx: number, tz: number): Tile | undefined {
     const mru = this.mruByLevel[level];
-    if (mru && mru.tx === tx && mru.tz === tz) {
+    if (mru && mru.tx === tx && mru.tz === tz && mru.tile !== undefined) {
       return mru.tile;
     }
     const tile = this.tileStore.get(level, tx, tz, 'height');
-    this.mruByLevel[level] = { tx, tz, tile };
+    if (tile !== undefined) {
+      this.mruByLevel[level] = { tx, tz, tile };
+    }
     return tile;
+  }
+
+  private readEditCorner(level: Level, ix: number, iz: number, maxTileIdx: number): number {
+    if (ix < 0 || iz < 0) return 0;
+    const tx = ix >> 8;
+    const tz = iz >> 8;
+    if (tx > maxTileIdx || tz > maxTileIdx) return 0;
+
+    const tile = this.getTileCached(level, tx, tz);
+    if (!tile || tile.scale === 0) return 0;
+
+    const lx = ix & 255;
+    const lz = iz & 255;
+    return tile.min + (tile.data[(lz << 8) | lx] + 32768) * tile.scale;
   }
 
   private sampleEditAtLevel(level: Level, x: number, z: number): number {
     const span = tileSpan(level);
     const step = spacing(level);
-    const fx = (x + HALF) / span;
-    const fz = (z + HALF) / span;
     const maxTileIdx = Math.max(0, Math.ceil(WORLD_SIZE / span) - 1);
-    const tx = clamp(Math.floor(fx), 0, maxTileIdx);
-    const tz = clamp(Math.floor(fz), 0, maxTileIdx);
 
-    const tile = this.getTileCached(level, tx, tz);
-    if (!tile || tile.scale === 0) return 0;
+    const gx = Math.max(0, (x + HALF) / step);
+    const gz = Math.max(0, (z + HALF) / step);
 
-    const tileMinX = -HALF + tx * span;
-    const tileMinZ = -HALF + tz * span;
-    const lx = clamp((x - tileMinX) / step, 0, 255);
-    const lz = clamp((z - tileMinZ) / step, 0, 255);
+    const ix0 = Math.floor(gx);
+    const iz0 = Math.floor(gz);
+    const ix1 = ix0 + 1;
+    const iz1 = iz0 + 1;
+    const ux = gx - ix0;
+    const uz = gz - iz0;
 
-    const x0 = Math.floor(lx);
-    const z0 = Math.floor(lz);
-    const x1 = Math.min(255, x0 + 1);
-    const z1 = Math.min(255, z0 + 1);
-    const ux = lx - x0;
-    const uz = lz - z0;
-
-    const data = tile.data;
-    const min = tile.min;
-    const scale = tile.scale;
-
-    const v00 = min + (data[z0 * 256 + x0] + 32768) * scale;
-    const v10 = min + (data[z0 * 256 + x1] + 32768) * scale;
-    const v01 = min + (data[z1 * 256 + x0] + 32768) * scale;
-    const v11 = min + (data[z1 * 256 + x1] + 32768) * scale;
+    const v00 = this.readEditCorner(level, ix0, iz0, maxTileIdx);
+    const v10 = this.readEditCorner(level, ix1, iz0, maxTileIdx);
+    const v01 = this.readEditCorner(level, ix0, iz1, maxTileIdx);
+    const v11 = this.readEditCorner(level, ix1, iz1, maxTileIdx);
 
     const top = v00 + (v10 - v00) * ux;
     const bot = v01 + (v11 - v01) * ux;

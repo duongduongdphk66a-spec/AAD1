@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { Request, Response } from 'express';
 import {
+  checkApiQuota,
+  resetRateLimitsForTest,
   resolveSafeDistFile,
   safeDecodePathname,
   selectContentEncoding,
   serveCompressedOrStatic,
+  verifyApiAuth,
 } from '../../server';
 
 test('serveCompressedOrStatic blocks sibling path traversal via path.relative, catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
@@ -81,4 +84,31 @@ test('serveCompressedOrStatic blocks sibling path traversal via path.relative, c
     true,
     'Middleware must not serve Brotli when Accept-Encoding specifies br;q=0'
   );
+});
+
+test('verifyApiAuth enforces optional API_AUTH_TOKEN and checkApiQuota enforces request count and byte bandwidth quotas', () => {
+  // Public mode when API_AUTH_TOKEN is empty
+  assert.equal(verifyApiAuth({}, ''), true);
+  // Protected mode when API_AUTH_TOKEN is set
+  assert.equal(verifyApiAuth({}, 'secret-123'), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer wrong' }, 'secret-123'), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123'), true);
+  assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123'), true);
+
+  resetRateLimitsForTest();
+  // Byte quota check (25 MB per minute ceiling)
+  const q1 = checkApiQuota('10.0.0.1', 15 * 1024 * 1024);
+  assert.equal(q1.allowed, true);
+  const q2 = checkApiQuota('10.0.0.1', 12 * 1024 * 1024);
+  assert.equal(q2.allowed, false);
+  assert.equal(q2.reason, 'byte_quota');
+
+  // Request count check (20 requests per minute ceiling)
+  resetRateLimitsForTest();
+  for (let i = 0; i < 20; i++) {
+    assert.equal(checkApiQuota('10.0.0.2', 1024).allowed, true);
+  }
+  const q21 = checkApiQuota('10.0.0.2', 1024);
+  assert.equal(q21.allowed, false);
+  assert.equal(q21.reason, 'rate_limit');
 });

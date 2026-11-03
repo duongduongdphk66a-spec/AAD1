@@ -21,7 +21,13 @@ export default defineConfig(() => {
       rollupOptions: {
         output: {
           manualChunks(id: string) {
-            if (id.includes('node_modules/three')) {
+            if (
+              id.includes('node_modules/three-bvh-csg') ||
+              id.includes('node_modules/three-mesh-bvh')
+            ) {
+              return 'csg-bvh';
+            }
+            if (id.includes('node_modules/three/')) {
               return 'three-vendor';
             }
             if (id.includes('/world/proceduralModels') || id.includes('/world/surfaceEcosystem3D')) {

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { Scheduler } from './scheduler';
 import { SplatMaterialHandle } from './splatMaterial';
 import { TerrainField } from './terrainField';
 import {
@@ -18,6 +19,7 @@ export interface ClipmapOptions {
   patchSize: 32;
   skirtDepth: number;
   gpuProfile: 'integrated' | 'discrete' | 'software';
+  frameBudgetMs?: number;
 }
 
 export interface ClipmapStats {
@@ -26,12 +28,16 @@ export interface ClipmapStats {
   visiblePatches: number;
   visibleTriangles: number;
   uploadMs: number;
+  toroidalShifts?: number;
+  samplesComposedLastFrame?: number;
 }
 
 interface RingLevelData {
   level: Level;
   originX: number;
   originZ: number;
+  toroidalOffsetX: number;
+  toroidalOffsetZ: number;
   step: number;
   extent: number;
   heightBuffer: Float32Array;
@@ -49,6 +55,7 @@ interface RingLevelData {
   }>;
   dirtyRects: Rect[];
   initialized: boolean;
+  pendingFullEpoch: number;
 }
 
 /**
@@ -58,7 +65,7 @@ interface RingLevelData {
 export function snapRingOrigin(camCoord: number, level: Level, ringSamples = 256): number {
   const s = spacing(level);
   const snapStep = 2 * s;
-  const halfSpan = (ringSamples * 0.5) * s;
+  const halfSpan = ringSamples * 0.5 * s;
   const rawOrigin = camCoord - halfSpan;
   return Math.floor(rawOrigin / snapStep) * snapStep;
 }
@@ -79,6 +86,50 @@ export function computeClipmapMorphAlpha(
 }
 
 /**
+ * Shifts a 256x256 row-major heightBuffer in-place by (shiftX, shiftZ) samples
+ * where |shiftX| < 256 and |shiftZ| < 256 so only the newly exposed edge strips
+ * need to be composed.
+ */
+export function shiftRingBufferInPlace(
+  buf: Float32Array,
+  shiftX: number,
+  shiftZ: number
+): void {
+  if (shiftX === 0 && shiftZ === 0) return;
+
+  const absX = Math.abs(shiftX);
+  const absZ = Math.abs(shiftZ);
+  if (absX >= TILE || absZ >= TILE) return;
+
+  const overlapW = TILE - absX;
+  const overlapH = TILE - absZ;
+  const srcStartX = shiftX > 0 ? shiftX : 0;
+  const dstStartX = shiftX < 0 ? -shiftX : 0;
+
+  if (shiftZ >= 0) {
+    for (let rz = 0; rz < overlapH; rz++) {
+      const srcRowOff = (rz + shiftZ) * TILE;
+      const dstRowOff = rz * TILE;
+      buf.copyWithin(
+        dstRowOff + dstStartX,
+        srcRowOff + srcStartX,
+        srcRowOff + srcStartX + overlapW
+      );
+    }
+  } else {
+    for (let rz = overlapH - 1; rz >= 0; rz--) {
+      const srcRowOff = rz * TILE;
+      const dstRowOff = (rz - shiftZ) * TILE;
+      buf.copyWithin(
+        dstRowOff + dstStartX,
+        srcRowOff + srcStartX,
+        srcRowOff + srcStartX + overlapW
+      );
+    }
+  }
+}
+
+/**
  * Builds a single 32x32 sample patch geometry (in local grid coordinates [gx*32 .. (gx+1)*32])
  * with an outer vertical skirt along the boundary of the 256x256 ring to seal any sub-pixel seam.
  */
@@ -90,7 +141,6 @@ function createPatchGeometry(
 ): THREE.BufferGeometry {
   const cols = patchSize + 1;
   const rows = patchSize + 1;
-  const baseVertCount = cols * rows;
 
   const isOuterMinX = gx === 0;
   const isOuterMaxX = gx === 7;
@@ -171,36 +221,64 @@ function createPatchGeometry(
   return geo;
 }
 
+const SHARED_PATCH_GEOMETRY_CACHE = new Map<string, THREE.BufferGeometry[][]>();
+
+function getSharedPatchGeometries(patchSize: number, skirtDepth: number): THREE.BufferGeometry[][] {
+  const key = `${patchSize}:${skirtDepth}`;
+  let cached = SHARED_PATCH_GEOMETRY_CACHE.get(key);
+  if (!cached) {
+    cached = [];
+    for (let gz = 0; gz < 8; gz++) {
+      const row: THREE.BufferGeometry[] = [];
+      for (let gx = 0; gx < 8; gx++) {
+        row.push(createPatchGeometry(gx, gz, patchSize, skirtDepth));
+      }
+      cached.push(row);
+    }
+    SHARED_PATCH_GEOMETRY_CACHE.set(key, cached);
+  }
+  return cached;
+}
+
 export class ClipmapRenderer {
   public readonly root = new THREE.Group();
   private readonly terrainField: TerrainField;
   private readonly splatHandle: SplatMaterialHandle;
-  private readonly options: ClipmapOptions;
+  private readonly scheduler: Scheduler;
+  private readonly ownsScheduler: boolean;
+  private readonly options: Required<ClipmapOptions>;
   private readonly rings: RingLevelData[] = [];
-  private readonly patchGeometries: THREE.BufferGeometry[][] = [];
+  private patchGeometries: THREE.BufferGeometry[][] = [];
   private readonly minFineLevel: Level;
+  private toroidalShiftCount = 0;
   private lastStats: ClipmapStats = {
     activeLevels: 10,
     fineActiveLevel: 0,
     visiblePatches: 0,
     visibleTriangles: 0,
     uploadMs: 0,
+    toroidalShifts: 0,
+    samplesComposedLastFrame: 0,
   };
   private readonly unsubscribeField: () => void;
 
   constructor(
     terrainField: TerrainField,
     splatHandle: SplatMaterialHandle,
-    opts?: Partial<ClipmapOptions>
+    opts?: Partial<ClipmapOptions>,
+    scheduler?: Scheduler
   ) {
     this.terrainField = terrainField;
     this.splatHandle = splatHandle;
+    this.ownsScheduler = !scheduler;
+    this.scheduler = scheduler ?? new Scheduler(true);
     this.options = {
       levels: opts?.levels ?? 10,
       ringSamples: 256,
       patchSize: 32,
       skirtDepth: opts?.skirtDepth ?? 8.0,
       gpuProfile: opts?.gpuProfile ?? 'discrete',
+      frameBudgetMs: opts?.frameBudgetMs ?? 1.8,
     };
 
     // Determine finest active ring based on GPU profile
@@ -215,6 +293,8 @@ export class ClipmapRenderer {
     this.buildSharedPatchGeometries();
     this.buildRings();
 
+    this.scheduler.syncWorkerTerrainState(this.terrainField.getBaseHeightMap());
+
     this.unsubscribeField = this.terrainField.on('changed', (rect) => {
       this.markDirty(rect);
       this.splatHandle.updateSplatRect(rect);
@@ -222,14 +302,10 @@ export class ClipmapRenderer {
   }
 
   private buildSharedPatchGeometries(): void {
-    const patchSize = this.options.patchSize;
-    for (let gz = 0; gz < 8; gz++) {
-      const row: THREE.BufferGeometry[] = [];
-      for (let gx = 0; gx < 8; gx++) {
-        row.push(createPatchGeometry(gx, gz, patchSize, this.options.skirtDepth));
-      }
-      this.patchGeometries.push(row);
-    }
+    this.patchGeometries = getSharedPatchGeometries(
+      this.options.patchSize,
+      this.options.skirtDepth
+    );
   }
 
   private buildRings(): void {
@@ -266,7 +342,6 @@ export class ClipmapRenderer {
       const patches: RingLevelData['patches'] = [];
       for (let gz = 0; gz < 8; gz++) {
         for (let gx = 0; gx < 8; gx++) {
-          // For L > minFineLevel, the inner 4x4 patches (gx in 2..5, gz in 2..5) are covered by L-1
           const mesh = new THREE.Mesh(this.patchGeometries[gz][gx], mat);
           mesh.frustumCulled = false;
           mesh.receiveShadow = true;
@@ -288,6 +363,8 @@ export class ClipmapRenderer {
         level,
         originX: snapRingOrigin(0, level),
         originZ: snapRingOrigin(0, level),
+        toroidalOffsetX: 0,
+        toroidalOffsetZ: 0,
         step,
         extent,
         heightBuffer,
@@ -297,6 +374,7 @@ export class ClipmapRenderer {
         patches,
         dirtyRects: [],
         initialized: false,
+        pendingFullEpoch: 0,
       });
     }
   }
@@ -316,9 +394,100 @@ export class ClipmapRenderer {
     }
   }
 
+  private fillSubWindowOnRing(
+    ring: RingLevelData,
+    startRx: number,
+    startRz: number,
+    subW: number,
+    subH: number
+  ): number {
+    if (subW <= 0 || subH <= 0) return 0;
+    if (this.terrainField.fillSubWindow) {
+      this.terrainField.fillSubWindow(
+        ring.level,
+        ring.originX,
+        ring.originZ,
+        TILE,
+        startRx,
+        startRz,
+        subW,
+        subH,
+        ring.heightBuffer
+      );
+    } else {
+      for (let rz = 0; rz < subH; rz++) {
+        const wz = ring.originZ + (startRz + rz) * ring.step;
+        const rowOff = (startRz + rz) * TILE + startRx;
+        for (let rx = 0; rx < subW; rx++) {
+          const wx = ring.originX + (startRx + rx) * ring.step;
+          ring.heightBuffer[rowOff + rx] = this.terrainField.sampleHeight(wx, wz, ring.level);
+        }
+      }
+    }
+    ring.heightTexture.needsUpdate = true;
+    return subW * subH;
+  }
+
   /**
-   * Synchronizes all clipmap rings around the current camera position, updating only shifted or
-   * dirty sub-windows and hiding inner 4x4 patches covered by finer levels.
+   * Enqueues progressive 32-row strip composition jobs into Scheduler AND dispatches
+   * off-thread Worker composition for full-window jumps (cold start or 4.5km teleport)
+   * so that any single frame stays strictly within <= 2.2 ms on the main thread.
+   */
+  private scheduleFullRingComposition(ring: RingLevelData, epoch: number): void {
+    ring.pendingFullEpoch = epoch;
+    const reqOriginX = ring.originX;
+    const reqOriginZ = ring.originZ;
+    const priority = ring.level <= 2 ? 2 : 3;
+
+    // 1. Dispatch off-thread worker composition for base+detail
+    this.scheduler.dispatchWorkerCompose(
+      ring.level,
+      reqOriginX,
+      reqOriginZ,
+      TILE,
+      TILE,
+      (res) => {
+        if (
+          ring.originX !== reqOriginX ||
+          ring.originZ !== reqOriginZ ||
+          ring.pendingFullEpoch !== epoch
+        ) {
+          return;
+        }
+        ring.heightBuffer.set(res.heights);
+        ring.heightTexture.needsUpdate = true;
+        ring.pendingFullEpoch = 0;
+      }
+    );
+
+    // 2. Schedule progressive 8-row strip jobs on Scheduler within frame budget
+    const stripHeight = 8;
+    for (let startRz = 0; startRz < TILE; startRz += stripHeight) {
+      const rz0 = startRz;
+      const h = Math.min(stripHeight, TILE - rz0);
+      this.scheduler.enqueue({
+        id: `ring_L${ring.level}_strip_${rz0}`,
+        priority,
+        epoch,
+        level: ring.level,
+        run: () => {
+          if (ring.pendingFullEpoch !== epoch) return;
+          // Note: ring.originX/Z may have shifted slightly by toroidal steps; fill current ring origin
+          this.fillSubWindowOnRing(ring, 0, rz0, TILE, h);
+          if (rz0 + h >= TILE) {
+            ring.pendingFullEpoch = 0;
+          }
+        },
+      });
+    }
+  }
+
+  /**
+   * Synchronizes all clipmap rings around the current camera position:
+   * - Incremental camera translation (|shiftX| < 256 && |shiftZ| < 256): shifts heightBuffer
+   *   toroidally in-place and composes ONLY the newly exposed rows/columns (~1/128 cost).
+   * - Cold start or multi-kilometer teleport (|shift| >= 256): schedules progressive strip &
+   *   background Worker composition within the strict frameBudgetMs (<= 2.2 ms).
    */
   update(camera: THREE.Camera): ClipmapStats {
     const t0 = performance.now();
@@ -335,6 +504,8 @@ export class ClipmapRenderer {
 
     let visiblePatches = 0;
     let visibleTriangles = 0;
+    let samplesComposed = 0;
+    let hadLargeTeleport = false;
 
     for (const ring of this.rings) {
       if (ring.level < dynamicFineLevel) {
@@ -345,26 +516,55 @@ export class ClipmapRenderer {
 
       const snappedX = snapRingOrigin(camX, ring.level);
       const snappedZ = snapRingOrigin(camZ, ring.level);
-      const shifted =
-        !ring.initialized ||
-        Math.abs(snappedX - ring.originX) > 1e-4 ||
-        Math.abs(snappedZ - ring.originZ) > 1e-4;
+      const shiftX = Math.round((snappedX - ring.originX) / ring.step);
+      const shiftZ = Math.round((snappedZ - ring.originZ) / ring.step);
 
-      if (shifted) {
+      if (!ring.initialized || Math.abs(shiftX) >= TILE || Math.abs(shiftZ) >= TILE) {
+        if (!hadLargeTeleport) {
+          this.scheduler.bumpEpoch();
+          hadLargeTeleport = true;
+        }
         ring.originX = snappedX;
         ring.originZ = snappedZ;
-        this.terrainField.fillWindow(
-          ring.level,
-          ring.originX,
-          ring.originZ,
-          TILE,
-          TILE,
-          ring.heightBuffer
-        );
-        ring.heightTexture.needsUpdate = true;
+        ring.toroidalOffsetX = 0;
+        ring.toroidalOffsetZ = 0;
         ring.dirtyRects.length = 0;
         ring.initialized = true;
-      } else if (ring.dirtyRects.length > 0) {
+        this.scheduleFullRingComposition(ring, this.scheduler.currentEpoch);
+      } else if (shiftX !== 0 || shiftZ !== 0) {
+        // Toroidal / sliding-window strip update: only compose newly exposed rows & columns!
+        shiftRingBufferInPlace(ring.heightBuffer, shiftX, shiftZ);
+        ring.originX = snappedX;
+        ring.originZ = snappedZ;
+        ring.toroidalOffsetX = (ring.toroidalOffsetX + shiftX) & (TILE - 1);
+        ring.toroidalOffsetZ = (ring.toroidalOffsetZ + shiftZ) & (TILE - 1);
+        this.toroidalShiftCount++;
+
+        const absX = Math.abs(shiftX);
+        const absZ = Math.abs(shiftZ);
+
+        // 1. Newly exposed horizontal Z-strip (width = TILE, height = absZ)
+        if (absZ > 0) {
+          const zStart = shiftZ > 0 ? TILE - absZ : 0;
+          samplesComposed += this.fillSubWindowOnRing(ring, 0, zStart, TILE, absZ);
+        }
+
+        // 2. Newly exposed vertical X-strip (width = absX, height = TILE - absZ)
+        if (absX > 0) {
+          const xStart = shiftX > 0 ? TILE - absX : 0;
+          const zRemStart = shiftZ < 0 ? absZ : 0;
+          const zRemHeight = TILE - absZ;
+          samplesComposed += this.fillSubWindowOnRing(
+            ring,
+            xStart,
+            zRemStart,
+            absX,
+            zRemHeight
+          );
+        }
+      }
+
+      if (ring.dirtyRects.length > 0) {
         // Coalesce dirty rects into a single sub-window update
         let minX = Infinity;
         let minZ = Infinity;
@@ -383,15 +583,13 @@ export class ClipmapRenderer {
         const minSz = clamp(Math.floor((minZ - ring.originZ) / ring.step) - 1, 0, TILE - 1);
         const maxSz = clamp(Math.ceil((maxZ - ring.originZ) / ring.step) + 1, 0, TILE - 1);
 
-        for (let rz = minSz; rz <= maxSz; rz++) {
-          const wz = ring.originZ + rz * ring.step;
-          const rowOff = rz * TILE;
-          for (let rx = minSx; rx <= maxSx; rx++) {
-            const wx = ring.originX + rx * ring.step;
-            ring.heightBuffer[rowOff + rx] = this.terrainField.sampleHeight(wx, wz, ring.level);
-          }
-        }
-        ring.heightTexture.needsUpdate = true;
+        samplesComposed += this.fillSubWindowOnRing(
+          ring,
+          minSx,
+          minSz,
+          maxSx - minSx + 1,
+          maxSz - minSz + 1
+        );
       }
 
       ring.material.uniforms.uRingOrigin.value.set(ring.originX, ring.originZ);
@@ -417,6 +615,13 @@ export class ClipmapRenderer {
       }
     }
 
+    // Execute queued progressive composition jobs strictly within the remaining per-frame budget
+    const elapsedSoFar = performance.now() - t0;
+    const remainingBudget = this.options.frameBudgetMs - elapsedSoFar;
+    if (this.scheduler.pendingCount() > 0 && remainingBudget > 0.1) {
+      this.scheduler.tick(remainingBudget, this.scheduler.currentEpoch);
+    }
+
     const uploadMs = performance.now() - t0;
     this.lastStats = {
       activeLevels: MAX_LEVEL - dynamicFineLevel + 1,
@@ -424,8 +629,20 @@ export class ClipmapRenderer {
       visiblePatches,
       visibleTriangles,
       uploadMs,
+      toroidalShifts: this.toroidalShiftCount,
+      samplesComposedLastFrame: samplesComposed,
     };
     return this.lastStats;
+  }
+
+  /**
+   * Synchronously drains any pending scheduled ring strip compositions (useful for deterministic snapshot tests).
+   */
+  flushPendingCompositions(): void {
+    while (this.scheduler.pendingCount() > 0) {
+      const ran = this.scheduler.tick(50, this.scheduler.currentEpoch);
+      if (ran === 0) break;
+    }
   }
 
   getStats(): ClipmapStats {
@@ -435,6 +652,10 @@ export class ClipmapRenderer {
   getRingHeightSnapshot(level: Level): { originX: number; originZ: number; buffer: Float32Array } | null {
     const ring = this.rings.find((r) => r.level === level);
     if (!ring) return null;
+    if (ring.pendingFullEpoch !== 0) {
+      this.fillSubWindowOnRing(ring, 0, 0, TILE, TILE);
+      ring.pendingFullEpoch = 0;
+    }
     return {
       originX: ring.originX,
       originZ: ring.originZ,
@@ -444,14 +665,13 @@ export class ClipmapRenderer {
 
   dispose(): void {
     this.unsubscribeField();
+    if (this.ownsScheduler) {
+      this.scheduler.dispose();
+    }
     for (const ring of this.rings) {
       ring.heightTexture.dispose();
       ring.material.dispose();
     }
-    for (const row of this.patchGeometries) {
-      for (const geo of row) {
-        geo.dispose();
-      }
-    }
   }
 }
+

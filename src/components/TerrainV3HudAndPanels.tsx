@@ -14,6 +14,8 @@ export interface ResolutionHudProps {
   pendingJobs: number;
   fps: number;
   uploadMs: number;
+  softCapExceeded?: boolean;
+  dirtyTiles?: number;
 }
 
 export interface BrushPanelProps {
@@ -58,6 +60,8 @@ class V3HudTelemetryStore {
     pendingJobs: 0,
     fps: 60,
     uploadMs: 0.2,
+    softCapExceeded: false,
+    dirtyTiles: 0,
   };
   private listeners = new Set<() => void>();
   private lastEmitTime = 0;
@@ -139,6 +143,14 @@ export const ResolutionHudV3: React.FC<{
               {Math.round(stats.visibleTriangles / 1000)}k Δ
             </span>
           </div>
+          {stats.softCapExceeded && (
+            <div
+              data-testid="v3-soft-cap-warning"
+              className="rounded bg-amber-500/20 border border-amber-400/40 px-1.5 py-0.5 text-[10px] text-amber-200 font-sans"
+            >
+              ⚠ Vượt mềm hạn mức 512 ô ({stats.residentTiles} ô, {stats.dirtyTiles ?? 0} chưa lưu) — đang chờ lưu tự động, không xóa dữ liệu
+            </div>
+          )}
           <div className="flex justify-between gap-2 text-[10px] text-slate-400 pt-0.5 border-t border-slate-800/80">
             <span>Hàng đợi: {stats.pendingJobs}</span>
             <span>{Math.round(stats.fps)} FPS</span>

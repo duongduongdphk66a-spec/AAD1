@@ -63,6 +63,7 @@ export interface TerrainV3EngineBundle {
   ): Float32Array;
   exportWorldSaveV3(objects: readonly PlacedObject[]): Promise<Blob>;
   importWorldSaveV3(blob: Blob): Promise<WorldSaveV3>;
+  flushAutosave(): Promise<void>;
   getHudMetrics(fps?: number): {
     addressableSamples: number;
     residentTiles: number;
@@ -74,6 +75,8 @@ export interface TerrainV3EngineBundle {
     pendingJobs: number;
     fps: number;
     uploadMs: number;
+    softCapExceeded: boolean;
+    dirtyTiles: number;
   };
   estimateBrush(radiusMeters: number): BrushCostEstimate;
   dispose(): void;
@@ -106,6 +109,24 @@ export function createTerrainV3Engine(
   let clipmap: ClipmapRenderer | null = null;
   let isBrushDragging = false;
   let linkRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+  let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleDebouncedAutosave = () => {
+    if (autosaveTimer !== null) {
+      clearTimeout(autosaveTimer);
+    }
+    autosaveTimer = setTimeout(() => {
+      autosaveTimer = null;
+      void tileStore.flush();
+    }, 2000);
+    if (typeof (autosaveTimer as unknown as { unref?: () => void }).unref === 'function') {
+      (autosaveTimer as unknown as { unref: () => void }).unref();
+    }
+  };
+
+  const unsubscribeAutosave = tileStore.onDirty(() => {
+    scheduleDebouncedAutosave();
+  });
 
   const scheduleDebouncedLinkConnect = (objects: readonly PlacedObject[], autoConnect: boolean) => {
     if (linkRebuildTimer !== null) {
@@ -152,7 +173,7 @@ export function createTerrainV3Engine(
         scene.remove(clipmap.root);
         clipmap.dispose();
       }
-      clipmap = new ClipmapRenderer(terrainField, splatHandle, opts);
+      clipmap = new ClipmapRenderer(terrainField, splatHandle, opts, scheduler);
       bundle.clipmap = clipmap;
       scene.add(clipmap.root);
       scene.add(linkSystem.getMergedGroup());
@@ -284,6 +305,14 @@ export function createTerrainV3Engine(
       return state;
     },
 
+    async flushAutosave(): Promise<void> {
+      if (autosaveTimer !== null) {
+        clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+      }
+      await tileStore.flush();
+    },
+
     getHudMetrics(fps = 60) {
       const tStats = tileStore.stats();
       const cStats: ClipmapStats = clipmap
@@ -311,6 +340,8 @@ export function createTerrainV3Engine(
         pendingJobs: scheduler.pendingCount(),
         fps,
         uploadMs: cStats.uploadMs,
+        softCapExceeded: tStats.softCapExceeded,
+        dirtyTiles: tStats.dirty,
       };
     },
 
@@ -319,6 +350,11 @@ export function createTerrainV3Engine(
     },
 
     dispose(): void {
+      unsubscribeAutosave();
+      if (autosaveTimer !== null) {
+        clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+      }
       if (linkRebuildTimer !== null) {
         clearTimeout(linkRebuildTimer);
       }
@@ -326,6 +362,7 @@ export function createTerrainV3Engine(
         clipmap.dispose();
         clipmap = null;
       }
+      scheduler.dispose();
       linkSystem.dispose();
       splatHandle.dispose();
     },

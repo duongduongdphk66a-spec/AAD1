@@ -57,6 +57,7 @@ import {
   formatTimeOfDayClock,
   generateBiomeTerrain,
   generateFlatEarthTerrain,
+  ParallelErosionPool,
   serializeWorldToSavePayload,
   timeOfDayToSunElevation,
   validateWorldSavePayload,
@@ -71,6 +72,7 @@ import {
   createTerrainV3Engine,
   TerrainV3EngineBundle,
 } from './core/terrainV3Controller';
+import { isTerrainV3DefaultEnabled } from './core/units';
 import {
   BrushLevelBadgeV3,
   LinkAndStampPopoverV3,
@@ -165,9 +167,11 @@ export default function App() {
   const [gpuShaderEnabled, setGpuShaderEnabled] = useState<boolean>(false);
   const [gpuWeatherPreset, setGpuWeatherPreset] = useState<WeatherPresetType | 'auto'>('auto');
   const [snowCoverageIntensity, setSnowCoverageIntensity] = useState<number>(0.85);
-  const [snowAltitudeMeters] = useState<number>(28.0);
+  const [snowAltitudeMeters, setSnowAltitudeMeters] = useState<number>(28.0);
   const [lavaLevelMeters, setLavaLevelMeters] = useState<number>(2.5);
+  const [lavaEmissiveIntensity, setLavaEmissiveIntensity] = useState<number>(2.2);
   const [triplanarSharpness, setTriplanarSharpness] = useState<number>(6.0);
+  const [isEroding, setIsEroding] = useState<boolean>(false);
   const [glbExportTrigger, setGlbExportTrigger] = useState<number>(0);
   const [cameraPreset, setCameraPreset] = useState<CameraPresetId>('mountain_gallery');
   const [cameraPresetTrigger, setCameraPresetTrigger] = useState<number>(0);
@@ -190,8 +194,8 @@ export default function App() {
   const dirtyRectRef = useRef<GridDirtyRect | null>(null);
 
   // V3 Clipmap + Sparse Tile Pyramid + Non-Destructive Stamp/Link State
-  const [v3Enabled, setV3Enabled] = useState<boolean>(
-    () => import.meta.env.VITE_TERRAIN_V3 === 'true'
+  const [v3Enabled, setV3Enabled] = useState<boolean>(() =>
+    isTerrainV3DefaultEnabled()
   );
   const [v3SnapEnabled, setV3SnapEnabled] = useState<boolean>(true);
   const [v3DebugSdfOutline, setV3DebugSdfOutline] = useState<boolean>(false);
@@ -210,6 +214,12 @@ export default function App() {
     placedObjects,
     microStrokes,
     selectedObjectId,
+    selectedPrefab,
+    sculptPrefabOverride,
+    sculptTool,
+    spawnObjectOnSculpt,
+    placementScale,
+    placementRotationDeg,
     biomeId,
     waterLevel,
     regionTitle,
@@ -217,19 +227,23 @@ export default function App() {
     autoJunctionBlend,
     starlightMode,
   });
-  useEffect(() => {
-    latestStateRef.current = {
-      placedObjects,
-      microStrokes,
-      selectedObjectId,
-      biomeId,
-      waterLevel,
-      regionTitle,
-      undoStack,
-      autoJunctionBlend,
-      starlightMode,
-    };
-  });
+  latestStateRef.current = {
+    placedObjects,
+    microStrokes,
+    selectedObjectId,
+    selectedPrefab,
+    sculptPrefabOverride,
+    sculptTool,
+    spawnObjectOnSculpt,
+    placementScale,
+    placementRotationDeg,
+    biomeId,
+    waterLevel,
+    regionTitle,
+    undoStack,
+    autoJunctionBlend,
+    starlightMode,
+  };
 
   const commitPlacedObjects = useCallback(
     (nextOrUpdater: PlacedObject[] | ((prev: PlacedObject[]) => PlacedObject[])) => {
@@ -510,10 +524,13 @@ export default function App() {
 
   const handleSelectSculptTool = useCallback(
     (nextTool: SculptToolId) => {
+      latestStateRef.current.sculptTool = nextTool;
+      latestStateRef.current.sculptPrefabOverride = 'auto';
       setSculptTool(nextTool);
       setSculptPrefabOverride('auto');
       const mapped = SCULPT_TOOL_PREFAB_MAP[nextTool];
       if (mapped) {
+        latestStateRef.current.selectedPrefab = mapped.prefabId;
         setSelectedPrefab(mapped.prefabId);
       }
     },
@@ -522,8 +539,10 @@ export default function App() {
 
   const handleChangeSculptPrefabOverride = useCallback(
     (nextOverride: PrefabId | 'auto') => {
+      latestStateRef.current.sculptPrefabOverride = nextOverride;
       setSculptPrefabOverride(nextOverride);
       if (nextOverride !== 'auto') {
+        latestStateRef.current.selectedPrefab = nextOverride;
         setSelectedPrefab(nextOverride);
         const meta = PREFAB_CATALOG.find((p) => p.id === nextOverride);
         if (meta) {
@@ -536,6 +555,9 @@ export default function App() {
 
   const handleSelectPrefab = useCallback(
     (nextPrefab: PrefabId) => {
+      latestStateRef.current.selectedPrefab = nextPrefab;
+      latestStateRef.current.sculptPrefabOverride = nextPrefab;
+      latestStateRef.current.selectedObjectId = null;
       setSelectedPrefab(nextPrefab);
       setSculptPrefabOverride(nextPrefab);
       setSelectedObjectId(null);
@@ -630,9 +652,19 @@ export default function App() {
       }
 
       if (activeTab === 'sculpt') {
-        const mapping = SCULPT_TOOL_PREFAB_MAP[sculptTool];
+        const curTool = latestStateRef.current.sculptTool;
+        const curOverride = latestStateRef.current.sculptPrefabOverride;
+        const curSelectedPrefab = latestStateRef.current.selectedPrefab;
+        const mapping = SCULPT_TOOL_PREFAB_MAP[curTool];
+        const effectivePrefabOverride: PrefabId | 'auto' =
+          curOverride !== 'auto'
+            ? curOverride
+            : mapping
+              ? 'auto'
+              : curSelectedPrefab || 'auto';
         const hasObjectToSpawn =
-          spawnObjectOnSculpt && (Boolean(mapping) || sculptPrefabOverride !== 'auto');
+          latestStateRef.current.spawnObjectOnSculpt &&
+          (Boolean(mapping) || effectivePrefabOverride !== 'auto');
 
         if (hasObjectToSpawn) {
           // Place the 3D landform/object directly onto the existing ground WITHOUT raising a dirt mound underneath
@@ -647,17 +679,17 @@ export default function App() {
 
           if (shouldAttemptSpawn) {
             const { updatedObjects, spawnedObject } = spawnSculptLandformObject(
-              sculptTool,
+              curTool,
               worldX,
               worldZ,
               heightMapRef.current,
               latestStateRef.current.placedObjects,
               {
-                prefabOverride: sculptPrefabOverride,
-                scale: placementScale,
+                prefabOverride: effectivePrefabOverride,
+                scale: latestStateRef.current.placementScale,
                 rotationY:
-                  placementRotationDeg !== 0
-                    ? Number(((placementRotationDeg * Math.PI) / 180).toFixed(3))
+                  latestStateRef.current.placementRotationDeg !== 0
+                    ? Number(((latestStateRef.current.placementRotationDeg * Math.PI) / 180).toFixed(3))
                     : undefined,
                 forcePlaceOnClick: isFirstSculpt,
               }
@@ -872,7 +904,12 @@ export default function App() {
   // Automatically fuses overlapping structures ("nối liền như 2 khối là 1") and interpolates/extrapolates bottom ground for distant objects
   const handlePlacePrefabAt = useCallback(
     (worldX: number, worldZ: number, prefabOverride?: PrefabId) => {
-      const targetPrefabId = prefabOverride || selectedPrefab;
+      const validOverride =
+        prefabOverride && PREFAB_CATALOG.some((p) => p.id === prefabOverride)
+          ? prefabOverride
+          : undefined;
+      const targetPrefabId =
+        validOverride || latestStateRef.current.selectedPrefab || selectedPrefab;
       const meta =
         PREFAB_CATALOG.find((p) => p.id === targetPrefabId) || PREFAB_CATALOG[0];
       pushUndoSnapshot(`Đặt ${meta.name}`);
@@ -1212,28 +1249,37 @@ export default function App() {
   ]);
 
   const handleRunHydraulicErosion = useCallback(() => {
-    pushUndoSnapshot('Xói Mòn Thủy Lực (Web Worker)');
-    showToast('Đang mô phỏng xói mòn thủy lực theo hạt trên Web Worker...');
-    runHydraulicErosionAsync(heightMapRef.current, {
-      width: VERTEX_COUNT_PER_SIDE,
-      height: VERTEX_COUNT_PER_SIDE,
-      iterations: 18000,
-    }).then((eroded) => {
-      heightMapRef.current.set(eroded);
-      recomputeTerrainColors(
+    pushUndoSnapshot('Xói Mòn Thủy Lực Đa Luồng (Parallel Halo-Blended Pool)');
+    setIsEroding(true);
+    showToast('Đang mô phỏng Xói Mòn Thủy Lực Đa Luồng (Parallel Halo-Blended Worker Pool)...');
+    const pool = new ParallelErosionPool();
+    pool
+      .executeParallelErosion(
         heightMapRef.current,
-        splatMapRef.current,
-        colorMapRef.current,
-        latestStateRef.current.biomeId
-      );
-      if (v3EngineRef.current) {
-        v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
-      }
-      commitPlacedObjects((prev) => syncObjectsToGround(prev));
-      dirtyRectRef.current = null;
-      setTerrainVersion((v) => v + 1);
-      showToast('Hoàn tất mô phỏng Xói Mòn Thủy Lực theo hạt (18.000 hạt nước).');
-    });
+        VERTEX_COUNT_PER_SIDE,
+        VERTEX_COUNT_PER_SIDE,
+        24000
+      )
+      .then((eroded) => {
+        heightMapRef.current.set(eroded);
+        recomputeTerrainColors(
+          heightMapRef.current,
+          splatMapRef.current,
+          colorMapRef.current,
+          latestStateRef.current.biomeId
+        );
+        if (v3EngineRef.current) {
+          v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
+        }
+        commitPlacedObjects((prev) => syncObjectsToGround(prev));
+        dirtyRectRef.current = null;
+        setTerrainVersion((v) => v + 1);
+        setIsEroding(false);
+        showToast('Hoàn tất mô phỏng Xói Mòn Thủy Lực Đa Luồng (24.000 hạt nước · Halo Blending).');
+      })
+      .catch(() => {
+        setIsEroding(false);
+      });
   }, [commitPlacedObjects, pushUndoSnapshot, showToast, syncObjectsToGround]);
 
   const handleExportWorldGlb = useCallback(() => {
@@ -1486,6 +1532,7 @@ export default function App() {
           snowCoverageIntensity={snowCoverageIntensity}
           snowAltitudeMeters={snowAltitudeMeters}
           lavaLevelMeters={lavaLevelMeters}
+          lavaEmissiveIntensity={lavaEmissiveIntensity}
           triplanarSharpness={triplanarSharpness}
           glbExportTrigger={glbExportTrigger}
           onGlbExportComplete={handleGlbExportComplete}
@@ -2022,14 +2069,19 @@ export default function App() {
         onImportWorldJson={handleImportWorldJson}
         onExportWorldGlb={handleExportWorldGlb}
         onRunHydraulicErosion={handleRunHydraulicErosion}
+        isEroding={isEroding}
         gpuShaderEnabled={gpuShaderEnabled}
         onToggleGpuShader={handleToggleGpuShader}
         gpuWeatherPreset={gpuWeatherPreset}
         onChangeGpuWeatherPreset={setGpuWeatherPreset}
         snowCoverageIntensity={snowCoverageIntensity}
         onChangeSnowCoverageIntensity={setSnowCoverageIntensity}
+        snowAltitudeMeters={snowAltitudeMeters}
+        onChangeSnowAltitudeMeters={setSnowAltitudeMeters}
         lavaLevelMeters={lavaLevelMeters}
         onChangeLavaLevelMeters={setLavaLevelMeters}
+        lavaEmissiveIntensity={lavaEmissiveIntensity}
+        onChangeLavaEmissiveIntensity={setLavaEmissiveIntensity}
         triplanarSharpness={triplanarSharpness}
         onChangeTriplanarSharpness={setTriplanarSharpness}
       />
