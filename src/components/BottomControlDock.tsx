@@ -392,6 +392,16 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
     setHorizontalScrollPct(0);
   }, [activeTab, prefabCategoryFilter]);
 
+  useEffect(() => {
+    if (activeTab !== 'prefabs') return;
+    const el = horizontalRowRef.current;
+    if (!el) return;
+    const btn = el.querySelector<HTMLElement>(`[data-testid="prefab-card-${selectedPrefab}"]`);
+    if (btn && typeof btn.scrollIntoView === 'function') {
+      btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    }
+  }, [activeTab, selectedPrefab, prefabCategoryFilter]);
+
   const handleRowScroll = useCallback(() => {
     const el = horizontalRowRef.current;
     if (!el) return;
@@ -434,9 +444,14 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
     Math.min(activeBrushPage.maxRadius, brushRadius)
   );
 
+  const activePrefabMeta =
+    PREFAB_CATALOG.find((p) => p.id === selectedPrefab) || PREFAB_CATALOG[0];
   const filteredPrefabs = PREFAB_CATALOG.filter(
     (p) => prefabCategoryFilter === 'all' || p.category === prefabCategoryFilter
   );
+  const quickSelectPrefabs = filteredPrefabs.some((p) => p.id === activePrefabMeta.id)
+    ? filteredPrefabs
+    : [activePrefabMeta, ...filteredPrefabs];
 
   const selectedObjDeg = selectedObject
     ? (((Math.round((selectedObject.rotationY * 180) / Math.PI) % 360) + 360) % 360)
@@ -444,8 +459,9 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
 
   const selectedObjScale = selectedObject ? selectedObject.scale : placementScale;
   const selectedObjMeta = selectedObject
-    ? PREFAB_CATALOG.find((p) => p.id === selectedObject.prefabId) || PREFAB_CATALOG[0]
-    : null;
+    ? PREFAB_CATALOG.find((p) => p.id === selectedObject.prefabId) || activePrefabMeta
+    : activePrefabMeta;
+  const inspectorLabel = selectedObject ? selectedObject.label : activePrefabMeta.name;
 
   return (
     <div
@@ -542,76 +558,101 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
               </button>
             </div>
 
-            {/* Inline Selected Object Mini-Inspector (No extra vertical row!) */}
-            {selectedObject && (
-              <div
-                data-testid="selected-object-inspector"
-                className="flex items-center gap-2 px-2 py-0.5 rounded-lg bg-[#162032] border border-amber-400/50 text-[11px] shrink-0"
+            {/* Inline Selected Object / Active Prefab Mini-Inspector (Always reflects active PrefabId!) */}
+            <div
+              data-testid="selected-object-inspector"
+              className="flex items-center gap-2 px-2 py-0.5 rounded-lg bg-[#162032] border border-amber-400/50 text-[11px] shrink-0"
+            >
+              <span
+                data-testid="selected-prefab-name-readout"
+                className="text-amber-300 font-semibold truncate max-w-[145px]"
               >
-                <span className="text-amber-300 font-semibold truncate max-w-[125px]">
-                  {selectedObject.label}
+                {inspectorLabel}
+              </span>
+              {selectedObjMeta && (
+                <span
+                  data-testid="selected-object-real-dims"
+                  className="text-emerald-300 font-mono text-[10px] hidden xl:inline"
+                >
+                  ({selectedObjMeta.realDimensions})
                 </span>
-                {selectedObjMeta && (
-                  <span
-                    data-testid="selected-object-real-dims"
-                    className="text-emerald-300 font-mono text-[10px] hidden xl:inline"
-                  >
-                    ({selectedObjMeta.realDimensions})
-                  </span>
-                )}
-                <div className="flex items-center gap-1">
-                  <span className="text-slate-400 text-[10px]">Hướng:</span>
-                  <input
-                    aria-label="Hướng xoay vật thể đang chọn"
-                    type="range"
-                    min={0}
-                    max={360}
-                    step={5}
-                    value={selectedObjDeg}
-                    onChange={(e) => onSetSelectedObjectRotationDeg(Number(e.target.value))}
-                    className="w-12 h-1 accent-amber-400 cursor-pointer"
-                  />
-                  <span className="font-mono text-[10px] text-amber-300 w-7 text-right">
-                    {selectedObjDeg}°
-                  </span>
-                  <button
-                    type="button"
-                    onClick={onRotateSelectedObject}
-                    className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 cursor-pointer"
-                  >
-                    +45°
-                  </button>
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="text-slate-400 text-[10px]">Cỡ:</span>
-                  <input
-                    aria-label="Kích thước vật thể đang chọn"
-                    type="range"
-                    min={0.3}
-                    max={3.0}
-                    step={0.05}
-                    value={selectedObjScale}
-                    onChange={(e) => onSetSelectedObjectScale(Number(e.target.value))}
-                    className="w-12 h-1 accent-cyan-400 cursor-pointer"
-                  />
-                  <span className="font-mono text-[10px] text-cyan-300 w-8 text-right">
-                    {selectedObjScale.toFixed(1)}x
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onScaleSelectedObject(0.15)}
-                    className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] cursor-pointer"
-                  >
-                    +
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onScaleSelectedObject(-0.15)}
-                    className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] cursor-pointer"
-                  >
-                    -
-                  </button>
-                </div>
+              )}
+              <div className="flex items-center gap-1">
+                <span className="text-slate-400 text-[10px]">Hướng:</span>
+                <input
+                  aria-label="Hướng xoay vật thể đang chọn"
+                  type="range"
+                  min={0}
+                  max={360}
+                  step={5}
+                  value={selectedObjDeg}
+                  onChange={(e) => onSetSelectedObjectRotationDeg(Number(e.target.value))}
+                  className="w-12 h-1 accent-amber-400 cursor-pointer"
+                />
+                <span className="font-mono text-[10px] text-amber-300 w-7 text-right">
+                  {selectedObjDeg}°
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (selectedObject) {
+                      onRotateSelectedObject();
+                    } else {
+                      onChangePlacementRotationDeg((placementRotationDeg + 45) % 360);
+                    }
+                  }}
+                  className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 cursor-pointer"
+                >
+                  +45°
+                </button>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-slate-400 text-[10px]">Cỡ:</span>
+                <input
+                  aria-label="Kích thước vật thể đang chọn"
+                  type="range"
+                  min={0.3}
+                  max={3.0}
+                  step={0.05}
+                  value={selectedObjScale}
+                  onChange={(e) => onSetSelectedObjectScale(Number(e.target.value))}
+                  className="w-12 h-1 accent-cyan-400 cursor-pointer"
+                />
+                <span className="font-mono text-[10px] text-cyan-300 w-8 text-right">
+                  {selectedObjScale.toFixed(1)}x
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (selectedObject) {
+                      onScaleSelectedObject(0.15);
+                    } else {
+                      onChangePlacementScale(
+                        Math.max(0.3, Math.min(3.0, Number((placementScale + 0.15).toFixed(2))))
+                      );
+                    }
+                  }}
+                  className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] cursor-pointer"
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (selectedObject) {
+                      onScaleSelectedObject(-0.15);
+                    } else {
+                      onChangePlacementScale(
+                        Math.max(0.3, Math.min(3.0, Number((placementScale - 0.15).toFixed(2))))
+                      );
+                    }
+                  }}
+                  className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] cursor-pointer"
+                >
+                  -
+                </button>
+              </div>
+              {selectedObject && (
                 <button
                   type="button"
                   onClick={onDeleteSelectedObject}
@@ -621,8 +662,8 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                   <Trash2 className="w-2.5 h-2.5" />
                   Xóa
                 </button>
-              </div>
-            )}
+              )}
+            </div>
 
             {/* Right Quick Actions + Collapse Button */}
             <div className="flex items-center gap-1 shrink-0">
@@ -1234,6 +1275,7 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                     <button
                       key={cat.id}
                       type="button"
+                      data-testid={`prefab-cat-${cat.id}`}
                       onClick={() => onChangePrefabCategoryFilter(cat.id)}
                       className={`px-1.5 py-0.5 rounded text-[10px] font-medium cursor-pointer ${
                         prefabCategoryFilter === cat.id
@@ -1245,6 +1287,19 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
                     </button>
                   ))}
                 </div>
+                <select
+                  aria-label="Chọn nhanh công trình đặt 1:1"
+                  data-testid="prefab-quick-select"
+                  value={activePrefabMeta.id}
+                  onChange={(e) => onSelectPrefab(e.target.value as PrefabId)}
+                  className="bg-[#0b111c] border border-cyan-500/50 rounded px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 cursor-pointer max-w-[168px]"
+                >
+                  {quickSelectPrefabs.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
                 <div className="flex items-center gap-1">
                   <RotateCw className="w-3 h-3 text-amber-400" />
                   <input

@@ -17,6 +17,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/src/world ./src/world
+COPY --from=builder /app/src/core ./src/core
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
 
 EXPOSE 3000

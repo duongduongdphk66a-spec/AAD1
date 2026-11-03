@@ -924,6 +924,23 @@ export const SCULPT_TOOL_PREFAB_MAP: Record<SculptToolId, SculptToolPrefabMappin
   smooth: null,
 };
 
+export interface SculptSpawnDiagnostics {
+  tool: SculptToolId;
+  requestedOverride: PrefabId | 'auto';
+  toolMappedPrefabId: PrefabId | null;
+  resolvedPrefabId: PrefabId | null;
+  resolutionSource: 'manual_override' | 'tool_mapping' | 'none';
+  position: { x: number; y: number; z: number };
+  spawned: boolean;
+  skipReason?: 'no_mapping_or_override' | 'spacing_too_close';
+}
+
+let lastSculptSpawnDiagnostics: SculptSpawnDiagnostics | null = null;
+
+export function getLastSculptSpawnDiagnostics(): SculptSpawnDiagnostics | null {
+  return lastSculptSpawnDiagnostics;
+}
+
 /**
  * Spawns and grounds a 3D geological/ecosystem object (`PlacedObject`) at `(worldX, worldZ)`
  * corresponding to the active sculpting tool (or an explicit `prefabOverride`), while syncing
@@ -944,6 +961,7 @@ export function spawnSculptLandformObject(
 ): {
   updatedObjects: PlacedObject[];
   spawnedObject: PlacedObject | null;
+  diagnostics: SculptSpawnDiagnostics;
 } {
   const half = WORLD_SIZE / 2;
   const clampedX = Number(Math.max(-half + 10, Math.min(half - 10, worldX)).toFixed(1));
@@ -961,19 +979,41 @@ export function spawnSculptLandformObject(
   });
 
   const mapping = SCULPT_TOOL_PREFAB_MAP[tool];
-  const overrideId =
-    options?.prefabOverride && options.prefabOverride !== 'auto'
-      ? options.prefabOverride
+  const requestedOverride: PrefabId | 'auto' = options?.prefabOverride ?? 'auto';
+  const overrideId: PrefabId | null =
+    requestedOverride !== 'auto' && PREFAB_CATALOG.some((p) => p.id === requestedOverride)
+      ? requestedOverride
       : null;
+  const toolMappedPrefabId: PrefabId | null = mapping?.prefabId ?? null;
+  const resolutionSource: 'manual_override' | 'tool_mapping' | 'none' = overrideId
+    ? 'manual_override'
+    : toolMappedPrefabId
+      ? 'tool_mapping'
+      : 'none';
+  const chosenPrefabId: PrefabId | null = overrideId ?? toolMappedPrefabId;
 
-  if (!overrideId && !mapping) {
+  if (!chosenPrefabId) {
+    const diagnostics: SculptSpawnDiagnostics = {
+      tool,
+      requestedOverride,
+      toolMappedPrefabId,
+      resolvedPrefabId: null,
+      resolutionSource: 'none',
+      position: { x: clampedX, y: groundY, z: clampedZ },
+      spawned: false,
+      skipReason: 'no_mapping_or_override',
+    };
+    lastSculptSpawnDiagnostics = diagnostics;
+    console.log(
+      `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId=null (source=none, skipped: no_mapping_or_override)`,
+      diagnostics
+    );
     return {
       updatedObjects: syncedExisting,
       spawnedObject: null,
+      diagnostics,
     };
   }
-
-  const chosenPrefabId: PrefabId = overrideId ?? mapping!.prefabId;
 
   const prefabMeta = PREFAB_CATALOG.find((p) => p.id === chosenPrefabId);
   const label = overrideId
@@ -988,9 +1028,25 @@ export function spawnSculptLandformObject(
     (obj) => Math.hypot(obj.x - clampedX, obj.z - clampedZ) < minSpacing
   );
   if (tooClose) {
+    const diagnostics: SculptSpawnDiagnostics = {
+      tool,
+      requestedOverride,
+      toolMappedPrefabId,
+      resolvedPrefabId: chosenPrefabId,
+      resolutionSource,
+      position: { x: clampedX, y: groundY, z: clampedZ },
+      spawned: false,
+      skipReason: 'spacing_too_close',
+    };
+    lastSculptSpawnDiagnostics = diagnostics;
+    console.log(
+      `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId="${chosenPrefabId}" (source=${resolutionSource}, skipped: spacing_too_close)`,
+      diagnostics
+    );
     return {
       updatedObjects: syncedExisting,
       spawnedObject: null,
+      diagnostics,
     };
   }
 
@@ -1018,11 +1074,28 @@ export function spawnSculptLandformObject(
     rotationY: rotVal,
   };
 
+  const diagnostics: SculptSpawnDiagnostics = {
+    tool,
+    requestedOverride,
+    toolMappedPrefabId,
+    resolvedPrefabId: chosenPrefabId,
+    resolutionSource,
+    position: { x: clampedX, y: groundY, z: clampedZ },
+    spawned: true,
+  };
+  lastSculptSpawnDiagnostics = diagnostics;
+  console.log(
+    `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId="${chosenPrefabId}" (source=${resolutionSource}, spawned=true at [${clampedX}, ${groundY}, ${clampedZ}])`,
+    diagnostics
+  );
+
   return {
     updatedObjects: [...syncedExisting, spawnedObject],
     spawnedObject,
+    diagnostics,
   };
 }
+
 
 
 

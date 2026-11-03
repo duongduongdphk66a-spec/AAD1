@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { Request, Response } from 'express';
 import {
+  CSP_HEADER_VALUE,
   checkApiQuota,
   resetRateLimitsForTest,
   resolveSafeDistFile,
@@ -12,12 +13,18 @@ import {
   verifyApiAuth,
 } from '../../server';
 
-test('serveCompressedOrStatic blocks sibling path traversal via path.relative, catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
+test('serveCompressedOrStatic blocks sibling path traversal via path.relative, allows valid filenames containing .., catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
   const distDir = path.resolve('/app/applet/dist');
   const middleware = serveCompressedOrStatic(distDir);
 
   // 1. Path traversal to sibling directory (/..%2fdist-secret%2fsecret.json) is blocked via path.relative(distPath, resolvedFile)
   assert.equal(resolveSafeDistFile(distDir, '/../dist-secret/secret.json'), null);
+  assert.equal(resolveSafeDistFile(distDir, '/assets/../../secret.json'), null);
+  // Valid filenames containing consecutive dots inside a filename (not a '..' segment) are allowed
+  assert.equal(
+    resolveSafeDistFile(distDir, '/assets/chunk..hash123.js'),
+    path.join(distDir, 'assets', 'chunk..hash123.js')
+  );
   assert.equal(safeDecodePathname('/%E0%A4%A'), null);
 
   let nextCalledForTraversal = false;
@@ -86,14 +93,30 @@ test('serveCompressedOrStatic blocks sibling path traversal via path.relative, c
   );
 });
 
-test('verifyApiAuth enforces optional API_AUTH_TOKEN and checkApiQuota enforces request count and byte bandwidth quotas', () => {
-  // Public mode when API_AUTH_TOKEN is empty
-  assert.equal(verifyApiAuth({}, ''), true);
-  // Protected mode when API_AUTH_TOKEN is set
-  assert.equal(verifyApiAuth({}, 'secret-123'), false);
-  assert.equal(verifyApiAuth({ authorization: 'Bearer wrong' }, 'secret-123'), false);
-  assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123'), true);
-  assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123'), true);
+test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeholder tokens, requires token in production, and checkApiQuota enforces quotas', () => {
+  // Development/preview mode when API_AUTH_TOKEN is empty or a placeholder ("true", "change-me-in-production")
+  assert.equal(verifyApiAuth({}, '', false), true);
+  assert.equal(verifyApiAuth({}, 'true', false), true);
+  assert.equal(verifyApiAuth({}, 'change-me-in-production', false), true);
+
+  // Production mode requires a real non-placeholder API_AUTH_TOKEN
+  assert.equal(verifyApiAuth({}, '', true), false);
+  assert.equal(verifyApiAuth({}, 'true', true), false);
+  assert.equal(verifyApiAuth({}, 'change-me-in-production', true), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer true' }, 'true', true), false);
+
+  // Protected mode when a real API_AUTH_TOKEN is set
+  assert.equal(verifyApiAuth({}, 'secret-123', false), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer wrong' }, 'secret-123', false), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer secret-1234' }, 'secret-123', false), false);
+  assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123', false), true);
+  assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123', true), true);
+
+  // CSP includes worker-src 'self' blob: so Blob Web Workers are never blocked
+  assert.ok(
+    CSP_HEADER_VALUE.includes("worker-src 'self' blob:"),
+    'CSP must permit Blob URL Web Workers via worker-src'
+  );
 
   resetRateLimitsForTest();
   // Byte quota check (25 MB per minute ceiling)
@@ -112,3 +135,31 @@ test('verifyApiAuth enforces optional API_AUTH_TOKEN and checkApiQuota enforces 
   assert.equal(q21.allowed, false);
   assert.equal(q21.reason, 'rate_limit');
 });
+
+test('GET /api/<unknown> returns 404 JSON instead of SPA fallback and /healthz sets worker-src CSP header', async () => {
+  const { app } = await import('../../server');
+  const srv = await new Promise<import('node:http').Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    const addr = srv.address();
+    assert.ok(addr && typeof addr === 'object');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    const healthRes = await fetch(`${baseUrl}/healthz`);
+    assert.equal(healthRes.status, 200);
+    const csp = healthRes.headers.get('content-security-policy') || '';
+    assert.ok(csp.includes("worker-src 'self' blob:"), 'CSP header must include worker-src blob:');
+
+    const unknownApiRes = await fetch(`${baseUrl}/api/does-not-exist`);
+    assert.equal(unknownApiRes.status, 404, 'Unknown /api/* route must return HTTP 404');
+    const contentType = unknownApiRes.headers.get('content-type') || '';
+    assert.ok(contentType.includes('application/json'), 'Unknown /api/* route must return JSON');
+    const body = (await unknownApiRes.json()) as { error?: string };
+    assert.ok(typeof body.error === 'string' && body.error.length > 0);
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
+});
+
+

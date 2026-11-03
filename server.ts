@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -15,7 +16,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
+export const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const isProd =
@@ -26,19 +27,20 @@ const hops = Number(process.env.TRUST_PROXY_HOPS ?? (process.env.K_SERVICE ? 1 :
 app.set('trust proxy', hops > 0 ? hops : false);
 app.disable('x-powered-by');
 
+export const CSP_HEADER_VALUE =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self';";
+
 // Security headers (CSP, X-Content-Type-Options, Referrer-Policy)
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self';"
-  );
+  res.setHeader('Content-Security-Policy', CSP_HEADER_VALUE);
   next();
 });
 
-app.use(express.json({ limit: '2.5mb' }));
+// 3.5 MB JSON body limit accommodates MAX_BASE64_LENGTH (~2.8 MB base64 for 2 MB image) plus JSON envelope
+app.use(express.json({ limit: '3.5mb' }));
 
 // Health check endpoint
 app.get('/healthz', (_req, res) => {
@@ -121,22 +123,46 @@ export function resetRateLimitsForTest(): void {
   rateLimitMap.clear();
 }
 
+const PLACEHOLDER_AUTH_TOKENS = new Set([
+  'true',
+  'false',
+  'change-me',
+  'change-me-in-production',
+  'my_api_auth_token',
+]);
+
+function timingSafeStringEqual(candidate: string, expected: string): boolean {
+  const bufA = Buffer.from(candidate, 'utf8');
+  const bufB = Buffer.from(expected, 'utf8');
+  if (bufA.length !== bufB.length) {
+    // Compare bufB against itself to keep constant-time execution before returning false
+    crypto.timingSafeEqual(bufB, bufB);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 export function verifyApiAuth(
   headers: Record<string, string | string[] | undefined>,
-  configuredToken = process.env.API_AUTH_TOKEN
+  configuredToken = process.env.API_AUTH_TOKEN,
+  enforceInProd = isProd
 ): boolean {
-  const token = configuredToken?.trim();
-  if (!token) {
-    // When API_AUTH_TOKEN is not configured, public preview requests are allowed
-    return true;
+  const rawToken = configuredToken?.trim() ?? '';
+  const isUnconfiguredOrPlaceholder =
+    rawToken.length === 0 || PLACEHOLDER_AUTH_TOKENS.has(rawToken.toLowerCase());
+
+  if (isUnconfiguredOrPlaceholder) {
+    // In production, a valid non-placeholder API_AUTH_TOKEN is required; in development/preview, allow when unconfigured
+    return !enforceInProd;
   }
+
   const authHeader = String(headers['authorization'] || '').trim();
   if (authHeader.toLowerCase().startsWith('bearer ')) {
     const bearer = authHeader.slice(7).trim();
-    if (bearer === token) return true;
+    if (timingSafeStringEqual(bearer, rawToken)) return true;
   }
   const apiKeyHeader = String(headers['x-api-key'] || '').trim();
-  if (apiKeyHeader === token) return true;
+  if (apiKeyHeader && timingSafeStringEqual(apiKeyHeader, rawToken)) return true;
   return false;
 }
 
@@ -379,6 +405,11 @@ ${prefabLines}`;
   }
 });
 
+// Explicit 404 JSON handler for unknown /api/* routes so they never fall through to the SPA HTML fallback
+app.all('/api/*', (_req, res) => {
+  res.status(404).json({ error: 'Không tìm thấy endpoint API.' });
+});
+
 const brotliCompressAsync = promisify(zlib.brotliCompress);
 const gzipAsync = promisify(zlib.gzip);
 
@@ -411,7 +442,8 @@ export function safeDecodePathname(rawUrlPath: string): string | null {
 
 /**
  * Resolves a request pathname inside `distPath` and verifies via `path.relative(distPath, resolvedFile)`
- * that it cannot escape into parent or sibling directories (e.g. `../dist-secret`).
+ * that it cannot escape into parent or sibling directories (e.g. `../dist-secret`), while still allowing
+ * valid filenames that contain consecutive dots (e.g. `/assets/chunk..123.js`).
  */
 export function resolveSafeDistFile(distPath: string, cleanPath: string): string | null {
   if (cleanPath.includes('\0')) return null;
@@ -420,7 +452,11 @@ export function resolveSafeDistFile(distPath: string, cleanPath: string): string
     '.' + (cleanPath === '/' ? '/index.html' : cleanPath)
   );
   const rel = path.relative(distPath, resolvedFile);
-  if (!rel || rel.startsWith('..') || rel.includes('..') || path.isAbsolute(rel)) {
+  if (!rel || path.isAbsolute(rel)) {
+    return null;
+  }
+  const segments = rel.split(/[\\/]+/);
+  if (segments.includes('..')) {
     return null;
   }
   return resolvedFile;
@@ -469,10 +505,8 @@ export function serveCompressedOrStatic(distPath: string) {
       return;
     }
 
-    let cleanPath: string;
-    try {
-      cleanPath = decodeURIComponent(req.path.split('?')[0]);
-    } catch {
+    const cleanPath = safeDecodePathname(req.path);
+    if (cleanPath === null) {
       res.status(400).json({ error: 'Đường dẫn URL không hợp lệ.' });
       return;
     }
@@ -484,12 +518,8 @@ export function serveCompressedOrStatic(distPath: string) {
       return;
     }
 
-    const resolvedFile = path.resolve(
-      distPath,
-      '.' + (cleanPath === '/' ? '/index.html' : cleanPath)
-    );
-    const rel = path.relative(distPath, resolvedFile);
-    if (!rel || rel.startsWith('..') || rel.includes('..') || path.isAbsolute(rel) || cleanPath.includes('\0')) {
+    const resolvedFile = resolveSafeDistFile(distPath, cleanPath);
+    if (!resolvedFile) {
       next();
       return;
     }
@@ -591,7 +621,7 @@ async function startServer() {
   // Express JSON / payload & fallback error middleware registered LAST so it catches all route/static errors
   app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
     if (err.type === 'entity.too.large') {
-      res.status(413).json({ error: 'Kích thước dữ liệu gửi lên vượt quá giới hạn cho phép (2.5MB).' });
+      res.status(413).json({ error: 'Kích thước dữ liệu gửi lên vượt quá giới hạn cho phép (3.5MB).' });
       return;
     }
     if (err instanceof SyntaxError && 'body' in err) {

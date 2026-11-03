@@ -124,7 +124,10 @@ export default function App() {
   );
 
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(
-    initialWorldRef.current.initialObjects[0]?.id ?? null
+    () =>
+      initialWorldRef.current.initialObjects.find((o) => o.prefabId === 'windmill_cottage')?.id ??
+      initialWorldRef.current.initialObjects[0]?.id ??
+      null
   );
 
   // Undo History Stack (up to 25 steps)
@@ -150,10 +153,10 @@ export default function App() {
   const [autoRuleOnSculpt, setAutoRuleOnSculpt] = useState<boolean>(true);
 
   // Prefab Placement & Transform State (Orientation 0°-360° & Scale 0.3x-3.0x on top of 1:1 real scale)
-  const [selectedPrefab, setSelectedPrefab] = useState<PrefabId>('pluto_cryo_volcano');
+  const [selectedPrefab, setSelectedPrefab] = useState<PrefabId>('windmill_cottage');
   const [prefabCategoryFilter, setPrefabCategoryFilter] = useState<PrefabCategory | 'all'>('all');
   const [placementRotationDeg, setPlacementRotationDeg] = useState<number>(0);
-  const [placementScale, setPlacementScale] = useState<number>(1.35);
+  const [placementScale, setPlacementScale] = useState<number>(1.0);
   const [autoJunctionBlend, setAutoJunctionBlend] = useState<boolean>(true);
 
   // Atmosphere, Planetary Weather, Day/Night Cycle & Camera State
@@ -215,6 +218,7 @@ export default function App() {
     microStrokes,
     selectedObjectId,
     selectedPrefab,
+    prefabCategoryFilter,
     sculptPrefabOverride,
     sculptTool,
     spawnObjectOnSculpt,
@@ -232,6 +236,7 @@ export default function App() {
     microStrokes,
     selectedObjectId,
     selectedPrefab,
+    prefabCategoryFilter,
     sculptPrefabOverride,
     sculptTool,
     spawnObjectOnSculpt,
@@ -529,9 +534,21 @@ export default function App() {
       setSculptTool(nextTool);
       setSculptPrefabOverride('auto');
       const mapped = SCULPT_TOOL_PREFAB_MAP[nextTool];
-      if (mapped) {
-        latestStateRef.current.selectedPrefab = mapped.prefabId;
-        setSelectedPrefab(mapped.prefabId);
+      const mappedMeta = mapped
+        ? PREFAB_CATALOG.find((p) => p.id === mapped.prefabId)
+        : undefined;
+      if (mappedMeta) {
+        latestStateRef.current.selectedPrefab = mappedMeta.id;
+        latestStateRef.current.selectedObjectId = null;
+        setSelectedPrefab(mappedMeta.id);
+        setSelectedObjectId(null);
+        if (
+          latestStateRef.current.prefabCategoryFilter !== 'all' &&
+          latestStateRef.current.prefabCategoryFilter !== mappedMeta.category
+        ) {
+          latestStateRef.current.prefabCategoryFilter = mappedMeta.category;
+          setPrefabCategoryFilter(mappedMeta.category);
+        }
       }
     },
     []
@@ -539,14 +556,41 @@ export default function App() {
 
   const handleChangeSculptPrefabOverride = useCallback(
     (nextOverride: PrefabId | 'auto') => {
-      latestStateRef.current.sculptPrefabOverride = nextOverride;
-      setSculptPrefabOverride(nextOverride);
       if (nextOverride !== 'auto') {
-        latestStateRef.current.selectedPrefab = nextOverride;
-        setSelectedPrefab(nextOverride);
         const meta = PREFAB_CATALOG.find((p) => p.id === nextOverride);
-        if (meta) {
-          showToast(`Đã chọn đặt mô hình 3D: "${meta.name}". Nhấp chuột lên mặt đất để đặt.`);
+        if (!meta) return;
+        latestStateRef.current.sculptPrefabOverride = meta.id;
+        latestStateRef.current.selectedPrefab = meta.id;
+        latestStateRef.current.selectedObjectId = null;
+        setSculptPrefabOverride(meta.id);
+        setSelectedPrefab(meta.id);
+        setSelectedObjectId(null);
+        if (
+          latestStateRef.current.prefabCategoryFilter !== 'all' &&
+          latestStateRef.current.prefabCategoryFilter !== meta.category
+        ) {
+          latestStateRef.current.prefabCategoryFilter = meta.category;
+          setPrefabCategoryFilter(meta.category);
+        }
+        showToast(`Đã chọn đặt mô hình 3D: "${meta.name}". Nhấp chuột lên mặt đất để đặt.`);
+      } else {
+        latestStateRef.current.sculptPrefabOverride = 'auto';
+        setSculptPrefabOverride('auto');
+        const mapped = SCULPT_TOOL_PREFAB_MAP[latestStateRef.current.sculptTool];
+        const mappedMeta = mapped
+          ? PREFAB_CATALOG.find((p) => p.id === mapped.prefabId)
+          : undefined;
+        if (mappedMeta) {
+          latestStateRef.current.selectedPrefab = mappedMeta.id;
+          setSelectedPrefab(mappedMeta.id);
+          if (
+            latestStateRef.current.prefabCategoryFilter !== 'all' &&
+            latestStateRef.current.prefabCategoryFilter !== mappedMeta.category
+          ) {
+            latestStateRef.current.prefabCategoryFilter = mappedMeta.category;
+            setPrefabCategoryFilter(mappedMeta.category);
+          }
+          showToast(`Đã đặt theo công cụ đắp: "${mappedMeta.name}".`);
         }
       }
     },
@@ -555,15 +599,60 @@ export default function App() {
 
   const handleSelectPrefab = useCallback(
     (nextPrefab: PrefabId) => {
-      latestStateRef.current.selectedPrefab = nextPrefab;
-      latestStateRef.current.sculptPrefabOverride = nextPrefab;
+      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefab) || PREFAB_CATALOG[0];
+      const validId = meta.id;
+      latestStateRef.current.selectedPrefab = validId;
+      latestStateRef.current.sculptPrefabOverride = validId;
       latestStateRef.current.selectedObjectId = null;
-      setSelectedPrefab(nextPrefab);
-      setSculptPrefabOverride(nextPrefab);
+      setSelectedPrefab(validId);
+      setSculptPrefabOverride(validId);
       setSelectedObjectId(null);
-      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefab);
+      if (
+        latestStateRef.current.prefabCategoryFilter !== 'all' &&
+        latestStateRef.current.prefabCategoryFilter !== meta.category
+      ) {
+        latestStateRef.current.prefabCategoryFilter = meta.category;
+        setPrefabCategoryFilter(meta.category);
+      }
+      showToast(`Đã chọn "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`);
+    },
+    [showToast]
+  );
+
+  const handleChangePrefabCategoryFilter = useCallback(
+    (nextCat: PrefabCategory | 'all') => {
+      latestStateRef.current.prefabCategoryFilter = nextCat;
+      setPrefabCategoryFilter(nextCat);
+      if (nextCat === 'all') return;
+
+      const preferredByCat: Record<PrefabCategory, PrefabId> = {
+        house: 'windmill_cottage',
+        tree: 'sakura_tree',
+        mountain: 'pluto_cryo_volcano',
+        landmark: 'ancient_bridge',
+      };
+
+      const curId = latestStateRef.current.selectedPrefab;
+      const curMeta = PREFAB_CATALOG.find((p) => p.id === curId);
+      const nextPrefabId: PrefabId =
+        curMeta && curMeta.category === nextCat
+          ? curId
+          : preferredByCat[nextCat] ||
+            PREFAB_CATALOG.find((p) => p.category === nextCat)?.id ||
+            curId;
+
+      latestStateRef.current.selectedPrefab = nextPrefabId;
+      latestStateRef.current.sculptPrefabOverride = nextPrefabId;
+      latestStateRef.current.selectedObjectId = null;
+      setSelectedPrefab(nextPrefabId);
+      setSculptPrefabOverride(nextPrefabId);
+      setSelectedObjectId(null);
+
+      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefabId);
       if (meta) {
-        showToast(`Đã chọn "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`);
+        showToast(
+          `Đã chọn danh mục "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`
+        );
       }
     },
     [showToast]
@@ -654,14 +743,11 @@ export default function App() {
       if (activeTab === 'sculpt') {
         const curTool = latestStateRef.current.sculptTool;
         const curOverride = latestStateRef.current.sculptPrefabOverride;
-        const curSelectedPrefab = latestStateRef.current.selectedPrefab;
         const mapping = SCULPT_TOOL_PREFAB_MAP[curTool];
         const effectivePrefabOverride: PrefabId | 'auto' =
-          curOverride !== 'auto'
+          curOverride !== 'auto' && PREFAB_CATALOG.some((p) => p.id === curOverride)
             ? curOverride
-            : mapping
-              ? 'auto'
-              : curSelectedPrefab || 'auto';
+            : 'auto';
         const hasObjectToSpawn =
           latestStateRef.current.spawnObjectOnSculpt &&
           (Boolean(mapping) || effectivePrefabOverride !== 'auto');
@@ -922,8 +1008,10 @@ export default function App() {
         worldZ
       );
 
-      const rotRad = Number(((placementRotationDeg * Math.PI) / 180).toFixed(4));
-      const finalScale = Number(Math.max(0.3, Math.min(3.0, placementScale)).toFixed(2));
+      const curRotDeg = latestStateRef.current.placementRotationDeg;
+      const curScale = latestStateRef.current.placementScale;
+      const rotRad = Number(((curRotDeg * Math.PI) / 180).toFixed(4));
+      const finalScale = Number(Math.max(0.3, Math.min(3.0, curScale)).toFixed(2));
 
       const newObj: PlacedObject = {
         id: `prop-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -937,12 +1025,12 @@ export default function App() {
       };
 
       const candidateList = [...latestStateRef.current.placedObjects, newObj];
-      if (autoJunctionBlend) {
+      if (latestStateRef.current.autoJunctionBlend) {
         const blendRes = blendObjectsAndTerrainJunctions(
           heightMapRef.current,
           splatMapRef.current,
           colorMapRef.current,
-          biomeId,
+          latestStateRef.current.biomeId,
           candidateList,
           {
             microStrokes: latestStateRef.current.microStrokes,
@@ -951,6 +1039,7 @@ export default function App() {
           }
         );
         commitPlacedObjects(blendRes.updatedObjects);
+        latestStateRef.current.selectedObjectId = newObj.id;
         setSelectedObjectId(newObj.id);
         if (blendRes.dirtyRect) {
           dirtyRectRef.current = mergeDirtyRect(dirtyRectRef.current, blendRes.dirtyRect);
@@ -967,18 +1056,15 @@ export default function App() {
         }
       } else {
         commitPlacedObjects(candidateList);
+        latestStateRef.current.selectedObjectId = newObj.id;
         setSelectedObjectId(newObj.id);
         showToast(
-          `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] (Hướng ${placementRotationDeg}°, Cỡ ${finalScale}x) tại (${Math.round(worldX)}m, ${Math.round(worldZ)}m).`
+          `Đã đặt "${meta.name}" [1:1 ${meta.realDimensions}] (Hướng ${curRotDeg}°, Cỡ ${finalScale}x) tại (${Math.round(worldX)}m, ${Math.round(worldZ)}m).`
         );
       }
     },
     [
       selectedPrefab,
-      placementRotationDeg,
-      placementScale,
-      autoJunctionBlend,
-      biomeId,
       commitPlacedObjects,
       pushUndoSnapshot,
       showToast,
@@ -1016,15 +1102,40 @@ export default function App() {
     );
   }, [showToast]);
 
-  // Spawn prefab near map center at realistic 1:1 village distances (12m - 44m)
+  // Spawn prefab in clear foreground plaza directly in front of the camera so it is never hidden behind background mountains
   const handleSpawnPrefabAtCenter = useCallback(
-    (prefabId: PrefabId) => {
-      const offsetIndex = latestStateRef.current.placedObjects.length;
-      const angle = offsetIndex * 1.15;
-      const radius = 12 + (offsetIndex % 5) * 8;
-      const wx = Number((Math.cos(angle) * radius).toFixed(1));
-      const wz = Number((Math.sin(angle) * radius).toFixed(1));
-      handlePlacePrefabAt(wx, wz, prefabId);
+    (prefabId?: PrefabId) => {
+      const targetPrefab = prefabId || latestStateRef.current.selectedPrefab;
+      const existing = latestStateRef.current.placedObjects;
+      const foregroundSlots: Array<{ x: number; z: number }> = [
+        { x: 0, z: 10 },
+        { x: -8, z: 10 },
+        { x: 8, z: 10 },
+        { x: 0, z: 16 },
+        { x: -8, z: 16 },
+        { x: 8, z: 16 },
+        { x: -12, z: 5 },
+        { x: 11, z: 5 },
+        { x: 0, z: 4 },
+        { x: -7, z: 22 },
+        { x: 7, z: 22 },
+      ];
+
+      let chosen = foregroundSlots.find((slot) =>
+        existing.every((obj) => Math.hypot(obj.x - slot.x, obj.z - slot.z) >= 5.5)
+      );
+
+      if (!chosen) {
+        const idx = existing.length;
+        const col = (idx % 7) - 3;
+        const row = Math.floor((idx - 21) / 7) % 4;
+        chosen = {
+          x: Number((col * 6.5).toFixed(1)),
+          z: Number((6 + Math.max(0, row) * 6).toFixed(1)),
+        };
+      }
+
+      handlePlacePrefabAt(chosen.x, chosen.z, targetPrefab);
     },
     [handlePlacePrefabAt]
   );
@@ -1904,10 +2015,10 @@ export default function App() {
                   data-testid={item.testId}
                   onClick={() => {
                     setActiveRefModelIdx(idx);
-                    setSelectedPrefab(item.prefabId);
-                    setSculptPrefabOverride(item.prefabId);
+                    handleSelectPrefab(item.prefabId);
                     const found = placedObjects.find((o) => o.prefabId === item.prefabId);
                     if (found) {
+                      latestStateRef.current.selectedObjectId = found.id;
                       setSelectedObjectId(found.id);
                     }
                     setCameraPreset(item.preset);
@@ -1949,6 +2060,7 @@ export default function App() {
                 onClick={() => {
                   const found = placedObjects.find((o) => o.prefabId === currentRef.prefabId);
                   if (found) {
+                    latestStateRef.current.selectedObjectId = found.id;
                     setSelectedObjectId(found.id);
                   }
                   setCameraPreset(currentRef.preset);
@@ -1963,9 +2075,8 @@ export default function App() {
                 type="button"
                 data-testid="spawn-volcano-model-btn"
                 onClick={() => {
-                  const targetPrefab = selectedPrefab || currentRef.prefabId;
-                  setSelectedPrefab(targetPrefab);
-                  setSculptPrefabOverride(targetPrefab);
+                  const targetPrefab = latestStateRef.current.selectedPrefab || currentRef.prefabId;
+                  handleSelectPrefab(targetPrefab);
                   setActiveTab('prefabs');
                   handleSpawnPrefabAtCenter(targetPrefab);
                 }}
@@ -2027,7 +2138,7 @@ export default function App() {
         selectedPrefab={selectedPrefab}
         onSelectPrefab={handleSelectPrefab}
         prefabCategoryFilter={prefabCategoryFilter}
-        onChangePrefabCategoryFilter={setPrefabCategoryFilter}
+        onChangePrefabCategoryFilter={handleChangePrefabCategoryFilter}
         placementRotationDeg={placementRotationDeg}
         onChangePlacementRotationDeg={setPlacementRotationDeg}
         placementScale={placementScale}

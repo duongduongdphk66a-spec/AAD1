@@ -35,6 +35,17 @@ export interface TerrainField {
     h: number,
     out: Float32Array
   ): void;
+  fillSubWindow?(
+    level: Level,
+    originX: number,
+    originZ: number,
+    ringStride: number,
+    startRx: number,
+    startRz: number,
+    subW: number,
+    subH: number,
+    out: Float32Array
+  ): void;
   raycast(
     o: [number, number, number],
     d: [number, number, number],
@@ -265,6 +276,28 @@ export class UnifiedTerrainField implements TerrainField {
       for (let rx = 0; rx < w; rx++) {
         const wx = originX + rx * step;
         out[idx++] = this.sampleHeight(wx, wz, level);
+      }
+    }
+  }
+
+  fillSubWindow(
+    level: Level,
+    originX: number,
+    originZ: number,
+    ringStride: number,
+    startRx: number,
+    startRz: number,
+    subW: number,
+    subH: number,
+    out: Float32Array
+  ): void {
+    const step = spacing(level);
+    for (let rz = 0; rz < subH; rz++) {
+      const wz = originZ + (startRz + rz) * step;
+      const rowOff = (startRz + rz) * ringStride + startRx;
+      for (let rx = 0; rx < subW; rx++) {
+        const wx = originX + (startRx + rx) * step;
+        out[rowOff + rx] = this.sampleHeight(wx, wz, level);
       }
     }
   }

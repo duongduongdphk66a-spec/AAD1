@@ -1526,11 +1526,21 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       _mouseNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     };
 
+    const fallbackGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const fallbackHitTarget = new THREE.Vector3();
+
     const raycastTerrainPoint = (e: PointerEvent): THREE.Vector3 | null => {
       updateMouseFromEvent(e);
       raycaster.setFromCamera(_mouseNdc, camera);
       const hits = raycaster.intersectObject(terrainMesh, false);
-      return hits.length > 0 ? hits[0].point : null;
+      if (hits.length > 0) return hits[0].point;
+      const planeHit = raycaster.ray.intersectPlane(fallbackGroundPlane, fallbackHitTarget);
+      if (!planeHit) return null;
+      const half = WORLD_SIZE / 2;
+      const cx = Math.max(-half + 10, Math.min(half - 10, planeHit.x));
+      const cz = Math.max(-half + 10, Math.min(half - 10, planeHit.z));
+      const cy = getGroundHeightAt(latestPropsRef.current.heightMap, GRID_SIZE, WORLD_SIZE, cx, cz);
+      return fallbackHitTarget.set(cx, cy, cz);
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1707,6 +1717,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      renderer.render(scene, camera);
       emitScaleMetrics();
     };
     window.addEventListener('resize', onResize);

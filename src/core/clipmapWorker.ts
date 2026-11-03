@@ -233,6 +233,10 @@ function ensureSharedWorker(): WorkerAdapter | null {
       w.onmessage = (e: MessageEvent) => {
         for (const fn of sharedMessageListeners) fn(e.data);
       };
+      w.onerror = () => {
+        sharedWorkerInstance = null;
+        URL.revokeObjectURL(url);
+      };
       sharedWorkerInstance = {
         postMessage: (msg, transfer) => w.postMessage(msg, transfer ?? []),
         terminate: () => {
@@ -251,13 +255,14 @@ function ensureSharedWorker(): WorkerAdapter | null {
     import('node:worker_threads')
       .then(({ Worker: NodeWorker }) => {
         const nw = new NodeWorker(WORKER_SCRIPT, { eval: true });
-        nw.unref();
         nw.on('message', (data) => {
           for (const fn of sharedMessageListeners) fn(data);
         });
         nw.on('error', () => {
           sharedWorkerInstance = null;
         });
+        // Call unref() AFTER attaching 'message' listener because .on('message') re-refs the port in Node.js
+        nw.unref();
         sharedWorkerInstance = {
           postMessage: (msg) => nw.postMessage(msg),
           terminate: () => {
