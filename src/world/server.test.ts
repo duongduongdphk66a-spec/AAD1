@@ -5,6 +5,8 @@ import type { Request, Response } from 'express';
 import {
   CSP_HEADER_VALUE,
   checkApiQuota,
+  consumeGlobalAiBudget,
+  resetAiBudgetForTest,
   resetRateLimitsForTest,
   resolveSafeDistFile,
   safeDecodePathname,
@@ -93,13 +95,13 @@ test('serveCompressedOrStatic blocks sibling path traversal via path.relative, a
   );
 });
 
-test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeholder tokens, requires token in production, and checkApiQuota enforces quotas', () => {
-  // Development/preview mode when API_AUTH_TOKEN is empty or a placeholder ("true", "change-me-in-production")
+test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeholder tokens, respects requireToken flag, and checkApiQuota + consumeGlobalAiBudget enforce quotas', () => {
+  // Default / SPA mode when requireToken is false and API_AUTH_TOKEN is empty or a placeholder ("true", "change-me-in-production")
   assert.equal(verifyApiAuth({}, '', false), true);
   assert.equal(verifyApiAuth({}, 'true', false), true);
   assert.equal(verifyApiAuth({}, 'change-me-in-production', false), true);
 
-  // Production mode requires a real non-placeholder API_AUTH_TOKEN
+  // Explicit requireToken=true requires a real non-placeholder API_AUTH_TOKEN
   assert.equal(verifyApiAuth({}, '', true), false);
   assert.equal(verifyApiAuth({}, 'true', true), false);
   assert.equal(verifyApiAuth({}, 'change-me-in-production', true), false);
@@ -112,11 +114,24 @@ test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeho
   assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123', false), true);
   assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123', true), true);
 
-  // CSP includes worker-src 'self' blob: so Blob Web Workers are never blocked
+  // CSP includes worker-src 'self' blob: and frame-ancestors for AI Studio preview iframe
   assert.ok(
     CSP_HEADER_VALUE.includes("worker-src 'self' blob:"),
     'CSP must permit Blob URL Web Workers via worker-src'
   );
+  assert.ok(
+    CSP_HEADER_VALUE.includes("frame-ancestors 'self' https://aistudio.google.com") &&
+      CSP_HEADER_VALUE.includes("form-action 'self';"),
+    'CSP must permit framing by AI Studio preview and restrict form-action to self'
+  );
+
+  // Global hourly AI budget check
+  resetAiBudgetForTest();
+  assert.equal(consumeGlobalAiBudget(1000, 2), true);
+  assert.equal(consumeGlobalAiBudget(2000, 2), true);
+  assert.equal(consumeGlobalAiBudget(3000, 2), false);
+  assert.equal(consumeGlobalAiBudget(3_602_000, 2), true);
+  resetAiBudgetForTest();
 
   resetRateLimitsForTest();
   // Byte quota check (25 MB per minute ceiling)
@@ -157,6 +172,21 @@ test('GET /api/<unknown> returns 404 JSON instead of SPA fallback and /healthz s
     assert.ok(contentType.includes('application/json'), 'Unknown /api/* route must return JSON');
     const body = (await unknownApiRes.json()) as { error?: string };
     assert.ok(typeof body.error === 'string' && body.error.length > 0);
+
+    // Client error log endpoint accepts <=8KB payload with 204 and rejects oversized payload with 413
+    const logRes = await fetch(`${baseUrl}/api/client-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'boundary', message: 'Test error', label: 'Khung nhìn 3D' }),
+    });
+    assert.equal(logRes.status, 204, 'POST /api/client-log must return 204 No Content');
+
+    const hugeLogRes = await fetch(`${baseUrl}/api/client-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'error', message: 'X'.repeat(12_000) }),
+    });
+    assert.equal(hugeLogRes.status, 413, 'POST /api/client-log >8KB must return 413');
   } finally {
     await new Promise<void>((resolve) => srv.close(() => resolve()));
   }

@@ -16,5 +16,6 @@ export const titan_methane_sea: BiomeConfig = {
   "defaultTexture": "titan_methane_liquid",
   "defaultWeather": "liquid_nitrogen_snow",
   "waterLevel": -12,
-  "reliefScale": 1.12
+  "reliefScale": 1.12,
+  "roughness": 0.78
 };

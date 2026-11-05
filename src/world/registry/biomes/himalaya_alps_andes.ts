@@ -16,5 +16,6 @@ export const himalaya_alps_andes: BiomeConfig = {
   "defaultTexture": "glacier_snow",
   "defaultWeather": "himalaya_blizzard",
   "waterLevel": -28,
-  "reliefScale": 1.44
+  "reliefScale": 1.44,
+  "roughness": 1.45
 };

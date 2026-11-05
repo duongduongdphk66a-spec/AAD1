@@ -793,7 +793,7 @@ export function exportWorldToGLB(
             link.href = url;
             link.download = filename;
             link.click();
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
           }
           resolve();
         } else {
@@ -935,12 +935,6 @@ export interface SculptSpawnDiagnostics {
   skipReason?: 'no_mapping_or_override' | 'spacing_too_close';
 }
 
-let lastSculptSpawnDiagnostics: SculptSpawnDiagnostics | null = null;
-
-export function getLastSculptSpawnDiagnostics(): SculptSpawnDiagnostics | null {
-  return lastSculptSpawnDiagnostics;
-}
-
 /**
  * Spawns and grounds a 3D geological/ecosystem object (`PlacedObject`) at `(worldX, worldZ)`
  * corresponding to the active sculpting tool (or an explicit `prefabOverride`), while syncing
@@ -1003,11 +997,6 @@ export function spawnSculptLandformObject(
       spawned: false,
       skipReason: 'no_mapping_or_override',
     };
-    lastSculptSpawnDiagnostics = diagnostics;
-    console.log(
-      `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId=null (source=none, skipped: no_mapping_or_override)`,
-      diagnostics
-    );
     return {
       updatedObjects: syncedExisting,
       spawnedObject: null,
@@ -1038,11 +1027,6 @@ export function spawnSculptLandformObject(
       spawned: false,
       skipReason: 'spacing_too_close',
     };
-    lastSculptSpawnDiagnostics = diagnostics;
-    console.log(
-      `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId="${chosenPrefabId}" (source=${resolutionSource}, skipped: spacing_too_close)`,
-      diagnostics
-    );
     return {
       updatedObjects: syncedExisting,
       spawnedObject: null,
@@ -1083,11 +1067,6 @@ export function spawnSculptLandformObject(
     position: { x: clampedX, y: groundY, z: clampedZ },
     spawned: true,
   };
-  lastSculptSpawnDiagnostics = diagnostics;
-  console.log(
-    `[spawnSculptLandformObject] tool="${tool}" override="${requestedOverride}" -> prefabId="${chosenPrefabId}" (source=${resolutionSource}, spawned=true at [${clampedX}, ${groundY}, ${clampedZ}])`,
-    diagnostics
-  );
 
   return {
     updatedObjects: [...syncedExisting, spawnedObject],

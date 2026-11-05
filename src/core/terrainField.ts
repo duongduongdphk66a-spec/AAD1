@@ -269,15 +269,7 @@ export class UnifiedTerrainField implements TerrainField {
     h: number,
     out: Float32Array
   ): void {
-    const step = spacing(level);
-    let idx = 0;
-    for (let rz = 0; rz < h; rz++) {
-      const wz = originZ + rz * step;
-      for (let rx = 0; rx < w; rx++) {
-        const wx = originX + rx * step;
-        out[idx++] = this.sampleHeight(wx, wz, level);
-      }
-    }
+    this.fillSubWindow(level, originX, originZ, w, 0, 0, w, h, out);
   }
 
   fillSubWindow(

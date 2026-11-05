@@ -149,6 +149,7 @@ export interface BiomeConfig {
   defaultWeather?: WeatherId;
   waterLevel: number;
   reliefScale: number;
+  roughness: number;
 }
 
 export interface TextureBrushConfig {

@@ -16,5 +16,6 @@ export const europa_chaos_ridge: BiomeConfig = {
   "defaultTexture": "pluto_nitrogen_ice",
   "defaultWeather": "cryo_geyser_blizzard",
   "waterLevel": -32,
-  "reliefScale": 1.26
+  "reliefScale": 1.26,
+  "roughness": 1.08
 };

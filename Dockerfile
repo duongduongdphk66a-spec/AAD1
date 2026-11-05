@@ -1,24 +1,20 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
-
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 RUN npm ci
-
 COPY . .
 RUN npm run build
 
 FROM node:22-alpine AS runner
 WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=3000
-
-COPY --from=builder /app/package.json /app/package-lock.json* ./
-COPY --from=builder /app/node_modules ./node_modules
+ENV NODE_ENV=production PORT=3000
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.ts ./server.ts
-COPY --from=builder /app/src/world ./src/world
-COPY --from=builder /app/src/core ./src/core
-COPY --from=builder /app/tsconfig.json ./tsconfig.json
-
+COPY --from=builder /app/server.js ./server.js
+USER node
 EXPOSE 3000
-CMD ["npx", "tsx", "server.ts", "--prod"]
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:3000/healthz || exit 1
+CMD ["node", "server.js", "--prod"]
+
+

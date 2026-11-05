@@ -16,5 +16,6 @@ export const corot_lava_ocean: BiomeConfig = {
   "defaultTexture": "volcanic_lava",
   "defaultWeather": "molten_silicate_rain",
   "waterLevel": -18,
-  "reliefScale": 1.38
+  "reliefScale": 1.38,
+  "roughness": 1.38
 };

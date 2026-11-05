@@ -16,5 +16,6 @@ export const natlan_volcano_abyss: BiomeConfig = {
   "defaultTexture": "volcanic_lava",
   "defaultWeather": "ash_ember_fall",
   "waterLevel": -60,
-  "reliefScale": 1.4
+  "reliefScale": 1.4,
+  "roughness": 1.35
 };

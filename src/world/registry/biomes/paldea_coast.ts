@@ -15,5 +15,6 @@ export const paldea_coast: BiomeConfig = {
   "waterDeepHex": "#0369a1",
   "defaultTexture": "desert_sand",
   "waterLevel": -15,
-  "reliefScale": 0.92
+  "reliefScale": 0.92,
+  "roughness": 0.65
 };

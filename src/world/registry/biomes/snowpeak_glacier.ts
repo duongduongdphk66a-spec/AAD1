@@ -15,5 +15,6 @@ export const snowpeak_glacier: BiomeConfig = {
   "waterDeepHex": "#1d4ed8",
   "defaultTexture": "glacier_snow",
   "waterLevel": -35,
-  "reliefScale": 1.22
+  "reliefScale": 1.22,
+  "roughness": 1.25
 };

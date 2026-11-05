@@ -60,6 +60,7 @@ export interface BrushEngine {
   redo(): Rect | null;
   canUndo(): boolean;
   canRedo(): boolean;
+  historyDepth(): number;
   estimateCost(radiusMeters: number): BrushCostEstimate;
 }
 
@@ -478,6 +479,10 @@ export class MultiResBrushEngine implements BrushEngine {
 
   canRedo(): boolean {
     return this.redoStack.length > 0;
+  }
+
+  historyDepth(): number {
+    return this.undoStack.length;
   }
 
   undo(): Rect | null {

@@ -16,5 +16,6 @@ export const kepler_crystalline: BiomeConfig = {
   "defaultTexture": "exoplanet_basalt",
   "defaultWeather": "exoplanet_meteor_shower",
   "waterLevel": -30,
-  "reliefScale": 1.32
+  "reliefScale": 1.32,
+  "roughness": 1.28
 };

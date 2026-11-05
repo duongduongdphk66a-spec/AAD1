@@ -16,5 +16,6 @@ export const boreal_taiga_forest: BiomeConfig = {
   "defaultTexture": "taiga_moss_needles",
   "defaultWeather": "clear_sky",
   "waterLevel": -22,
-  "reliefScale": 1.16
+  "reliefScale": 1.16,
+  "roughness": 0.82
 };

@@ -15,5 +15,6 @@ export const liyue_amber: BiomeConfig = {
   "waterDeepHex": "#0f766e",
   "defaultTexture": "earth_soil",
   "waterLevel": -30,
-  "reliefScale": 1.25
+  "reliefScale": 1.25,
+  "roughness": 1.15
 };

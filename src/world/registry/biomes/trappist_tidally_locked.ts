@@ -16,5 +16,6 @@ export const trappist_tidally_locked: BiomeConfig = {
   "defaultTexture": "exoplanet_basalt",
   "defaultWeather": "ion_aurora_tempest",
   "waterLevel": -25,
-  "reliefScale": 1.25
+  "reliefScale": 1.25,
+  "roughness": 1.2
 };

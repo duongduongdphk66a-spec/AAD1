@@ -1,7 +1,19 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import * as THREE from 'three';
 import { createTerrainV3Engine } from '../src/core/terrainV3Controller';
 import { BASE_N, TILE, snapToGrid, spacing } from '../src/core/units';
 import { PlacedObject } from '../src/world/registry';
+
+function runCalibrationLoop(): number {
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 1_000_000; i++) {
+    acc += Math.sin(i * 0.001) * Math.cos(i * 0.002);
+  }
+  if (acc === Number.NaN) console.log(acc);
+  return Math.max(0.1, performance.now() - t0);
+}
 
 function generateObjects(count: number): PlacedObject[] {
   const list: PlacedObject[] = [];
@@ -25,6 +37,8 @@ function generateObjects(count: number): PlacedObject[] {
 
 function runBenchmark(): void {
   console.log('=== AetherTerra 3D v3 Performance Benchmark ===\n');
+  const calibMs = runCalibrationLoop();
+  const recordedMetrics: Record<string, number> = {};
 
   const baseHeight = new Float32Array(BASE_N * BASE_N);
   for (let i = 0; i < baseHeight.length; i++) {
@@ -46,6 +60,7 @@ function runBenchmark(): void {
     engine.linkSystem.syncObjects(objs);
     const links = engine.linkSystem.autoConnectAll(45);
     const dt = performance.now() - t0;
+    if (n === 800) recordedMetrics.linkBuild800Ms = Number(dt.toFixed(2));
     const meshCount = engine.linkSystem.getMergedGroup().children.length;
     console.log(
       `   ${String(n).padStart(5)} | ${dt.toFixed(2).padStart(12)} ms | ${String(meshCount).padStart(10)} | ${String(links.length).padStart(13)}`
@@ -66,6 +81,7 @@ function runBenchmark(): void {
     engine.composeWindow(0, originX, originZ, TILE, TILE, outWin);
   }
   const avgWinMs = (performance.now() - w0) / iterations;
+  recordedMetrics.composeWindowL0Ms = Number(avgWinMs.toFixed(2));
   console.log(`   Average 256×256 L0 window compose: ${avgWinMs.toFixed(2)} ms`);
 
   // 3. 1,000 brush stamps at radii 1m, 10m, 100m
@@ -81,6 +97,7 @@ function runBenchmark(): void {
     }
     bEngine.brushEngine.endStroke();
     const totalMs = performance.now() - b0;
+    if (r === 10) recordedMetrics.brush1000StampsR10Ms = Number(totalMs.toFixed(2));
     const stats = bEngine.tileStore.stats();
     console.log(
       `   Radius ${String(r).padStart(3)} m (L${bEngine.brushEngine.selectLevel(r)}): ${(totalMs / 1000).toFixed(3)} ms/stamp (Total: ${totalMs.toFixed(1)} ms, Resident tiles: ${stats.tiles}, ${(stats.bytes / (1024 * 1024)).toFixed(2)} MB)`
@@ -113,6 +130,7 @@ function runBenchmark(): void {
     }
     frameTimes.sort((a, b) => a - b);
     const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+    if (speed === 6) recordedMetrics.clipmapUpdateAvgMs = Number(avg.toFixed(2));
     const p95 = frameTimes[Math.floor(frameTimes.length * 0.95)];
     console.log(
       `   ${ `${speed} m/s`.padStart(12) } | ${avg.toFixed(2).padStart(8)} | ${p95.toFixed(2).padStart(8)} | ${`${overBudget}/300`.padStart(16)}`
@@ -120,6 +138,12 @@ function runBenchmark(): void {
   }
 
   engine.dispose();
+
+  const outPath = path.resolve(process.cwd(), 'bench/out.json');
+  fs.writeFileSync(
+    outPath,
+    JSON.stringify({ calibMs: Number(calibMs.toFixed(2)), metrics: recordedMetrics }, null, 2)
+  );
 }
 
 runBenchmark();

@@ -16,5 +16,6 @@ export const venus_ishtar: BiomeConfig = {
   "defaultTexture": "venus_sulfur",
   "defaultWeather": "venus_acid_rain",
   "waterLevel": -50,
-  "reliefScale": 1.18
+  "reliefScale": 1.18,
+  "roughness": 1.12
 };

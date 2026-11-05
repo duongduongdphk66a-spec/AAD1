@@ -16,5 +16,6 @@ export const sahara_atacama_gobi: BiomeConfig = {
   "defaultTexture": "desert_sand",
   "defaultWeather": "clear_sky",
   "waterLevel": -48,
-  "reliefScale": 1.05
+  "reliefScale": 1.05,
+  "roughness": 0.55
 };

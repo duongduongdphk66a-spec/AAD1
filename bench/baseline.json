@@ -1,0 +1,9 @@
+{
+  "calibMs": 10,
+  "metrics": {
+    "linkBuild800Ms": 45,
+    "composeWindowL0Ms": 12,
+    "brush1000StampsR10Ms": 180,
+    "clipmapUpdateAvgMs": 4.5
+  }
+}

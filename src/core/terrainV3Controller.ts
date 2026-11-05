@@ -28,6 +28,15 @@ import {
 } from './tileStore';
 import { ADDRESSABLE_SAMPLES_L0, BASE_N, Level, Rect, tileSpan } from './units';
 
+export type TerrainSaveStatus = 'saving' | 'saved';
+
+export interface PostImportIntegrityResult {
+  totalTilesChecked: number;
+  unsyncedTilesFound: number;
+  autosaveTriggered: boolean;
+  remainingDirtyTiles: number;
+}
+
 export interface TerrainV3EngineBundle {
   readonly seed: number;
   readonly tileStore: TileStore;
@@ -61,9 +70,17 @@ export interface TerrainV3EngineBundle {
     h: number,
     out?: Float32Array
   ): Float32Array;
-  exportWorldSaveV3(objects: readonly PlacedObject[]): Promise<Blob>;
+  exportWorldSaveV3(
+    objects: readonly PlacedObject[],
+    extras?: Pick<WorldSaveV3, 'microStrokes' | 'splatLayers' | 'settings'>
+  ): Promise<Blob>;
   importWorldSaveV3(blob: Blob): Promise<WorldSaveV3>;
+  verifyPostImportIntegrity(): Promise<PostImportIntegrityResult>;
   flushAutosave(): Promise<void>;
+  getSaveStatus(): TerrainSaveStatus;
+  onSaveStatusChange(
+    listener: (status: TerrainSaveStatus, dirtyTiles: number) => void
+  ): () => void;
   getHudMetrics(fps?: number): {
     addressableSamples: number;
     residentTiles: number;
@@ -87,12 +104,13 @@ export function createTerrainV3Engine(
   seed = 1337,
   useIndexedDb = typeof indexedDB !== 'undefined'
 ): TerrainV3EngineBundle {
+  let currentSeed = seed;
   const persistence = useIndexedDb
     ? new IndexedDbTilePersistence('aetherterra-v3-tiles')
     : new InMemoryTilePersistence();
 
   const tileStore = new SparseTileStore(512, persistence);
-  const detailGen = new DeterministicDetailGenerator(seed);
+  const detailGen = new DeterministicDetailGenerator(currentSeed);
   const stampIndex = new SpatialStampIndex();
   const terrainField = new UnifiedTerrainField(
     initialBaseHeightMap,
@@ -106,18 +124,43 @@ export function createTerrainV3Engine(
   const scheduler = new Scheduler();
   const stampOverrides = new Map<string, Partial<Stamp>>();
 
+  scheduler.syncWorkerTerrainState(
+    terrainField.getBaseHeightMap(),
+    detailGen.getParams(),
+    detailGen.isEnabled(),
+    detailGen.getBiomeRoughness()
+  );
+
   let clipmap: ClipmapRenderer | null = null;
   let isBrushDragging = false;
   let linkRebuildTimer: ReturnType<typeof setTimeout> | null = null;
   let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let saveStatus: TerrainSaveStatus = 'saved';
+  const saveStatusListeners = new Set<
+    (status: TerrainSaveStatus, dirtyTiles: number) => void
+  >();
+
+  const emitSaveStatus = (explicitStatus?: TerrainSaveStatus) => {
+    const dirtyCount = tileStore.stats().dirty;
+    const nextStatus: TerrainSaveStatus =
+      explicitStatus ?? (dirtyCount > 0 ? 'saving' : 'saved');
+    saveStatus = nextStatus;
+    for (const fn of saveStatusListeners) {
+      fn(saveStatus, dirtyCount);
+    }
+  };
 
   const scheduleDebouncedAutosave = () => {
+    emitSaveStatus('saving');
     if (autosaveTimer !== null) {
       clearTimeout(autosaveTimer);
     }
     autosaveTimer = setTimeout(() => {
       autosaveTimer = null;
-      void tileStore.flush();
+      emitSaveStatus('saving');
+      void tileStore.flush().finally(() => {
+        emitSaveStatus();
+      });
     }, 2000);
     if (typeof (autosaveTimer as unknown as { unref?: () => void }).unref === 'function') {
       (autosaveTimer as unknown as { unref: () => void }).unref();
@@ -150,7 +193,9 @@ export function createTerrainV3Engine(
   };
 
   const bundle: TerrainV3EngineBundle = {
-    seed,
+    get seed() {
+      return currentSeed;
+    },
     tileStore,
     detailGen,
     stampIndex,
@@ -263,25 +308,42 @@ export function createTerrainV3Engine(
       return target;
     },
 
-    async exportWorldSaveV3(objects: readonly PlacedObject[]): Promise<Blob> {
-      const baseHeight = terrainField.getBaseHeightMap();
-      const baseSplat = new Uint8Array(BASE_N * BASE_N * 4);
-      const state: WorldSaveV3 = {
-        version: 3,
-        seed,
-        worldSize: 10000,
-        baseHeight,
-        baseSplat,
-        tiles: extractNonEmptyTilesForSave(tileStore.entries()),
-        objects: [...objects],
-        stamps: [...stampIndex.list()],
-        links: [...linkSystem.listLinks()],
-      };
-      return exportAtw(state);
+    async exportWorldSaveV3(
+      objects: readonly PlacedObject[],
+      extras?: Pick<WorldSaveV3, 'microStrokes' | 'splatLayers' | 'settings'>
+    ): Promise<Blob> {
+      emitSaveStatus('saving');
+      try {
+        if (tileStore.stats().dirty > 0) {
+          await bundle.flushAutosave();
+        }
+        const baseHeight = terrainField.getBaseHeightMap();
+        const baseSplat = new Uint8Array(BASE_N * BASE_N * 4);
+        const state: WorldSaveV3 = {
+          version: 3,
+          seed: currentSeed,
+          worldSize: 10000,
+          baseHeight,
+          baseSplat,
+          tiles: extractNonEmptyTilesForSave(tileStore.entries()),
+          objects: [...objects],
+          stamps: [...stampIndex.list()],
+          links: [...linkSystem.listLinks()],
+          ...extras,
+        };
+        const blob = await exportAtw(state);
+        emitSaveStatus();
+        return blob;
+      } catch (err) {
+        emitSaveStatus();
+        throw err;
+      }
     },
 
     async importWorldSaveV3(blob: Blob): Promise<WorldSaveV3> {
+      emitSaveStatus('saving');
       const state = await importAtw(blob);
+      currentSeed = state.seed;
       detailGen.configure({ seed: state.seed });
       tileStore.clear();
       for (const t of state.tiles) {
@@ -289,20 +351,58 @@ export function createTerrainV3Engine(
         tile.min = t.min;
         tile.scale = t.scale;
         tile.data.set(t.data);
-        tile.dirty = false;
+        tileStore.markTileDirty(tile);
       }
       stampIndex.clear();
       for (const s of state.stamps) {
         stampIndex.upsert(s);
       }
       terrainField.setBaseHeightMap(state.baseHeight);
+      scheduler.syncWorkerTerrainState(
+        state.baseHeight,
+        detailGen.getParams(),
+        detailGen.isEnabled(),
+        detailGen.getBiomeRoughness()
+      );
       linkSystem.syncObjects(state.objects);
       linkSystem.clearLinks();
       for (const l of state.links) {
         linkSystem.upsertLink(l);
       }
       splatHandle.syncBaseSplatFromField();
+      await bundle.verifyPostImportIntegrity();
       return state;
+    },
+
+    async verifyPostImportIntegrity(): Promise<PostImportIntegrityResult> {
+      const entries = tileStore.entries();
+      let unsyncedTilesFound = 0;
+      for (const tile of entries) {
+        if (tile.dirty) {
+          unsyncedTilesFound++;
+        }
+      }
+      const statsDirty = tileStore.stats().dirty;
+      const totalUnsynced = Math.max(unsyncedTilesFound, statsDirty);
+
+      if (totalUnsynced > 0) {
+        emitSaveStatus('saving');
+        await bundle.flushAutosave();
+        return {
+          totalTilesChecked: entries.length,
+          unsyncedTilesFound: totalUnsynced,
+          autosaveTriggered: true,
+          remainingDirtyTiles: tileStore.stats().dirty,
+        };
+      }
+
+      emitSaveStatus('saved');
+      return {
+        totalTilesChecked: entries.length,
+        unsyncedTilesFound: 0,
+        autosaveTriggered: false,
+        remainingDirtyTiles: 0,
+      };
     },
 
     async flushAutosave(): Promise<void> {
@@ -310,7 +410,25 @@ export function createTerrainV3Engine(
         clearTimeout(autosaveTimer);
         autosaveTimer = null;
       }
-      await tileStore.flush();
+      emitSaveStatus('saving');
+      try {
+        await tileStore.flush();
+      } finally {
+        emitSaveStatus();
+      }
+    },
+
+    getSaveStatus(): TerrainSaveStatus {
+      return tileStore.stats().dirty > 0 ? 'saving' : saveStatus;
+    },
+
+    onSaveStatusChange(
+      listener: (status: TerrainSaveStatus, dirtyTiles: number) => void
+    ): () => void {
+      saveStatusListeners.add(listener);
+      return () => {
+        saveStatusListeners.delete(listener);
+      };
     },
 
     getHudMetrics(fps = 60) {
@@ -351,6 +469,7 @@ export function createTerrainV3Engine(
 
     dispose(): void {
       unsubscribeAutosave();
+      saveStatusListeners.clear();
       if (autosaveTimer !== null) {
         clearTimeout(autosaveTimer);
         autosaveTimer = null;

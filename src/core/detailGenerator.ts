@@ -1,4 +1,5 @@
 import { MAX_LEVEL, deterministicGradientNoise2D, spacing } from './units';
+import { BIOMES, BiomeId } from '../world/registry';
 
 export interface DetailParams {
   seed: number;
@@ -12,6 +13,7 @@ export interface DetailGenerator {
   configure(p: Partial<DetailParams>): void;
   getParams(): DetailParams;
   setBiome(biomeId: string): void;
+  getBiomeRoughness(): number;
   setEnabled(enabled: boolean): void;
   isEnabled(): boolean;
   sample(x: number, z: number, level: number, baseSlope?: number): number;
@@ -26,25 +28,6 @@ export interface DetailGenerator {
   ): void;
 }
 
-const BIOME_ROUGHNESS_MAP: Record<string, number> = {
-  mondstadt_meadow: 0.72,
-  liyue_amber: 1.15,
-  inazuma_sakura: 0.85,
-  snowpeak_glacier: 1.25,
-  paldea_coast: 0.65,
-  sahara_dune_sea: 0.55,
-  volcanic_caldera: 1.35,
-  himalaya_roof: 1.45,
-  amazon_canopy: 0.68,
-  siberian_taiga: 0.82,
-  mars_olympus: 1.18,
-  venus_highlands: 1.12,
-  titan_hydrocarbon: 0.78,
-  pluto_sputnik: 0.92,
-  europa_chaos: 1.08,
-  corot_lava_world: 1.38,
-};
-
 export class DeterministicDetailGenerator implements DetailGenerator {
   private params: DetailParams = {
     seed: 1337,
@@ -53,7 +36,7 @@ export class DeterministicDetailGenerator implements DetailGenerator {
     maxDetailMeters: 2.0,
   };
   private biomeId = 'mondstadt_meadow';
-  private biomeRoughness = 0.72;
+  private biomeRoughness = BIOMES.mondstadt_meadow.roughness;
   private enabled = true;
 
   private octaveTableByLevel: Array<
@@ -88,8 +71,15 @@ export class DeterministicDetailGenerator implements DetailGenerator {
 
   setBiome(biomeId: string): void {
     this.biomeId = biomeId;
-    this.biomeRoughness = BIOME_ROUGHNESS_MAP[biomeId] ?? 0.85;
+    this.biomeRoughness =
+      Object.hasOwn(BIOMES, biomeId)
+        ? BIOMES[biomeId as BiomeId].roughness
+        : 0.85;
     this.rebuildOctaveTable();
+  }
+
+  getBiomeRoughness(): number {
+    return this.biomeRoughness;
   }
 
   setEnabled(enabled: boolean): void {

@@ -1,3 +1,4 @@
+import 'fake-indexeddb/auto';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
@@ -9,11 +10,24 @@ import { computeClipmapMorphAlpha, snapRingOrigin } from '../core/clipmapRendere
 import { DeterministicDetailGenerator } from '../core/detailGenerator';
 import { NonDestructiveLinkSystem } from '../core/linkSystem';
 import {
+  MAX_ATW_CHUNKS,
+  WorldSaveV3,
   assertSafeJsonKeys,
+  crc32,
   exportAtw,
   importAtw,
   migrateV2ToV3,
+  validateSettingsV3,
 } from '../core/persistenceV3';
+import { clearSessions, loadNewestSession, putSession } from '../core/sessionStore';
+import {
+  BrushStrokeCommand,
+  CommandHistoryManager,
+  ImportCommand,
+  ObjectsCommand,
+  SettingsCommand,
+  WorldSettingsState,
+} from '../core/undoCommands';
 import { Scheduler } from '../core/scheduler';
 import { evaluateProceduralSplatColor } from '../core/splatMaterial';
 import {
@@ -41,7 +55,16 @@ import {
   tileSpan,
   unpackTileKey,
 } from '../core/units';
+import {
+  encodeHeightmapRawLittleEndian,
+  exportHeightmap16,
+  reconstructHeightFromUint16,
+} from './exportHeightmap';
 import { serializeWorldToSavePayload } from './generation';
+import {
+  sniffImageMimeType,
+  validateReconstructAiPayload,
+} from './reconstructValidation';
 import { PlacedObject } from './registry';
 
 describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive Stamp/Link Engine', () => {
@@ -413,14 +436,22 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
         rotationY: 0,
       });
     }
-    // Warm up JIT once before measuring
-    engine.linkSystem.syncObjects(objects800.slice(0, 40));
-    engine.linkSystem.autoConnectAll(45);
 
-    const t0 = performance.now();
-    engine.linkSystem.syncObjects(objects800);
-    engine.linkSystem.autoConnectAll(45);
-    const elapsedMs = performance.now() - t0;
+    const timeBuild = (objs: PlacedObject[]) => {
+      const t = performance.now();
+      engine.linkSystem.syncObjects(objs);
+      engine.linkSystem.autoConnectAll(45);
+      return performance.now() - t;
+    };
+    const bestOf = (n: number, fn: () => number) => {
+      let best = Infinity;
+      for (let i = 0; i < n; i++) best = Math.min(best, fn());
+      return best;
+    };
+
+    timeBuild(objects800.slice(0, 100)); // warm up JIT
+    const t100 = Math.max(0.2, bestOf(3, () => timeBuild(objects800.slice(0, 100))));
+    const elapsedMs = bestOf(3, () => timeBuild(objects800));
 
     const mergedGroup = engine.linkSystem.getMergedGroup();
     assert.ok(
@@ -428,13 +459,14 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
       `Expected <= 2 meshes in merged link group, got ${mergedGroup.children.length}`
     );
     assert.ok(
-      elapsedMs < 250,
-      `Expected fast O(N) spatial hash link build for 800 objects (< 250ms), took ${elapsedMs.toFixed(1)}ms`
+      elapsedMs < 50 && elapsedMs < t100 * 20,
+      `Expected near-linear O(N) spatial hash link build for 800 objects (< 50ms and < 20x 100-obj), took ${elapsedMs.toFixed(1)}ms (100-obj: ${t100.toFixed(1)}ms)`
     );
 
     // Also verify TerrainField.fillSubWindow matches sampleHeight
     const ringBuf = new Float32Array(TILE * TILE);
-    engine.terrainField.fillSubWindow?.(0, -10, -10, TILE, 4, 6, 8, 8, ringBuf);
+    assert.equal(typeof engine.terrainField.fillSubWindow, 'function');
+    engine.terrainField.fillSubWindow!(0, -10, -10, TILE, 4, 6, 8, 8, ringBuf);
     const step0 = spacing(0);
     for (let rz = 0; rz < 8; rz++) {
       for (let rx = 0; rx < 8; rx++) {
@@ -495,15 +527,25 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     );
     const heightAtStrokeBefore = engine.terrainField.sampleHeight(15, -15, 0);
 
-    // Export binary .atw and import into a fresh engine
-    const blob = await engine.exportWorldSaveV3(objs);
+    // Export binary .atw with microStrokes and import into a fresh engine with different initial seed (1)
+    const blob = await engine.exportWorldSaveV3(objs, {
+      microStrokes: [{ id: 'ms-1', x: 4, z: -4, radius: 8, brushId: 'emerald_grass' }],
+    });
     assert.ok(blob.size > 32, 'Exported .atw blob must be non-empty');
 
     const freshEngine = createTerrainV3Engine(new Float32Array(BASE_N * BASE_N), 1, false);
     const imported = await freshEngine.importWorldSaveV3(blob);
     assert.equal(imported.version, 3);
+    assert.equal(imported.seed, 2026);
+    assert.equal(freshEngine.seed, 2026, 'Engine seed getter must update to imported seed');
     assert.equal(imported.objects.length, 2);
+    assert.equal(imported.microStrokes?.length, 1);
     assert.ok(imported.tiles.length >= 1);
+
+    // Verify re-exporting from freshEngine preserves seed 2026
+    const reExportedBlob = await freshEngine.exportWorldSaveV3(imported.objects);
+    const reImported = await importAtw(reExportedBlob);
+    assert.equal(reImported.seed, 2026, 'Re-exported .atw must preserve imported seed 2026');
 
     const heightAtStrokeAfter = freshEngine.terrainField.sampleHeight(15, -15, 0);
     assert.ok(Math.abs(heightAtStrokeAfter - heightAtStrokeBefore) < 1e-3);
@@ -662,4 +704,354 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
       );
     }
   });
+
+  it('11. Post-import integrity check (verifyPostImportIntegrity) & save status transitions prevent .atw brush data loss', async () => {
+    const baseMap = new Float32Array(BASE_N * BASE_N);
+    const sourceEngine = createTerrainV3Engine(baseMap, 8888, false);
+    const observedStatuses: string[] = [];
+    const unsubSource = sourceEngine.onSaveStatusChange((status) => {
+      observedStatuses.push(status);
+    });
+
+    assert.equal(sourceEngine.getSaveStatus(), 'saved');
+
+    // Apply a brush stroke and verify status transitions to 'saving' with dirty tiles > 0
+    sourceEngine.applySculptStrokeStamp(20, -20, 4.0, 80, 'raise', 0.1, 2);
+    assert.equal(sourceEngine.getSaveStatus(), 'saving');
+    assert.ok(sourceEngine.tileStore.stats().dirty > 0, 'Sculpt stroke must mark tiles dirty');
+
+    // Run verifyPostImportIntegrity directly on dirty tiles
+    const manualIntegrity = await sourceEngine.verifyPostImportIntegrity();
+    assert.equal(manualIntegrity.autosaveTriggered, true);
+    assert.ok(manualIntegrity.unsyncedTilesFound > 0);
+    assert.equal(manualIntegrity.remainingDirtyTiles, 0);
+    assert.equal(sourceEngine.getSaveStatus(), 'saved');
+    assert.ok(observedStatuses.includes('saving'));
+    assert.equal(observedStatuses[observedStatuses.length - 1], 'saved');
+
+    const expectedHeightAtBrush = sourceEngine.terrainField.sampleHeight(20, -20, 0);
+    const atwBlob = await sourceEngine.exportWorldSaveV3([]);
+
+    // Import into a target engine and track save status transitions during importWorldSaveV3
+    const targetEngine = createTerrainV3Engine(new Float32Array(BASE_N * BASE_N), 1, false);
+    const targetStatuses: Array<{ status: string; dirty: number }> = [];
+    const unsubTarget = targetEngine.onSaveStatusChange((status, dirty) => {
+      targetStatuses.push({ status, dirty });
+    });
+
+    await targetEngine.importWorldSaveV3(atwBlob);
+
+    // Must have transitioned through 'saving' during import and ended at 'saved' with 0 dirty tiles
+    assert.ok(
+      targetStatuses.some((s) => s.status === 'saving'),
+      'Import must emit saving status while dirty tiles are being synchronized'
+    );
+    assert.equal(targetEngine.getSaveStatus(), 'saved');
+    assert.equal(targetEngine.tileStore.stats().dirty, 0);
+
+    // Even if we force LRU eviction to 0 resident tiles and page back in, imported brush data must survive in persistence
+    (targetEngine.tileStore as SparseTileStore).evict();
+    const heightAfterImportAndFlush = targetEngine.terrainField.sampleHeight(20, -20, 0);
+    assert.ok(
+      Math.abs(heightAfterImportAndFlush - expectedHeightAtBrush) < 1e-3,
+      'Imported brush height must remain intact after post-import integrity flush'
+    );
+
+    unsubSource();
+    unsubTarget();
+    sourceEngine.dispose();
+    targetEngine.dispose();
+  });
+
+  it('12. SessionStore (fake-indexeddb) alternates slots a/b and returns the newest session', async () => {
+    await clearSessions();
+    assert.equal(await loadNewestSession(), null);
+
+    const bytesA = new Uint8Array([1, 2, 3, 4]).buffer;
+    const bytesB = new Uint8Array([9, 8, 7, 6, 5]).buffer;
+
+    await putSession('a', { savedAt: 1000, title: 'Phiên A', bytes: bytesA });
+    const afterA = await loadNewestSession();
+    assert.ok(afterA !== null);
+    assert.equal(afterA.title, 'Phiên A');
+    assert.equal(afterA.savedAt, 1000);
+
+    await putSession('b', { savedAt: 2500, title: 'Phiên B Mới Hơn', bytes: bytesB });
+    const afterB = await loadNewestSession();
+    assert.ok(afterB !== null);
+    assert.equal(afterB.title, 'Phiên B Mới Hơn');
+    assert.equal(afterB.savedAt, 2500);
+    assert.deepEqual(new Uint8Array(afterB.bytes), new Uint8Array([9, 8, 7, 6, 5]));
+
+    // Overwrite slot 'a' with an even newer timestamp (3500) while keeping slot 'b' intact
+    await putSession('a', { savedAt: 3500, title: 'Phiên A Cập Nhật', bytes: bytesA });
+    const afterA2 = await loadNewestSession();
+    assert.ok(afterA2 !== null);
+    assert.equal(afterA2.title, 'Phiên A Cập Nhật');
+    assert.equal(afterA2.savedAt, 3500);
+
+    await clearSessions();
+    assert.equal(await loadNewestSession(), null);
+  });
+
+  it('13. ATW v3 settings metadata, CRC32 corruption detection, 1000-tile roundtrip, and ceiling guard', async () => {
+    const baseHeight = new Float32Array(BASE_N * BASE_N);
+    const baseSplat = new Uint8Array(BASE_N * BASE_N * 4);
+    const sharedData = new Int16Array(TILE * TILE);
+    sharedData[0] = 1234;
+
+    // 1. 1,000 tiles + settings roundtrip
+    const thousandTiles: WorldSaveV3['tiles'] = [];
+    for (let i = 0; i < 1000; i++) {
+      thousandTiles.push({
+        level: 0,
+        tx: i % 100,
+        tz: Math.floor(i / 100),
+        kind: 'height',
+        min: -10,
+        scale: 0.01,
+        data: sharedData,
+      });
+    }
+
+    const state1000: WorldSaveV3 = {
+      version: 3,
+      seed: 4242,
+      worldSize: 10000,
+      baseHeight,
+      baseSplat,
+      tiles: thousandTiles,
+      objects: [],
+      stamps: [],
+      links: [],
+      settings: {
+        biomeId: 'snowpeak_glacier',
+        waterLevel: -8.5,
+        regionTitle: 'Đỉnh Băng Ngàn Ô',
+      },
+    };
+
+    const blob1000 = await exportAtw(state1000);
+    const imported1000 = await importAtw(blob1000);
+    assert.equal(imported1000.tiles.length, 1000);
+    assert.deepEqual(imported1000.settings, {
+      biomeId: 'snowpeak_glacier',
+      waterLevel: -8.5,
+      regionTitle: 'Đỉnh Băng Ngàn Ô',
+    });
+
+    // Validate settings fallback behavior
+    assert.deepEqual(validateSettingsV3({ biomeId: 'unknown_biome', waterLevel: 99999, regionTitle: 'X' }), {
+      biomeId: 'mondstadt_meadow',
+      waterLevel: 5000,
+      regionTitle: 'X',
+    });
+
+    // 2. Flip 1 byte in the body to verify CRC32 mismatch detection
+    const rawBytes = new Uint8Array(await blob1000.arrayBuffer());
+    assert.ok(crc32(rawBytes.subarray(16)) !== 0);
+    rawBytes[rawBytes.length - 5] ^= 0xff;
+    const corruptedBlob = new Blob([rawBytes], { type: 'application/octet-stream' });
+    await assert.rejects(
+      async () => {
+        await importAtw(corruptedBlob);
+      },
+      /CRC không khớp/
+    );
+
+    // 3. Ceiling check when tile count exceeds MAX_ATW_CHUNKS
+    const tooManyTiles: WorldSaveV3['tiles'] = [];
+    for (let i = 0; i < MAX_ATW_CHUNKS; i++) {
+      tooManyTiles.push({
+        level: 0,
+        tx: i % 200,
+        tz: Math.floor(i / 200),
+        kind: 'height',
+        min: -1,
+        scale: 0.01,
+        data: sharedData,
+      });
+    }
+    await assert.rejects(
+      async () => {
+        await exportAtw({ ...state1000, tiles: tooManyTiles });
+      },
+      /Thế giới quá lớn để lưu thành một tệp \.atw/
+    );
+  });
+
+  it('14. Unified Undo: brushDepth alignment and CommandHistoryManager ([brush -> object -> undo] & [5s stroke -> undo])', async () => {
+    const engine = createTerrainV3Engine(new Float32Array(BASE_N * BASE_N), 1337, false);
+
+    // Case A: [brush stroke -> place object -> undo] must preserve the brush stroke!
+    const snapBeforeStroke = { brushDepth: engine.brushEngine.historyDepth() };
+    assert.equal(snapBeforeStroke.brushDepth, 0);
+
+    const hOriginBefore = engine.terrainField.sampleHeight(0, 0, 0);
+    engine.applySculptStrokeStamp(0, 0, 5.0, 80, 'raise', 0.1);
+    const heightAfterStroke = engine.terrainField.sampleHeight(0, 0, 0);
+    assert.ok(heightAfterStroke > hOriginBefore + 0.1, 'Brush stroke must raise terrain at origin');
+    assert.equal(engine.brushEngine.historyDepth(), 1);
+
+    // Now user places an object: snapshot records current brushDepth (1)
+    const snapBeforePlaceObject = { brushDepth: engine.brushEngine.historyDepth() };
+    assert.equal(snapBeforePlaceObject.brushDepth, 1);
+
+    // User undoes object placement: while (historyDepth() > snapBeforePlaceObject.brushDepth) undo()
+    while (engine.brushEngine.historyDepth() > snapBeforePlaceObject.brushDepth) {
+      engine.brushEngine.undo();
+    }
+    assert.equal(engine.brushEngine.historyDepth(), 1, 'Undoing object placement must not pop brush stroke');
+    assert.ok(
+      Math.abs(engine.terrainField.sampleHeight(0, 0, 0) - heightAfterStroke) < 1e-5,
+      'Brush stroke height must remain intact after undoing object placement'
+    );
+
+    // Case B: Multi-stamp 5-second stroke with intermediate snapshots unwinds cleanly to initial depth
+    const h30Before = engine.terrainField.sampleHeight(30, 30, 0);
+    const depthBeforeLongStroke = engine.brushEngine.historyDepth(); // 1
+    engine.applySculptStrokeStamp(30, 30, 5.0, 80, 'raise', 0.1);
+    engine.applySculptStrokeStamp(32, 30, 5.0, 80, 'raise', 0.1);
+    engine.applySculptStrokeStamp(34, 30, 5.0, 80, 'raise', 0.1);
+    assert.equal(engine.brushEngine.historyDepth(), 4);
+
+    while (engine.brushEngine.historyDepth() > depthBeforeLongStroke) {
+      engine.brushEngine.undo();
+    }
+    assert.equal(engine.brushEngine.historyDepth(), 1);
+    assert.ok(Math.abs(engine.terrainField.sampleHeight(30, 30, 0) - h30Before) < 1e-4);
+
+    // Case C: CommandHistoryManager (BrushStrokeCommand, ObjectsCommand, SettingsCommand, ImportCommand)
+    const cmdMgr = new CommandHistoryManager(1024 * 1024);
+    let currentObjects: PlacedObject[] = [];
+    let currentSettings: WorldSettingsState = {
+      biomeId: 'mondstadt_meadow',
+      waterLevel: -3,
+      regionTitle: 'Thung Lũng Gió',
+    };
+
+    const hNeg25Before = engine.terrainField.sampleHeight(-25, 25, 0);
+    const d0 = engine.brushEngine.historyDepth();
+    engine.applySculptStrokeStamp(-25, 25, 4.0, 80, 'raise', 0.1);
+    const d1 = engine.brushEngine.historyDepth();
+    const hRaised = engine.terrainField.sampleHeight(-25, 25, 0);
+    cmdMgr.push(new BrushStrokeCommand(engine.brushEngine, d0, d1));
+
+    const objAfter: PlacedObject[] = [
+      { id: 'o1', prefabId: 'windmill_cottage', label: 'Cối Xay', x: 5, y: 0, z: 5, scale: 1, rotationY: 0 },
+    ];
+    cmdMgr.push(
+      new ObjectsCommand(currentObjects, objAfter, (objs) => {
+        currentObjects = objs;
+      })
+    );
+    currentObjects = objAfter;
+
+    const settingsAfter: WorldSettingsState = {
+      biomeId: 'liyue_amber',
+      waterLevel: 2,
+      regionTitle: 'Đỉnh Đá Vôi',
+    };
+    cmdMgr.push(
+      new SettingsCommand(currentSettings, settingsAfter, (s) => {
+        currentSettings = s;
+      })
+    );
+    currentSettings = settingsAfter;
+
+    await cmdMgr.undo(); // Undo SettingsCommand
+    assert.equal(currentSettings.biomeId, 'mondstadt_meadow');
+    assert.equal(currentObjects.length, 1);
+
+    await cmdMgr.undo(); // Undo ObjectsCommand
+    assert.equal(currentObjects.length, 0);
+    assert.ok(Math.abs(engine.terrainField.sampleHeight(-25, 25, 0) - hRaised) < 1e-4);
+
+    await cmdMgr.undo(); // Undo BrushStrokeCommand
+    assert.ok(Math.abs(engine.terrainField.sampleHeight(-25, 25, 0) - hNeg25Before) < 1e-4);
+
+    await cmdMgr.redo(); // Redo BrushStrokeCommand
+    assert.ok(Math.abs(engine.terrainField.sampleHeight(-25, 25, 0) - hRaised) < 1e-4);
+
+    const h40Before = engine.terrainField.sampleHeight(40, -40, 0);
+    const beforeAtw = await engine.exportWorldSaveV3([]);
+    engine.applySculptStrokeStamp(40, -40, 4.0, 90, 'raise', 0.1);
+    const afterAtw = await engine.exportWorldSaveV3([]);
+    const importCmd = new ImportCommand(beforeAtw, afterAtw, async (b) => {
+      await engine.importWorldSaveV3(b);
+    });
+    cmdMgr.push(importCmd);
+    await cmdMgr.undo();
+    assert.ok(Math.abs(engine.terrainField.sampleHeight(40, -40, 0) - h40Before) < 1e-4);
+    await cmdMgr.redo();
+    assert.ok(engine.terrainField.sampleHeight(40, -40, 0) > h40Before + 0.1);
+
+    engine.dispose();
+  });
+
+  it('15. exportHeightmap16 (.raw little-endian + metadata) & reconstructValidation (MIME + AI payload)', async () => {
+    const engine = createTerrainV3Engine(new Float32Array(BASE_N * BASE_N), 1337, false);
+    engine.applySculptStrokeStamp(0, 0, 250, 95, 'raise', 0.25);
+
+    const { data, meta } = await exportHeightmap16(engine.terrainField, 65);
+    assert.equal(data.length, 65 * 65);
+    assert.equal(meta.size, 65);
+    assert.equal(meta.worldSize, 10000);
+    assert.ok(meta.maxHeight > meta.minHeight);
+
+    const centerIdx = 32 * 65 + 32;
+    const reconstructedCenter = reconstructHeightFromUint16(
+      data[centerIdx],
+      meta.minHeight,
+      meta.maxHeight
+    );
+    const actualCenter = engine.terrainField.sampleHeight(0, 0, 0);
+    assert.ok(
+      Math.abs(reconstructedCenter - actualCenter) < 0.05,
+      '16-bit quantized heightmap must reconstruct center height within 5cm'
+    );
+
+    const rawBytes = encodeHeightmapRawLittleEndian(data);
+    assert.equal(rawBytes.byteLength, 65 * 65 * 2);
+
+    // MIME magic-byte sniffing
+    assert.equal(
+      sniffImageMimeType(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])),
+      'image/png'
+    );
+    assert.equal(
+      sniffImageMimeType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0])),
+      'image/jpeg'
+    );
+    assert.equal(
+      sniffImageMimeType(
+        new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])
+      ),
+      'image/webp'
+    );
+    assert.equal(sniffImageMimeType(new Uint8Array([1, 2, 3])), null);
+
+    // AI payload validation
+    const validated = validateReconstructAiPayload({
+      regionName: '  Thung Lũng Sao Hỏa  ',
+      summary: 'Địa hình hẻm núi đỏ',
+      biomeId: 'mars_olympus',
+      terraceSteps: 99,
+      elevationScale: 500,
+      detectedObjects: [
+        { prefabId: 'mars_olympus_shield', x: 10, z: -10, scale: 1.5, rotationDeg: 405 },
+        { prefabId: 'invalid_prefab_id', x: 0, z: 0 },
+      ],
+    });
+    assert.equal(validated.regionName, 'Thung Lũng Sao Hỏa');
+    assert.equal(validated.biomeId, 'mars_olympus');
+    assert.equal(validated.terraceSteps, 18);
+    assert.equal(validated.elevationScale, 85);
+    assert.equal(validated.detectedObjects.length, 1);
+    assert.equal(validated.detectedObjects[0].rotationDeg, 45);
+
+    engine.dispose();
+  });
 });
+
+

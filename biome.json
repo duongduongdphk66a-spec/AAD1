@@ -1,0 +1,22 @@
+{
+  "files": { "includes": ["src/**", "server.ts", "bench/**", "vite.config.ts"] },
+  "formatter": { "enabled": false },
+  "assist": { "enabled": false },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "none",
+      "correctness": {
+        "useExhaustiveDependencies": "warn",
+        "useHookAtTopLevel": "error",
+        "noUnusedVariables": "warn",
+        "noUnusedImports": "warn"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "noDoubleEquals": "warn",
+        "noDebugger": "error"
+      }
+    }
+  }
+}

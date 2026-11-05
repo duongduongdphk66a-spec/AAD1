@@ -1,7 +1,7 @@
 import { ComposeWorkerPool, WorkerComposeResult } from './clipmapWorker';
 import { DetailParams } from './detailGenerator';
 import { Stamp } from './stampSystem';
-import { Level, Rect } from './units';
+import { Level, Rect, rectsIntersect } from './units';
 
 export type WorkerRequest =
   | {
@@ -88,10 +88,11 @@ export class Scheduler {
   syncWorkerTerrainState(
     baseMap: Float32Array,
     params?: DetailParams,
-    detailEnabled = true
+    detailEnabled = true,
+    biomeRoughness = 0.72
   ): void {
     if (this.workerPool) {
-      this.workerPool.syncState(baseMap, params, detailEnabled);
+      this.workerPool.syncState(baseMap, params, detailEnabled, biomeRoughness);
     }
   }
 
@@ -133,7 +134,8 @@ export class Scheduler {
         (j.level !== undefined &&
           j.level === job.level &&
           j.rect !== undefined &&
-          job.rect !== undefined)
+          job.rect !== undefined &&
+          rectsIntersect(j.rect, job.rect))
     );
     if (existingIdx !== -1) {
       const prev = list[existingIdx];

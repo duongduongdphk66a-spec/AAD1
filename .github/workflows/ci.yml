@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck (tsc --noEmit)
+      - name: Typecheck & Lint (tsc --noEmit && biome lint)
         run: npm run lint
 
       - name: Run unit & security tests
@@ -30,3 +30,40 @@ jobs:
 
       - name: Build production bundle
         run: npm run build
+
+  docker-smoke:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify lockfile has Alpine musl entries
+        run: test "$(grep -c musl package-lock.json)" -gt 0
+      - name: Build production image
+        run: docker build -t aetherterra:ci .
+      - name: Boot container and probe /healthz
+        run: |
+          docker run -d --name app -p 3000:3000 aetherterra:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null; then
+              docker rm -f app
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs app
+          docker rm -f app
+          exit 1
+
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm run test:e2e

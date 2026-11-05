@@ -39,6 +39,7 @@ import {
 import { buildJunctionContinuumGroup } from '../world/junctionBridges3D';
 import { ActiveTabId, computeSunDirection } from './BottomControlDock';
 import type { TerrainV3EngineBundle } from '../core/terrainV3Controller';
+import { AdaptiveQuality, QualityMode } from '../core/adaptiveQuality';
 import { v3HudStore } from './TerrainV3HudAndPanels';
 
 export class WorldEnvironmentController {
@@ -198,6 +199,10 @@ interface WorldViewport3DProps {
   cameraPresetTrigger: number;
   v3Engine?: TerrainV3EngineBundle | null;
   v3Enabled?: boolean;
+  debugShowSdfOutline?: boolean;
+  qualityMode?: QualityMode;
+  onAdaptiveScaleChange?: (scale: number) => void;
+  touchMode?: 'navigate' | 'sculpt';
   onTerrainStrokeStart?: () => void;
   onTerrainStroke: (worldX: number, worldZ: number) => void;
   onTerrainStrokeEnd?: () => void;
@@ -968,6 +973,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   cameraPresetTrigger,
   v3Engine = null,
   v3Enabled = false,
+  debugShowSdfOutline = false,
+  qualityMode = 'auto',
+  onAdaptiveScaleChange,
+  touchMode = 'navigate',
   onTerrainStrokeStart,
   onTerrainStroke,
   onTerrainStrokeEnd,
@@ -995,6 +1004,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     autoJunctionBlend,
     v3Engine,
     v3Enabled,
+    qualityMode,
+    onAdaptiveScaleChange,
+    touchMode,
     onTerrainStrokeStart,
     onTerrainStroke,
     onTerrainStrokeEnd,
@@ -1016,6 +1028,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     autoJunctionBlend,
     v3Engine,
     v3Enabled,
+    qualityMode,
+    onAdaptiveScaleChange,
+    touchMode,
     onTerrainStrokeStart,
     onTerrainStroke,
     onTerrainStrokeEnd,
@@ -1125,7 +1140,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.12;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    const maxPr = isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const adaptive = new AdaptiveQuality(0.6, maxPr);
+    let currentPr =
+      latestPropsRef.current.qualityMode === 'low'
+        ? 0.6
+        : maxPr;
+    renderer.setPixelRatio(currentPr);
+    latestPropsRef.current.onAdaptiveScaleChange?.(currentPr);
     renderer.setSize(
       container.clientWidth || window.innerWidth,
       container.clientHeight || window.innerHeight
@@ -1137,6 +1159,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
+    renderer.domElement.style.touchAction = 'none';
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
 
@@ -1168,6 +1191,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     controls.maxPolarAngle = Math.PI * 0.485;
     controls.minDistance = 2;
     controls.maxDistance = 14500;
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
     controls.target.set(0, 10, -12);
 
     // 3-Point Warm/Cool Lighting Rig with Real-Time Directional Shadows
@@ -1350,6 +1374,36 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const selArrow = new THREE.Mesh(selArrowGeo, selArrowMat);
     selArrow.position.set(0, 0.25, 6.6);
     selectionRing.add(selArrow);
+
+    const sdfDebugVolume = new THREE.Group();
+    sdfDebugVolume.name = 'sdf_debug_volume';
+    const sdfShellGeo = new THREE.CylinderGeometry(5.6, 5.6, 8.5, 32, 2, true);
+    sdfShellGeo.translate(0, 4.25, 0);
+    const sdfShellMat = new THREE.MeshBasicMaterial({
+      color: 0x3b82f6,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+    });
+    sdfDebugVolume.add(new THREE.Mesh(sdfShellGeo, sdfShellMat));
+
+    const sdfFalloffRingGeo = new THREE.RingGeometry(8.8, 9.25, 64);
+    sdfFalloffRingGeo.rotateX(-Math.PI / 2);
+    const sdfFalloffRingMat = new THREE.MeshBasicMaterial({
+      color: 0x60a5fa,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    });
+    sdfDebugVolume.add(new THREE.Mesh(sdfFalloffRingGeo, sdfFalloffRingMat));
+    sdfDebugVolume.visible = false;
+    selectionRing.add(sdfDebugVolume);
+
     selectionRing.visible = false;
     scene.add(selectionRing);
 
@@ -1490,9 +1544,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         _camPosGoal.set(0, 95, 6);
         _camTargetGoal.set(0, 0, 0);
       }
-      // Advance 78% immediately so software-WebGL viewports frame the target right away
-      camera.position.lerp(_camPosGoal, 0.78);
-      controls.target.lerp(_camTargetGoal, 0.78);
+      const reduceMotion =
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const snapRatio = reduceMotion ? 1.0 : 0.78;
+      if (reduceMotion) camTransitionActive = false;
+      camera.position.lerp(_camPosGoal, snapRatio);
+      controls.target.lerp(_camTargetGoal, snapRatio);
       controls.update();
     };
 
@@ -1536,15 +1595,37 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (hits.length > 0) return hits[0].point;
       const planeHit = raycaster.ray.intersectPlane(fallbackGroundPlane, fallbackHitTarget);
       if (!planeHit) return null;
-      const half = WORLD_SIZE / 2;
-      const cx = Math.max(-half + 10, Math.min(half - 10, planeHit.x));
-      const cz = Math.max(-half + 10, Math.min(half - 10, planeHit.z));
-      const cy = getGroundHeightAt(latestPropsRef.current.heightMap, GRID_SIZE, WORLD_SIZE, cx, cz);
-      return fallbackHitTarget.set(cx, cy, cz);
+      const limit = WORLD_SIZE / 2 - 10;
+      if (Math.abs(planeHit.x) > limit || Math.abs(planeHit.z) > limit) return null;
+      const cy = getGroundHeightAt(latestPropsRef.current.heightMap, GRID_SIZE, WORLD_SIZE, planeHit.x, planeHit.z);
+      return new THREE.Vector3(planeHit.x, cy, planeHit.z);
+    };
+
+    const finishTerrainStrokeDrag = () => {
+      if (!isPointerDraggingTerrain) return false;
+      isPointerDraggingTerrain = false;
+      isPointerDraggingTerrainRef.current = false;
+      if (latestPropsRef.current.v3Engine) {
+        latestPropsRef.current.v3Engine.isBrushDragging = false;
+        latestPropsRef.current.v3Engine.brushEngine.endStroke();
+      }
+      latestPropsRef.current.onTerrainStrokeEnd?.();
+      const isCoarse =
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(pointer: coarse)').matches;
+      controls.enabled = !(isCoarse && latestPropsRef.current.touchMode === 'sculpt');
+      if (pendingJunctionRebuildRef.current || latestPropsRef.current.autoJunctionBlend) {
+        scheduleDebouncedJunctionRebuild(180);
+      }
+      return true;
     };
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0 || e.ctrlKey || e.altKey || e.metaKey) return;
+      if (e.pointerType === 'touch' && latestPropsRef.current.touchMode === 'navigate') {
+        return;
+      }
       pointerDownPos = { x: e.clientX, y: e.clientY };
       const {
         activeTab: tab,
@@ -1555,6 +1636,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (tab === 'sculpt' || tab === 'paint') {
         const pt = raycastTerrainPoint(e);
         if (pt) {
+          try {
+            renderer.domElement.setPointerCapture(e.pointerId);
+          } catch {
+            // Synthetic test events may not have an active pointerId
+          }
           isPointerDraggingTerrain = true;
           isPointerDraggingTerrainRef.current = true;
           if (latestPropsRef.current.v3Engine) {
@@ -1599,19 +1685,22 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
     };
 
+    const onPointerCancel = (e: PointerEvent) => {
+      try {
+        renderer.domElement.releasePointerCapture(e.pointerId);
+      } catch {
+        // Ignore if not captured
+      }
+      finishTerrainStrokeDrag();
+    };
+
     const onPointerUp = (e: PointerEvent) => {
-      if (isPointerDraggingTerrain) {
-        isPointerDraggingTerrain = false;
-        isPointerDraggingTerrainRef.current = false;
-        if (latestPropsRef.current.v3Engine) {
-          latestPropsRef.current.v3Engine.isBrushDragging = false;
-          latestPropsRef.current.v3Engine.brushEngine.endStroke();
-        }
-        latestPropsRef.current.onTerrainStrokeEnd?.();
-        controls.enabled = true;
-        if (pendingJunctionRebuildRef.current || latestPropsRef.current.autoJunctionBlend) {
-          scheduleDebouncedJunctionRebuild(180);
-        }
+      try {
+        renderer.domElement.releasePointerCapture(e.pointerId);
+      } catch {
+        // Ignore if not captured
+      }
+      if (finishTerrainStrokeDrag()) {
         return;
       }
 
@@ -1702,6 +1791,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     domElem.addEventListener('pointerdown', onPointerDown);
     domElem.addEventListener('pointermove', onPointerMove);
+    domElem.addEventListener('pointercancel', onPointerCancel);
     domElem.addEventListener('webglcontextlost', onContextLost, false);
     domElem.addEventListener('webglcontextrestored', onContextRestored, false);
     window.addEventListener('pointerup', onPointerUp);
@@ -1752,9 +1842,32 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     function tick() {
       if (unmounted) return;
       const nowMs = performance.now();
-      const dt = Math.min(Math.max((nowMs - lastTimeMs) / 1000, 0.001), 0.1);
+      const dtMs = nowMs - lastTimeMs;
+      const dt = Math.min(Math.max(dtMs / 1000, 0.001), 0.1);
       lastTimeMs = nowMs;
       const elapsed = (nowMs - startTimeMs) / 1000;
+
+      // Adaptive pixelRatio scaling based on qualityMode ('auto' | 'high' | 'low')
+      const qMode = latestPropsRef.current.qualityMode ?? 'auto';
+      const nextPr =
+        qMode === 'auto'
+          ? adaptive.update(dtMs)
+          : qMode === 'low'
+          ? Math.abs(currentPr - 0.6) > 1e-6
+            ? 0.6
+            : null
+          : Math.abs(currentPr - maxPr) > 1e-6
+          ? maxPr
+          : null;
+      if (nextPr !== null) {
+        currentPr = nextPr;
+        adaptive.scale = nextPr;
+        renderer.setPixelRatio(nextPr);
+        const w = container?.clientWidth || window.innerWidth;
+        const h = container?.clientHeight || window.innerHeight;
+        renderer.setSize(w, h, false);
+        latestPropsRef.current.onAdaptiveScaleChange?.(Number(nextPr.toFixed(2)));
+      }
 
       // Adaptive WASD camera pan speed proportional to camera distance
       const camDist = camera.position.distanceTo(controls.target);
@@ -2021,6 +2134,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       clearTimeout(frameId);
       domElem.removeEventListener('pointerdown', onPointerDown);
       domElem.removeEventListener('pointermove', onPointerMove);
+      domElem.removeEventListener('pointercancel', onPointerCancel);
       domElem.removeEventListener('webglcontextlost', onContextLost, false);
       domElem.removeEventListener('webglcontextrestored', onContextRestored, false);
       window.removeEventListener('pointerup', onPointerUp);
@@ -2247,10 +2361,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       selectionRing.position.set(selectedObj.x, wy + 0.12, selectedObj.z);
       selectionRing.rotation.y = selectedObj.rotationY;
       selectionRing.scale.setScalar(selectedObj.scale);
+      const sdfVol = selectionRing.getObjectByName('sdf_debug_volume');
+      if (sdfVol) {
+        sdfVol.visible = Boolean(debugShowSdfOutline);
+      }
     } else {
       selectionRing.visible = false;
     }
-  }, [placedObjects, selectedObjectId, heightMap]);
+  }, [placedObjects, selectedObjectId, heightMap, debugShowSdfOutline]);
 
   // 3b. Sync 3D Physical Surface Ecosystems (3-5cm Grass Blades, 3D Flowers, Desert Sand Dunes, Flowing Smoking Lava, Mars/Venus/Exoplanet Regolith)
   useEffect(() => {

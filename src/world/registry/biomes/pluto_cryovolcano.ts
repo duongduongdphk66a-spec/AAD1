@@ -16,5 +16,6 @@ export const pluto_cryovolcano: BiomeConfig = {
   "defaultTexture": "pluto_nitrogen_ice",
   "defaultWeather": "liquid_nitrogen_snow",
   "waterLevel": -45,
-  "reliefScale": 1.32
+  "reliefScale": 1.32,
+  "roughness": 0.92
 };

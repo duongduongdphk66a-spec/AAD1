@@ -12,6 +12,7 @@ import {
   PREFAB_CATALOG,
   TEXTURE_INDEX_MAP,
 } from './src/world/registry';
+import { sanitizeAnalysis } from './src/world/aiAnalysis';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,8 +28,14 @@ const hops = Number(process.env.TRUST_PROXY_HOPS ?? (process.env.K_SERVICE ? 1 :
 app.set('trust proxy', hops > 0 ? hops : false);
 app.disable('x-powered-by');
 
+export const CSP_SCRIPT_SRC = isProd ? "'self'" : "'self' 'unsafe-inline'";
+export const CSP_CONNECT_SRC = isProd ? "'self'" : "'self' ws: wss:";
+export const CSP_FRAME_ANCESTORS =
+  process.env.CSP_FRAME_ANCESTORS ||
+  "'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com https://*.run.app";
+
 export const CSP_HEADER_VALUE =
-  "default-src 'self'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self';";
+  `default-src 'self'; script-src ${CSP_SCRIPT_SRC}; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src ${CSP_CONNECT_SRC}; object-src 'none'; base-uri 'self'; frame-ancestors ${CSP_FRAME_ANCESTORS}; form-action 'self';`;
 
 // Security headers (CSP, X-Content-Type-Options, Referrer-Policy)
 app.use((_req, res, next) => {
@@ -39,8 +46,99 @@ app.use((_req, res, next) => {
   next();
 });
 
+// Client error reporting endpoint (placed before the 3.5MB parser so the 8KB limit is strictly enforced)
+const logHits = new Map<string, { n: number; resetAt: number }>();
+app.post('/api/client-log', express.json({ limit: '8kb' }), (req, res) => {
+  const ip = req.ip ?? 'local';
+  const now = Date.now();
+  const h = logHits.get(ip);
+  if (!h || h.resetAt < now) {
+    logHits.set(ip, { n: 1, resetAt: now + 60_000 });
+  } else if (++h.n > 30) {
+    res.status(429).end();
+    return;
+  }
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const s = (v: unknown, n: number) => String(v ?? '').slice(0, n);
+  console.warn(
+    JSON.stringify({
+      t: 'client-error',
+      kind: s(b.kind, 20),
+      message: s(b.message, 300),
+      stack: s(b.stack, 1500),
+      label: s(b.label, 40),
+      build: s(b.build, 20),
+    })
+  );
+  res.status(204).end();
+});
+
 // 3.5 MB JSON body limit accommodates MAX_BASE64_LENGTH (~2.8 MB base64 for 2 MB image) plus JSON envelope
-app.use(express.json({ limit: '3.5mb' }));
+const jsonBody = express.json({ limit: '3.5mb' });
+
+const AI_BUDGET_WINDOW_MS = 3_600_000;
+const AI_DAILY_WINDOW_MS = 86_400_000;
+const AI_MAX_CALLS_PER_HOUR = Math.max(1, Number(process.env.AI_MAX_CALLS_PER_HOUR ?? 200));
+const GEMINI_DAILY_BUDGET = Math.max(1, Number(process.env.GEMINI_DAILY_BUDGET ?? 500));
+let aiHourWindow = { count: 0, resetAt: 0 };
+let aiDayWindow = { count: 0, resetAt: 0 };
+
+export function consumeGlobalAiBudget(
+  now = Date.now(),
+  maxHourly = AI_MAX_CALLS_PER_HOUR,
+  maxDaily = GEMINI_DAILY_BUDGET
+): boolean {
+  const hourExpired = now > aiHourWindow.resetAt;
+  const dayExpired = now > aiDayWindow.resetAt;
+  const nextHourCount = hourExpired ? 1 : aiHourWindow.count + 1;
+  const nextDayCount = dayExpired ? 1 : aiDayWindow.count + 1;
+
+  if (nextHourCount > maxHourly || nextDayCount > maxDaily) {
+    return false;
+  }
+  aiHourWindow = {
+    count: nextHourCount,
+    resetAt: hourExpired ? now + AI_BUDGET_WINDOW_MS : aiHourWindow.resetAt,
+  };
+  aiDayWindow = {
+    count: nextDayCount,
+    resetAt: dayExpired ? now + AI_DAILY_WINDOW_MS : aiDayWindow.resetAt,
+  };
+  return true;
+}
+
+export function resetAiBudgetForTest(): void {
+  aiHourWindow = { count: 0, resetAt: 0 };
+  aiDayWindow = { count: 0, resetAt: 0 };
+}
+
+const PROMPT_VERSION = 'v1';
+const AI_CACHE_TTL_MS = 60 * 60_000;
+const AI_CACHE_MAX = 100;
+const aiCache = new Map<
+  string,
+  { at: number; value: NonNullable<ReturnType<typeof sanitizeAnalysis>> }
+>();
+const aiInflight = new Map<string, Promise<ReturnType<typeof sanitizeAnalysis>>>();
+
+export function computeAiCacheKey(
+  mimeType: string,
+  mode: string,
+  cleanBase64: string,
+  model = GEMINI_MODEL,
+  version = PROMPT_VERSION
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${version}|${model}|${mimeType}|${mode}|`)
+    .update(cleanBase64)
+    .digest('hex');
+}
+
+export function resetAiCacheForTest(): void {
+  aiCache.clear();
+  aiInflight.clear();
+}
 
 // Health check endpoint
 app.get('/healthz', (_req, res) => {
@@ -142,18 +240,19 @@ function timingSafeStringEqual(candidate: string, expected: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+const REQUIRE_API_AUTH = process.env.REQUIRE_API_AUTH === 'true';
+
 export function verifyApiAuth(
   headers: Record<string, string | string[] | undefined>,
   configuredToken = process.env.API_AUTH_TOKEN,
-  enforceInProd = isProd
+  requireToken = REQUIRE_API_AUTH
 ): boolean {
   const rawToken = configuredToken?.trim() ?? '';
   const isUnconfiguredOrPlaceholder =
     rawToken.length === 0 || PLACEHOLDER_AUTH_TOKENS.has(rawToken.toLowerCase());
 
   if (isUnconfiguredOrPlaceholder) {
-    // In production, a valid non-placeholder API_AUTH_TOKEN is required; in development/preview, allow when unconfigured
-    return !enforceInProd;
+    return !requireToken;
   }
 
   const authHeader = String(headers['authorization'] || '').trim();
@@ -235,29 +334,31 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-app.post('/api/reconstruct', async (req, res) => {
+function reconstructGuard(req: Request, res: Response, next: NextFunction): void {
+  if (!verifyApiAuth(req.headers)) {
+    res.status(401).json({ error: 'Yêu cầu thiếu hoặc sai khóa xác thực API (API_AUTH_TOKEN).' });
+    return;
+  }
+  const declaredLen = Math.max(0, Number(req.headers['content-length'] ?? 0) || 0);
+  const clientIp = req.ip || 'local';
+  const quota = checkApiQuota(clientIp, declaredLen);
+  res.setHeader('X-RateLimit-Remaining', String(quota.remainingRequests));
+  res.setHeader('X-RateLimit-Reset', String(Math.ceil(quota.resetAt / 1000)));
+  if (!quota.allowed) {
+    res.status(429).json({
+      error:
+        quota.reason === 'byte_quota'
+          ? 'Đã vượt hạn mức băng thông phân tích AI trong 1 phút (tối đa 25MB/phút).'
+          : 'Quá nhiều yêu cầu phân tích AI. Vui lòng thử lại sau 1 phút.',
+    });
+    return;
+  }
+  next();
+}
+
+app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
   try {
-    if (!verifyApiAuth(req.headers)) {
-      res.status(401).json({ error: 'Yêu cầu thiếu hoặc sai khóa xác thực API (API_AUTH_TOKEN).' });
-      return;
-    }
-
     const { imageBase64, mimeType, mode = 'both', clientMetrics } = req.body || {};
-    const payloadBytes = typeof imageBase64 === 'string' ? imageBase64.length : 0;
-
-    const clientIp = req.ip || 'local';
-    const quota = checkApiQuota(clientIp, payloadBytes);
-    res.setHeader('X-RateLimit-Remaining', String(quota.remainingRequests));
-    res.setHeader('X-RateLimit-Reset', String(Math.ceil(quota.resetAt / 1000)));
-    if (!quota.allowed) {
-      res.status(429).json({
-        error:
-          quota.reason === 'byte_quota'
-            ? 'Đã vượt hạn mức băng thông phân tích AI trong 1 phút (tối đa 25MB/phút).'
-            : 'Quá nhiều yêu cầu phân tích AI. Vui lòng thử lại sau 1 phút.',
-      });
-      return;
-    }
 
     if (!imageBase64 || typeof imageBase64 !== 'string') {
       res.status(400).json({ error: 'Thiếu dữ liệu ảnh đầu vào (imageBase64).' });
@@ -282,20 +383,40 @@ app.post('/api/reconstruct', async (req, res) => {
       typeof mode === 'string' && ALLOWED_MODES.has(mode) ? mode : 'both';
     const safeMetrics = sanitizeClientMetrics(clientMetrics);
 
-    const ai = getGeminiClient();
-    if (!ai) {
-      res.json({
-        source: 'pixel-engine',
-        warning: 'Khóa GEMINI_API_KEY chưa được cấu hình — sử dụng bộ phân tích Pixel Depth cục bộ.',
-        analysis: null,
-      });
+    const key = computeAiCacheKey(resolvedMime, resolvedMode, cleanBase64);
+    const hit = aiCache.get(key);
+    if (hit && Date.now() - hit.at < AI_CACHE_TTL_MS) {
+      aiCache.delete(key);
+      aiCache.set(key, hit);
+      res.json({ source: 'gemini-vision', analysis: hit.value, cached: true });
       return;
     }
 
-    const biomeIds = Object.keys(BIOMES);
-    const prefabLines = PREFAB_CATALOG.map((p) => `   - '${p.id}' (${p.name})`).join('\n');
+    let job = aiInflight.get(key);
+    if (!job) {
+      const ai = getGeminiClient();
+      if (!ai) {
+        res.json({
+          source: 'pixel-engine',
+          warning: 'Khóa GEMINI_API_KEY chưa được cấu hình — sử dụng bộ phân tích Pixel Depth cục bộ.',
+          analysis: null,
+        });
+        return;
+      }
 
-    const promptText = `Bạn là kiến trúc sư thế giới 3D phong cách Genshin Impact (Teyvat), Pokémon Legends và các đại địa hình Trái Đất / Hệ Mặt Trời.
+      if (!consumeGlobalAiBudget()) {
+        res.json({
+          source: 'pixel-engine',
+          warning: 'Đã đạt giới hạn gọi AI trong giờ/ngày — sử dụng bộ phân tích Pixel Depth cục bộ.',
+          analysis: null,
+        });
+        return;
+      }
+
+      const biomeIds = Object.keys(BIOMES);
+      const prefabLines = PREFAB_CATALOG.map((p) => `   - '${p.id}' (${p.name})`).join('\n');
+
+      const promptText = `Bạn là kiến trúc sư thế giới 3D phong cách Genshin Impact (Teyvat), Pokémon Legends và các đại địa hình Trái Đất / Hệ Mặt Trời.
 Bản đồ thế giới mở có tổng diện tích 10x10 km (lưới 160x160 ô, trần độ cao 1.000m) với khu vực trung tâm 1:1 quanh tọa độ (-48m đến +48m).
 Người dùng vừa tải lên một bức ảnh thực tế (chế độ tái tạo: ${resolvedMode}).
 Thông số màu sắc trích xuất từ ảnh: ${JSON.stringify(safeMetrics)}.
@@ -307,93 +428,105 @@ Hãy phân tích địa hình, độ cao (tối đa 1000m), mặt nước, thả
 4. Liệt kê từ 6 đến 14 vật thể 3D (detectedObjects) đặt trong vùng quan sát trung tâm 1:1 (x, z trong khoảng -48 đến +48 mét), sử dụng prefabId thuộc danh sách:
 ${prefabLines}`;
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: resolvedMime,
-              data: cleanBase64,
-            },
-          },
-          { text: promptText },
-        ],
-      },
-      config: {
-        abortSignal: AbortSignal.timeout(20_000),
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            regionName: {
-              type: Type.STRING,
-              description: 'Tên vùng đất bằng tiếng Việt',
-            },
-            biome: {
-              type: Type.STRING,
-              enum: biomeIds,
-              description: 'Quần xã / hành tinh phù hợp nhất từ registry',
-            },
-            dominantTexture: {
-              type: Type.STRING,
-              enum: TEXTURE_INDEX_MAP,
-              description: 'Kết cấu bề mặt chủ đạo từ registry',
-            },
-            summary: {
-              type: Type.STRING,
-              description: 'Mô tả ngắn gọn (1-2 câu) cách tái tạo địa hình và vật thể từ bức ảnh.',
-            },
-            reliefScale: {
-              type: Type.NUMBER,
-              description: 'Hệ số độ cao địa hình từ 0.6 đến 2.2',
-            },
-            waterLevel: {
-              type: Type.NUMBER,
-              description: 'Mực nước tính bằng mét từ -120 đến 80',
-            },
-            terraceSteps: {
-              type: Type.INTEGER,
-              description: 'Số bậc thang địa hình (0 nếu mượt, 4-8 nếu có ruộng bậc thang/vách đá)',
-            },
-            detectedObjects: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  prefabId: {
-                    type: Type.STRING,
-                    enum: PREFAB_CATALOG.map((p) => p.id),
-                  },
-                  label: { type: Type.STRING },
-                  x: { type: Type.NUMBER, description: 'Tọa độ X từ -48 đến 48 mét' },
-                  z: { type: Type.NUMBER, description: 'Tọa độ Z từ -48 đến 48 mét' },
-                  scale: { type: Type.NUMBER },
-                  rotationY: { type: Type.NUMBER },
+      job = (async () => {
+        const response = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: resolvedMime,
+                  data: cleanBase64,
                 },
-                required: ['prefabId', 'label', 'x', 'z', 'scale', 'rotationY'],
               },
+              { text: promptText },
+            ],
+          },
+          config: {
+            abortSignal: AbortSignal.timeout(20_000),
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                regionName: {
+                  type: Type.STRING,
+                  description: 'Tên vùng đất bằng tiếng Việt',
+                },
+                biome: {
+                  type: Type.STRING,
+                  enum: biomeIds,
+                  description: 'Quần xã / hành tinh phù hợp nhất từ registry',
+                },
+                dominantTexture: {
+                  type: Type.STRING,
+                  enum: TEXTURE_INDEX_MAP,
+                  description: 'Kết cấu bề mặt chủ đạo từ registry',
+                },
+                summary: {
+                  type: Type.STRING,
+                  description: 'Mô tả ngắn gọn (1-2 câu) cách tái tạo địa hình và vật thể từ bức ảnh.',
+                },
+                reliefScale: {
+                  type: Type.NUMBER,
+                  description: 'Hệ số độ cao địa hình từ 0.6 đến 2.2',
+                },
+                waterLevel: {
+                  type: Type.NUMBER,
+                  description: 'Mực nước tính bằng mét từ -120 đến 80',
+                },
+                terraceSteps: {
+                  type: Type.INTEGER,
+                  description: 'Số bậc thang địa hình (0 nếu mượt, 4-8 nếu có ruộng bậc thang/vách đá)',
+                },
+                detectedObjects: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      prefabId: {
+                        type: Type.STRING,
+                        enum: PREFAB_CATALOG.map((p) => p.id),
+                      },
+                      label: { type: Type.STRING },
+                      x: { type: Type.NUMBER, description: 'Tọa độ X từ -48 đến 48 mét' },
+                      z: { type: Type.NUMBER, description: 'Tọa độ Z từ -48 đến 48 mét' },
+                      scale: { type: Type.NUMBER },
+                      rotationY: { type: Type.NUMBER },
+                    },
+                    required: ['prefabId', 'label', 'x', 'z', 'scale', 'rotationY'],
+                  },
+                },
+              },
+              required: [
+                'regionName',
+                'biome',
+                'dominantTexture',
+                'summary',
+                'reliefScale',
+                'waterLevel',
+                'terraceSteps',
+                'detectedObjects',
+              ],
             },
           },
-          required: [
-            'regionName',
-            'biome',
-            'dominantTexture',
-            'summary',
-            'reliefScale',
-            'waterLevel',
-            'terraceSteps',
-            'detectedObjects',
-          ],
-        },
-      },
-    });
+        });
+        const rawText = response.text;
+        return sanitizeAnalysis(rawText ? JSON.parse(rawText.trim()) : null);
+      })().finally(() => aiInflight.delete(key));
+      aiInflight.set(key, job);
+    }
 
-    const rawText = response.text;
-    const parsed = rawText ? JSON.parse(rawText.trim()) : null;
+    const analysis = await job;
+    if (analysis) {
+      if (aiCache.size >= AI_CACHE_MAX) {
+        const oldestKey = aiCache.keys().next().value;
+        if (oldestKey) aiCache.delete(oldestKey);
+      }
+      aiCache.set(key, { at: Date.now(), value: analysis });
+    }
     res.json({
       source: 'gemini-vision',
-      analysis: parsed,
+      analysis,
     });
   } catch (err: unknown) {
     console.error('[server] /api/reconstruct error:', err instanceof Error ? err.message : err);
@@ -406,7 +539,7 @@ ${prefabLines}`;
 });
 
 // Explicit 404 JSON handler for unknown /api/* routes so they never fall through to the SPA HTML fallback
-app.all('/api/*', (_req, res) => {
+app.all('/api/*splat', (_req, res) => {
   res.status(404).json({ error: 'Không tìm thấy endpoint API.' });
 });
 
@@ -612,7 +745,12 @@ async function startServer() {
         },
       })
     );
-    app.get('*', (_req, res) => {
+    app.get('/{*splat}', (req, res) => {
+      const ext = path.extname(req.path).toLowerCase();
+      if (ext && ext !== '.html') {
+        res.status(404).end();
+        return;
+      }
       res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
@@ -631,10 +769,14 @@ async function startServer() {
     res.status(err.status || 500).json({ error: 'Lỗi máy chủ nội bộ.' });
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `AetherTerra 3D Server (${isProd ? 'production' : 'development'}) listening on http://localhost:${PORT}`
     );
+  });
+
+  process.on('SIGTERM', () => {
+    server.close(() => process.exit(0));
   });
 }
 
@@ -646,6 +788,10 @@ const isTestExecution =
   Boolean(process.argv[1] && /\.test\.[cm]?[jt]sx?$/.test(process.argv[1]));
 
 if (!isTestExecution) {
-  startServer();
+  startServer().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
 }
+
 

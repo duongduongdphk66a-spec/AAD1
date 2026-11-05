@@ -15,5 +15,6 @@ export const celestia_sky_isles: BiomeConfig = {
   "waterDeepHex": "#0369a1",
   "defaultTexture": "limestone_cliff",
   "waterLevel": -45,
-  "reliefScale": 1.35
+  "reliefScale": 1.35,
+  "roughness": 1.2
 };

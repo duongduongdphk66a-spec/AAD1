@@ -7,6 +7,10 @@ import {
   Undo2,
   Moon,
   Sun,
+  Eye,
+  EyeOff,
+  Scan,
+  Layers,
 } from 'lucide-react';
 import {
   BiomeId,
@@ -63,16 +67,31 @@ import {
   validateWorldSavePayload,
 } from './world/generation';
 import { blendObjectsAndTerrainJunctions } from './world/junctionBlending';
-import { runHydraulicErosionAsync } from './world/terrainWorker';
 import { WorldViewport3D, CameraPresetId, ScaleMetrics } from './components/WorldViewport3D';
 import { BottomControlDock, ActiveTabId } from './components/BottomControlDock';
 import { DistanceScaleBar } from './components/DistanceScaleBar';
+import { SaveStatusIndicator } from './components/SaveStatusIndicator';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   createTerrainV3Engine,
+  TerrainSaveStatus,
   TerrainV3EngineBundle,
 } from './core/terrainV3Controller';
+import { checkStorageQuotaWarning } from './core/persistenceV3';
+import {
+  loadNewestSession,
+  putSession,
+  SessionRecord,
+} from './core/sessionStore';
 import { isTerrainV3DefaultEnabled } from './core/units';
+import {
+  encodeHeightmapRawLittleEndian,
+  exportHeightmap16,
+} from './world/exportHeightmap';
+import { downloadBlob } from './world/worldIoUtils';
+import { selectionStore, useSelection } from './state/selectionStore';
+import { QualityMode } from './core/adaptiveQuality';
+import { SHORTCUTS } from './ui/shortcuts';
 import {
   BrushLevelBadgeV3,
   LinkAndStampPopoverV3,
@@ -96,6 +115,7 @@ interface WorldHistorySnapshot {
   biomeId: BiomeId;
   waterLevel: number;
   regionTitle: string;
+  brushDepth: number;
 }
 
 const MAX_UNDO_STEPS = 25;
@@ -123,12 +143,26 @@ export default function App() {
     generateInitialSurfaceShowcaseStrokes()
   );
 
-  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(
-    () =>
+  const didInitSelectionRef = useRef(false);
+  if (!didInitSelectionRef.current) {
+    didInitSelectionRef.current = true;
+    selectionStore.getState().selectObject(
       initialWorldRef.current.initialObjects.find((o) => o.prefabId === 'windmill_cottage')?.id ??
-      initialWorldRef.current.initialObjects[0]?.id ??
-      null
-  );
+        initialWorldRef.current.initialObjects[0]?.id ??
+        null
+    );
+  }
+
+  const selectedObjectId = useSelection((s) => s.selectedObjectId);
+  const sculptTool = useSelection((s) => s.sculptTool);
+  const sculptPrefabOverride = useSelection((s) => s.sculptPrefabOverride);
+  const selectedPrefab = useSelection((s) => s.selectedPrefab);
+  const prefabCategoryFilter = useSelection((s) => s.prefabCategoryFilter);
+
+  const setSelectedObjectId = useCallback((id: string | null) => {
+    latestStateRef.current.selectedObjectId = id;
+    selectionStore.getState().selectObject(id);
+  }, []);
 
   // Undo History Stack (up to 25 steps)
   const [undoStack, setUndoStack] = useState<WorldHistorySnapshot[]>([]);
@@ -137,11 +171,9 @@ export default function App() {
   // Unified Bottom Dock State (calibrated for 10x10 km / 161x161 grid (62.5m/cell) / min 1m brush / 1:1 scale)
   const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<ActiveTabId>('prefabs');
-  const [sculptTool, setSculptTool] = useState<SculptToolId>('sheer_cliff');
   const [brushRadius, setBrushRadius] = useState<number>(15); // 15m default brush radius on Page 2 (Thang 25m)
   const [brushStrength, setBrushStrength] = useState<number>(45);
   const [spawnObjectOnSculpt, setSpawnObjectOnSculpt] = useState<boolean>(true);
-  const [sculptPrefabOverride, setSculptPrefabOverride] = useState<PrefabId | 'auto'>('auto');
   const [textureBrush, setTextureBrush] = useState<TextureBrushId>('emerald_grass');
   const [grassHeightCm, setGrassHeightCm] = useState<number>(DEFAULT_GRASS_HEIGHT_CM); // 4.0 cm (range 3.0 - 5.0 cm)
   const [flowerSpecies, setFlowerSpecies] = useState<FlowerSpeciesId>('sakura_bloom');
@@ -153,8 +185,6 @@ export default function App() {
   const [autoRuleOnSculpt, setAutoRuleOnSculpt] = useState<boolean>(true);
 
   // Prefab Placement & Transform State (Orientation 0°-360° & Scale 0.3x-3.0x on top of 1:1 real scale)
-  const [selectedPrefab, setSelectedPrefab] = useState<PrefabId>('windmill_cottage');
-  const [prefabCategoryFilter, setPrefabCategoryFilter] = useState<PrefabCategory | 'all'>('all');
   const [placementRotationDeg, setPlacementRotationDeg] = useState<number>(0);
   const [placementScale, setPlacementScale] = useState<number>(1.0);
   const [autoJunctionBlend, setAutoJunctionBlend] = useState<boolean>(true);
@@ -204,6 +234,23 @@ export default function App() {
   const [v3DebugSdfOutline, setV3DebugSdfOutline] = useState<boolean>(false);
   const [v3PanelOpen, setV3PanelOpen] = useState<boolean>(false);
   const [v3UiTick, setV3UiTick] = useState<number>(0);
+  const [saveStatus, setSaveStatus] = useState<TerrainSaveStatus>('saved');
+  const [dirtyTileCount, setDirtyTileCount] = useState<number>(0);
+  const [pendingSession, setPendingSession] = useState<SessionRecord | null>(null);
+  const [autosaveEnabled, setAutosaveEnabled] = useState<boolean>(false);
+  const [qualityMode, setQualityMode] = useState<QualityMode>(() => {
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('qualityMode') : null;
+      if (saved === 'auto' || saved === 'high' || saved === 'low') return saved;
+    } catch {
+      // Ignore storage access errors
+    }
+    return 'auto';
+  });
+  const [adaptiveScale, setAdaptiveScale] = useState<number>(1);
+  const [touchMode, setTouchMode] = useState<'navigate' | 'sculpt'>('navigate');
+  const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState<boolean>(false);
+  const scheduleSessionAutosaveRef = useRef<(() => void) | null>(null);
   const v3EngineRef = useRef<TerrainV3EngineBundle | null>(null);
   if (!v3EngineRef.current) {
     v3EngineRef.current = createTerrainV3Engine(heightMapRef.current, 1337, false);
@@ -281,6 +328,7 @@ export default function App() {
       biomeId: cur.biomeId,
       waterLevel: cur.waterLevel,
       regionTitle: cur.regionTitle,
+      brushDepth: v3EngineRef.current?.brushEngine.historyDepth() ?? 0,
     };
     setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), snapshot]);
   }, []);
@@ -303,16 +351,20 @@ export default function App() {
     setWaterLevel(snapshot.waterLevel);
     setRegionTitle(snapshot.regionTitle);
     dirtyRectRef.current = null;
-    if (v3EngineRef.current) {
-      v3EngineRef.current.brushEngine.undo();
-      v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
-      v3EngineRef.current.syncPlacedObjects(snapshot.placedObjects, latestStateRef.current.autoJunctionBlend);
+    const eng = v3EngineRef.current;
+    if (eng) {
+      while (eng.brushEngine.historyDepth() > snapshot.brushDepth && eng.brushEngine.canUndo()) {
+        eng.brushEngine.undo();
+      }
+      eng.detailGen.setBiome(snapshot.biomeId);
+      eng.terrainField.setBaseHeightMap(heightMapRef.current);
+      eng.syncPlacedObjects(snapshot.placedObjects, latestStateRef.current.autoJunctionBlend);
     }
     setTerrainVersion((v) => v + 1);
     showToast(
       `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
     );
-  }, [showToast]);
+  }, [commitPlacedObjects, showToast]);
 
   // Keep V3 StampIndex and LinkSystem synchronized with placedObjects & autoJunctionBlend
   useEffect(() => {
@@ -321,9 +373,143 @@ export default function App() {
     setV3UiTick((t) => t + 1);
   }, [placedObjects, autoJunctionBlend]);
 
-  // Keyboard shortcuts: 'H' to toggle Cinema / Zen Mode, 'Ctrl+Z' / 'Cmd+Z' to Undo
+  // Subscribe to V3 tileStore dirty status & autosave lifecycle
+  useEffect(() => {
+    const engine = v3EngineRef.current;
+    if (!engine) return;
+    setSaveStatus(engine.getSaveStatus());
+    setDirtyTileCount(engine.tileStore.stats().dirty);
+    return engine.onSaveStatusChange((nextStatus, nextDirtyCount) => {
+      setSaveStatus(nextStatus);
+      setDirtyTileCount(nextDirtyCount);
+    });
+  }, []);
+
+  // Startup: request persistent storage and check for recoverable session in IndexedDB
+  useEffect(() => {
+    let cancelled = false;
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.storage &&
+      typeof navigator.storage.persist === 'function'
+    ) {
+      void navigator.storage.persist().catch(() => {});
+    }
+    loadNewestSession()
+      .then((rec) => {
+        if (cancelled) return;
+        if (rec && rec.bytes && rec.bytes.byteLength > 16) {
+          setPendingSession(rec);
+        } else {
+          setAutosaveEnabled(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAutosaveEnabled(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 5-second debounced session autosave into alternating 'a' / 'b' IndexedDB slots
+  useEffect(() => {
+    const eng = v3EngineRef.current;
+    if (!eng || !autosaveEnabled) {
+      scheduleSessionAutosaveRef.current = null;
+      return;
+    }
+    let timer = 0;
+    let dirty = false;
+    let slot: 'a' | 'b' = 'a';
+
+    const flush = async () => {
+      if (!dirty) return;
+      dirty = false;
+      try {
+        const q = await checkStorageQuotaWarning();
+        if (q.warning80Pct) {
+          showToast('Bộ nhớ trình duyệt gần đầy, hãy xuất .atw để sao lưu.');
+        }
+        const cur = latestStateRef.current;
+        const blob = await eng.exportWorldSaveV3(cur.placedObjects, {
+          microStrokes: cur.microStrokes,
+          settings: {
+            biomeId: cur.biomeId,
+            waterLevel: cur.waterLevel,
+            regionTitle: cur.regionTitle,
+          },
+        });
+        await putSession(slot, {
+          savedAt: Date.now(),
+          title: cur.regionTitle,
+          bytes: await blob.arrayBuffer(),
+        });
+        slot = slot === 'a' ? 'b' : 'a';
+      } catch {
+        // Ignore transient session save errors
+      }
+    };
+
+    const schedule = () => {
+      dirty = true;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void flush();
+      }, 5000);
+    };
+
+    scheduleSessionAutosaveRef.current = schedule;
+    const off = eng.terrainField.on('changed', schedule);
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') {
+        void flush();
+      }
+    };
+    document.addEventListener('visibilitychange', onHide);
+
+    return () => {
+      scheduleSessionAutosaveRef.current = null;
+      off();
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onHide);
+    };
+  }, [autosaveEnabled, showToast]);
+
+  // Schedule session autosave when React world state changes
+  const isInitialMountRef = useRef(true);
+  useEffect(() => {
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      return;
+    }
+    scheduleSessionAutosaveRef.current?.();
+  }, [placedObjects, biomeId, waterLevel, regionTitle, microStrokes]);
+
+  const handleForceSyncTerrain = useCallback(() => {
+    const engine = v3EngineRef.current;
+    if (!engine) return;
+    setSaveStatus('saving');
+    void engine
+      .verifyPostImportIntegrity()
+      .then((res) => {
+        setDirtyTileCount(res.remainingDirtyTiles);
+        setSaveStatus(res.remainingDirtyTiles > 0 ? 'saving' : 'saved');
+      })
+      .catch(() => {
+        setSaveStatus(engine.getSaveStatus());
+      });
+  }, []);
+
+  // Keyboard shortcuts driven by single source of truth (SHORTCUTS in src/ui/shortcuts.ts)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsShortcutsModalOpen(false);
+        return;
+      }
       if (
         document.activeElement &&
         ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)
@@ -340,11 +526,28 @@ export default function App() {
       }
       if (e.key === 'h' || e.key === 'H') {
         setIsDockCollapsed((prev) => !prev);
+      } else if (e.key === '?') {
+        e.preventDefault();
+        setIsShortcutsModalOpen((prev) => !prev);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleUndo]);
+
+  const handleCycleQualityMode = useCallback(() => {
+    setQualityMode((prev) => {
+      const next: QualityMode = prev === 'auto' ? 'high' : prev === 'high' ? 'low' : 'auto';
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('qualityMode', next);
+        }
+      } catch {
+        // Ignore storage write errors
+      }
+      return next;
+    });
+  }, []);
 
   // Live-update 3-5cm grass height across existing grass & flower patches
   const handleChangeGrassHeightCm = useCallback((nextCm: number) => {
@@ -527,71 +730,29 @@ export default function App() {
     });
   }, [showToast]);
 
-  const handleSelectSculptTool = useCallback(
-    (nextTool: SculptToolId) => {
-      latestStateRef.current.sculptTool = nextTool;
-      latestStateRef.current.sculptPrefabOverride = 'auto';
-      setSculptTool(nextTool);
-      setSculptPrefabOverride('auto');
-      const mapped = SCULPT_TOOL_PREFAB_MAP[nextTool];
-      const mappedMeta = mapped
-        ? PREFAB_CATALOG.find((p) => p.id === mapped.prefabId)
-        : undefined;
-      if (mappedMeta) {
-        latestStateRef.current.selectedPrefab = mappedMeta.id;
-        latestStateRef.current.selectedObjectId = null;
-        setSelectedPrefab(mappedMeta.id);
-        setSelectedObjectId(null);
-        if (
-          latestStateRef.current.prefabCategoryFilter !== 'all' &&
-          latestStateRef.current.prefabCategoryFilter !== mappedMeta.category
-        ) {
-          latestStateRef.current.prefabCategoryFilter = mappedMeta.category;
-          setPrefabCategoryFilter(mappedMeta.category);
-        }
-      }
-    },
-    []
-  );
+  const handleSelectSculptTool = useCallback((nextTool: SculptToolId) => {
+    selectionStore.getState().setSculptTool(nextTool);
+    const s = selectionStore.getState();
+    latestStateRef.current.sculptTool = s.sculptTool;
+    latestStateRef.current.sculptPrefabOverride = s.sculptPrefabOverride;
+    latestStateRef.current.selectedPrefab = s.selectedPrefab;
+    latestStateRef.current.selectedObjectId = s.selectedObjectId;
+    latestStateRef.current.prefabCategoryFilter = s.prefabCategoryFilter;
+  }, []);
 
   const handleChangeSculptPrefabOverride = useCallback(
     (nextOverride: PrefabId | 'auto') => {
+      const res = selectionStore.getState().setSculptPrefabOverride(nextOverride);
+      const s = selectionStore.getState();
+      latestStateRef.current.sculptPrefabOverride = s.sculptPrefabOverride;
+      latestStateRef.current.selectedPrefab = s.selectedPrefab;
+      latestStateRef.current.selectedObjectId = s.selectedObjectId;
+      latestStateRef.current.prefabCategoryFilter = s.prefabCategoryFilter;
+      if (!res) return;
       if (nextOverride !== 'auto') {
-        const meta = PREFAB_CATALOG.find((p) => p.id === nextOverride);
-        if (!meta) return;
-        latestStateRef.current.sculptPrefabOverride = meta.id;
-        latestStateRef.current.selectedPrefab = meta.id;
-        latestStateRef.current.selectedObjectId = null;
-        setSculptPrefabOverride(meta.id);
-        setSelectedPrefab(meta.id);
-        setSelectedObjectId(null);
-        if (
-          latestStateRef.current.prefabCategoryFilter !== 'all' &&
-          latestStateRef.current.prefabCategoryFilter !== meta.category
-        ) {
-          latestStateRef.current.prefabCategoryFilter = meta.category;
-          setPrefabCategoryFilter(meta.category);
-        }
-        showToast(`Đã chọn đặt mô hình 3D: "${meta.name}". Nhấp chuột lên mặt đất để đặt.`);
+        showToast(`Đã chọn đặt mô hình 3D: "${res.name}". Nhấp chuột lên mặt đất để đặt.`);
       } else {
-        latestStateRef.current.sculptPrefabOverride = 'auto';
-        setSculptPrefabOverride('auto');
-        const mapped = SCULPT_TOOL_PREFAB_MAP[latestStateRef.current.sculptTool];
-        const mappedMeta = mapped
-          ? PREFAB_CATALOG.find((p) => p.id === mapped.prefabId)
-          : undefined;
-        if (mappedMeta) {
-          latestStateRef.current.selectedPrefab = mappedMeta.id;
-          setSelectedPrefab(mappedMeta.id);
-          if (
-            latestStateRef.current.prefabCategoryFilter !== 'all' &&
-            latestStateRef.current.prefabCategoryFilter !== mappedMeta.category
-          ) {
-            latestStateRef.current.prefabCategoryFilter = mappedMeta.category;
-            setPrefabCategoryFilter(mappedMeta.category);
-          }
-          showToast(`Đã đặt theo công cụ đắp: "${mappedMeta.name}".`);
-        }
+        showToast(`Đã đặt theo công cụ đắp: "${res.name}".`);
       }
     },
     [showToast]
@@ -599,59 +760,28 @@ export default function App() {
 
   const handleSelectPrefab = useCallback(
     (nextPrefab: PrefabId) => {
-      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefab) || PREFAB_CATALOG[0];
-      const validId = meta.id;
-      latestStateRef.current.selectedPrefab = validId;
-      latestStateRef.current.sculptPrefabOverride = validId;
-      latestStateRef.current.selectedObjectId = null;
-      setSelectedPrefab(validId);
-      setSculptPrefabOverride(validId);
-      setSelectedObjectId(null);
-      if (
-        latestStateRef.current.prefabCategoryFilter !== 'all' &&
-        latestStateRef.current.prefabCategoryFilter !== meta.category
-      ) {
-        latestStateRef.current.prefabCategoryFilter = meta.category;
-        setPrefabCategoryFilter(meta.category);
-      }
-      showToast(`Đã chọn "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`);
+      const { name } = selectionStore.getState().selectPrefab(nextPrefab);
+      const s = selectionStore.getState();
+      latestStateRef.current.selectedPrefab = s.selectedPrefab;
+      latestStateRef.current.sculptPrefabOverride = s.sculptPrefabOverride;
+      latestStateRef.current.selectedObjectId = s.selectedObjectId;
+      latestStateRef.current.prefabCategoryFilter = s.prefabCategoryFilter;
+      showToast(`Đã chọn "${name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`);
     },
     [showToast]
   );
 
   const handleChangePrefabCategoryFilter = useCallback(
     (nextCat: PrefabCategory | 'all') => {
-      latestStateRef.current.prefabCategoryFilter = nextCat;
-      setPrefabCategoryFilter(nextCat);
-      if (nextCat === 'all') return;
-
-      const preferredByCat: Record<PrefabCategory, PrefabId> = {
-        house: 'windmill_cottage',
-        tree: 'sakura_tree',
-        mountain: 'pluto_cryo_volcano',
-        landmark: 'ancient_bridge',
-      };
-
-      const curId = latestStateRef.current.selectedPrefab;
-      const curMeta = PREFAB_CATALOG.find((p) => p.id === curId);
-      const nextPrefabId: PrefabId =
-        curMeta && curMeta.category === nextCat
-          ? curId
-          : preferredByCat[nextCat] ||
-            PREFAB_CATALOG.find((p) => p.category === nextCat)?.id ||
-            curId;
-
-      latestStateRef.current.selectedPrefab = nextPrefabId;
-      latestStateRef.current.sculptPrefabOverride = nextPrefabId;
-      latestStateRef.current.selectedObjectId = null;
-      setSelectedPrefab(nextPrefabId);
-      setSculptPrefabOverride(nextPrefabId);
-      setSelectedObjectId(null);
-
-      const meta = PREFAB_CATALOG.find((p) => p.id === nextPrefabId);
-      if (meta) {
+      const res = selectionStore.getState().setCategoryFilter(nextCat);
+      const s = selectionStore.getState();
+      latestStateRef.current.prefabCategoryFilter = s.prefabCategoryFilter;
+      latestStateRef.current.selectedPrefab = s.selectedPrefab;
+      latestStateRef.current.sculptPrefabOverride = s.sculptPrefabOverride;
+      latestStateRef.current.selectedObjectId = s.selectedObjectId;
+      if (res) {
         showToast(
-          `Đã chọn danh mục "${meta.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`
+          `Đã chọn danh mục "${res.name}" — Nhấp chuột lên mặt đất hoặc bấm "Đặt 1:1" để đặt.`
         );
       }
     },
@@ -1121,18 +1251,21 @@ export default function App() {
         { x: 7, z: 22 },
       ];
 
-      let chosen = foregroundSlots.find((slot) =>
-        existing.every((obj) => Math.hypot(obj.x - slot.x, obj.z - slot.z) >= 5.5)
-      );
+      const MIN_SLOT_GAP = 5.5;
+      const isFree = (x: number, z: number) =>
+        existing.every((obj) => Math.hypot(obj.x - x, obj.z - z) >= MIN_SLOT_GAP);
+
+      let chosen = foregroundSlots.find((slot) => isFree(slot.x, slot.z));
 
       if (!chosen) {
-        const idx = existing.length;
-        const col = (idx % 7) - 3;
-        const row = Math.floor((idx - 21) / 7) % 4;
-        chosen = {
-          x: Number((col * 6.5).toFixed(1)),
-          z: Number((6 + Math.max(0, row) * 6).toFixed(1)),
-        };
+        for (let step = 0; step < 280 && !chosen; step++) {
+          const col = (step % 7) - 3;
+          const row = Math.floor(step / 7);
+          const x = Number((col * 6.5).toFixed(1));
+          const z = Number((6 + row * 6).toFixed(1));
+          if (isFree(x, z)) chosen = { x, z };
+        }
+        chosen ??= { x: 0, z: Number((6 + existing.length * 6).toFixed(1)) };
       }
 
       handlePlacePrefabAt(chosen.x, chosen.z, targetPrefab);
@@ -1155,6 +1288,16 @@ export default function App() {
       heightMapRef.current = generated.heightMap;
       splatMapRef.current = generated.splatMap;
       colorMapRef.current = generated.colorMap;
+      if (v3EngineRef.current) {
+        v3EngineRef.current.detailGen.setBiome(nextBiome);
+        v3EngineRef.current.terrainField.setBaseHeightMap(generated.heightMap);
+        v3EngineRef.current.scheduler.syncWorkerTerrainState(
+          generated.heightMap,
+          v3EngineRef.current.detailGen.getParams(),
+          v3EngineRef.current.detailGen.isEnabled(),
+          v3EngineRef.current.detailGen.getBiomeRoughness()
+        );
+      }
       commitPlacedObjects(generated.initialObjects);
       setSelectedObjectId(generated.initialObjects[0]?.id ?? null);
 
@@ -1317,36 +1460,58 @@ export default function App() {
   );
 
   const handleExportWorldJson = useCallback(() => {
-    const cur = latestStateRef.current;
-    const payload = serializeWorldToSavePayload({
-      regionTitle: cur.regionTitle,
-      biomeId: cur.biomeId,
-      activeWeather,
-      waterLevel: cur.waterLevel,
-      sunElevation,
-      sunAzimuth,
-      timeOfDay,
-      starlightMode,
-      grassHeightCm,
-      flowerSpecies,
-      flowerColorHex,
-      heightMap: heightMapRef.current,
-      splatMap: splatMapRef.current,
-      placedObjects: cur.placedObjects,
-      microStrokes: cur.microStrokes,
-    });
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `aetherterra-v2-${cur.biomeId}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast(
-      `Đã xuất tệp bản đồ 3D đầy đủ (.JSON v2: lưới độ cao ${GRID_SIZE + 1}×${GRID_SIZE + 1}, bảng màu bề mặt & ${cur.placedObjects.length} vật thể).`
-    );
+    setSaveStatus('saving');
+    try {
+      const cur = latestStateRef.current;
+      const payload = serializeWorldToSavePayload({
+        regionTitle: cur.regionTitle,
+        biomeId: cur.biomeId,
+        activeWeather,
+        waterLevel: cur.waterLevel,
+        sunElevation,
+        sunAzimuth,
+        timeOfDay,
+        starlightMode,
+        grassHeightCm,
+        flowerSpecies,
+        flowerColorHex,
+        heightMap: heightMapRef.current,
+        splatMap: splatMapRef.current,
+        placedObjects: cur.placedObjects,
+        microStrokes: cur.microStrokes,
+      });
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json',
+      });
+      downloadBlob(blob, `aetherterra-v2-${cur.biomeId}.json`);
+
+      const syncPromise = v3EngineRef.current
+        ? v3EngineRef.current.verifyPostImportIntegrity()
+        : Promise.resolve({
+            totalTilesChecked: 0,
+            unsyncedTilesFound: 0,
+            autosaveTriggered: false,
+            remainingDirtyTiles: 0,
+          });
+
+      void syncPromise
+        .then((res) => {
+          setDirtyTileCount(res.remainingDirtyTiles);
+          setSaveStatus(res.remainingDirtyTiles > 0 ? 'saving' : 'saved');
+        })
+        .catch(() => {
+          setSaveStatus('saved');
+        });
+
+      showToast(
+        `Đã xuất tệp bản đồ 3D đầy đủ (.JSON v2: lưới độ cao ${GRID_SIZE + 1}×${GRID_SIZE + 1}, bảng màu bề mặt & ${cur.placedObjects.length} vật thể).`
+      );
+    } catch {
+      setSaveStatus(
+        v3EngineRef.current ? v3EngineRef.current.getSaveStatus() : 'saved'
+      );
+      showToast('Không thể xuất tệp bản đồ .JSON.');
+    }
   }, [
     activeWeather,
     sunElevation,
@@ -1381,6 +1546,12 @@ export default function App() {
         );
         if (v3EngineRef.current) {
           v3EngineRef.current.terrainField.setBaseHeightMap(heightMapRef.current);
+          v3EngineRef.current.scheduler.syncWorkerTerrainState(
+            heightMapRef.current,
+            v3EngineRef.current.detailGen.getParams(),
+            v3EngineRef.current.detailGen.isEnabled(),
+            v3EngineRef.current.detailGen.getBiomeRoughness()
+          );
         }
         commitPlacedObjects((prev) => syncObjectsToGround(prev));
         dirtyRectRef.current = null;
@@ -1416,29 +1587,89 @@ export default function App() {
     });
   }, [showToast]);
 
+  const applyAtwBlob = useCallback(
+    async (blob: Blob, undoLabel?: string) => {
+      const engine = v3EngineRef.current;
+      if (!engine) return;
+      if (undoLabel) {
+        pushUndoSnapshot(undoLabel);
+      }
+      const stateV3 = await engine.importWorldSaveV3(blob);
+      heightMapRef.current = stateV3.baseHeight;
+      const nextBiome: BiomeId =
+        stateV3.settings?.biomeId ?? latestStateRef.current.biomeId;
+      if (stateV3.settings) {
+        setBiomeId(stateV3.settings.biomeId);
+        setWaterLevel(stateV3.settings.waterLevel);
+        if (stateV3.settings.regionTitle) {
+          setRegionTitle(stateV3.settings.regionTitle);
+        }
+        engine.detailGen.setBiome(stateV3.settings.biomeId);
+        engine.scheduler.syncWorkerTerrainState(
+          stateV3.baseHeight,
+          engine.detailGen.getParams(),
+          engine.detailGen.isEnabled(),
+          engine.detailGen.getBiomeRoughness()
+        );
+      }
+      recomputeTerrainColors(
+        heightMapRef.current,
+        splatMapRef.current,
+        colorMapRef.current,
+        nextBiome
+      );
+      commitPlacedObjects(stateV3.objects);
+      if (stateV3.microStrokes && stateV3.microStrokes.length > 0) {
+        setMicroStrokes(stateV3.microStrokes);
+      }
+      setSelectedObjectId(stateV3.objects[0]?.id ?? null);
+      dirtyRectRef.current = null;
+      setTerrainVersion((v) => v + 1);
+      setV3UiTick((t) => t + 1);
+      return stateV3;
+    },
+    [commitPlacedObjects, pushUndoSnapshot]
+  );
+
+  const handleAcceptSessionRestore = useCallback(() => {
+    if (!pendingSession) return;
+    const rec = pendingSession;
+    setPendingSession(null);
+    void applyAtwBlob(new Blob([rec.bytes]), 'Khôi phục phiên làm việc trước')
+      .then((stateV3) => {
+        setAutosaveEnabled(true);
+        if (stateV3) {
+          showToast(
+            `Đã khôi phục phiên "${rec.title || 'Bản đồ 3D'}" (${stateV3.tiles.length} ô đa phân giải, ${stateV3.objects.length} vật thể).`
+          );
+        }
+      })
+      .catch(() => {
+        setAutosaveEnabled(true);
+        showToast('Không thể khôi phục phiên trước. Đã khởi tạo bản đồ mới.');
+      });
+  }, [applyAtwBlob, pendingSession, showToast]);
+
+  const handleDismissSessionRestore = useCallback(() => {
+    setPendingSession(null);
+    setAutosaveEnabled(true);
+  }, []);
+
   const handleImportWorldJson = useCallback(
     (file: File) => {
       if (file.name.toLowerCase().endsWith('.atw')) {
-        if (!v3EngineRef.current) return;
-        v3EngineRef.current
-          .importWorldSaveV3(file)
+        void applyAtwBlob(file, 'Nhập bản đồ nhị phân .ATW v3')
           .then((stateV3) => {
-            pushUndoSnapshot('Nhập bản đồ nhị phân .ATW v3');
-            heightMapRef.current = stateV3.baseHeight;
-            commitPlacedObjects(stateV3.objects);
-            if (stateV3.microStrokes && stateV3.microStrokes.length > 0) {
-              setMicroStrokes(stateV3.microStrokes);
+            if (stateV3) {
+              showToast(
+                `Đã nhập tệp nhị phân .ATW v3 (${stateV3.tiles.length} ô đa phân giải, ${stateV3.objects.length} vật thể, ${stateV3.links.length} đường nối).`
+              );
             }
-            setSelectedObjectId(stateV3.objects[0]?.id ?? null);
-            dirtyRectRef.current = null;
-            setTerrainVersion((v) => v + 1);
-            setV3UiTick((t) => t + 1);
-            showToast(
-              `Đã nhập tệp nhị phân .ATW v3 (${stateV3.tiles.length} ô đa phân giải, ${stateV3.objects.length} vật thể, ${stateV3.links.length} đường nối).`
-            );
           })
           .catch((err) => {
-            showToast(`Không thể nhập tệp .ATW: ${err instanceof Error ? err.message : 'Lỗi định dạng'}`);
+            showToast(
+              `Không thể nhập tệp .ATW: ${err instanceof Error ? err.message : 'Lỗi định dạng'}`
+            );
           });
         return;
       }
@@ -1458,7 +1689,14 @@ export default function App() {
           splatMapRef.current = restored.splatMap;
           colorMapRef.current = restored.colorMap;
           if (v3EngineRef.current) {
+            v3EngineRef.current.detailGen.setBiome(restored.biomeId);
             v3EngineRef.current.terrainField.setBaseHeightMap(restored.heightMap);
+            v3EngineRef.current.scheduler.syncWorkerTerrainState(
+              restored.heightMap,
+              v3EngineRef.current.detailGen.getParams(),
+              v3EngineRef.current.detailGen.isEnabled(),
+              v3EngineRef.current.detailGen.getBiomeRoughness()
+            );
             v3EngineRef.current.syncPlacedObjects(restored.placedObjects, latestStateRef.current.autoJunctionBlend);
           }
           setRegionTitle(restored.regionTitle);
@@ -1489,24 +1727,60 @@ export default function App() {
       };
       reader.readAsText(file);
     },
-    [commitPlacedObjects, pushUndoSnapshot, showToast]
+    [applyAtwBlob, commitPlacedObjects, pushUndoSnapshot, showToast]
   );
 
   const handleExportAtwV3 = useCallback(() => {
     if (!v3EngineRef.current) return;
+    setSaveStatus('saving');
+    const cur = latestStateRef.current;
     v3EngineRef.current
-      .exportWorldSaveV3(latestStateRef.current.placedObjects)
+      .exportWorldSaveV3(cur.placedObjects, {
+        microStrokes: cur.microStrokes,
+        settings: {
+          biomeId: cur.biomeId,
+          waterLevel: cur.waterLevel,
+          regionTitle: cur.regionTitle,
+        },
+      })
       .then((blob) => {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `aetherterra-v3-${latestStateRef.current.biomeId}.atw`;
-        a.click();
-        URL.revokeObjectURL(url);
+        downloadBlob(blob, `aetherterra-v3-${cur.biomeId}.atw`);
+        setDirtyTileCount(v3EngineRef.current?.tileStore.stats().dirty ?? 0);
+        setSaveStatus(v3EngineRef.current?.getSaveStatus() ?? 'saved');
         showToast('Đã xuất tệp bản đồ nhị phân nén .ATW (WorldSaveV3).');
       })
+      .catch((err) => {
+        setSaveStatus(v3EngineRef.current?.getSaveStatus() ?? 'saved');
+        showToast(
+          err instanceof Error ? err.message : 'Không thể xuất tệp .ATW.'
+        );
+      });
+  }, [showToast]);
+
+  const handleExportHeightmap16 = useCallback(() => {
+    const engine = v3EngineRef.current;
+    if (!engine) return;
+    setSaveStatus('saving');
+    const cur = latestStateRef.current;
+    void exportHeightmap16(engine.terrainField, 1025)
+      .then(({ data, meta }) => {
+        const rawBytes = encodeHeightmapRawLittleEndian(data);
+        const rawBlob = new Blob([rawBytes as unknown as BlobPart], {
+          type: 'application/octet-stream',
+        });
+        const metaBlob = new Blob([JSON.stringify(meta, null, 2)], {
+          type: 'application/json',
+        });
+        downloadBlob(rawBlob, `aetherterra-heightmap-1025-${cur.biomeId}.raw`);
+        downloadBlob(metaBlob, `aetherterra-heightmap-1025-${cur.biomeId}.heightmap.json`);
+        setSaveStatus(engine.getSaveStatus());
+        showToast(
+          `Đã xuất Heightmap 16-bit 1025×1025 (.raw + heightmap.json · Cao độ [${meta.minHeight.toFixed(1)}m .. ${meta.maxHeight.toFixed(1)}m]).`
+        );
+      })
       .catch(() => {
-        showToast('Không thể xuất tệp .ATW.');
+        setSaveStatus(engine.getSaveStatus());
+        showToast('Không thể xuất Heightmap 16-bit.');
       });
   }, [showToast]);
 
@@ -1668,6 +1942,10 @@ export default function App() {
           cameraPresetTrigger={cameraPresetTrigger}
           v3Engine={v3EngineRef.current}
           v3Enabled={v3Enabled}
+          debugShowSdfOutline={v3DebugSdfOutline}
+          qualityMode={qualityMode}
+          onAdaptiveScaleChange={setAdaptiveScale}
+          touchMode={touchMode}
           onTerrainStrokeStart={handleTerrainStrokeStart}
           onTerrainStroke={handleTerrainStroke}
           onTerrainStrokeEnd={handleTerrainStrokeEnd}
@@ -1694,14 +1972,89 @@ export default function App() {
         })()}
         {v3Enabled && v3EngineRef.current && (
           <div className="pointer-events-auto flex flex-col items-end gap-1" data-tick={v3UiTick}>
-            <button
-              type="button"
-              data-testid="toggle-v3-link-stamp-btn"
-              onClick={() => setV3PanelOpen((p) => !p)}
-              className="px-2.5 py-1 rounded-lg bg-slate-950/85 hover:bg-slate-900 border border-cyan-500/40 text-[11px] font-medium text-cyan-200 shadow-lg cursor-pointer"
-            >
-              {v3PanelOpen ? 'Ẩn Tem SDF & Đường Nối V3' : 'Mở Tem SDF & Đường Nối V3'}
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                id="quick-toggle-sdf-debug-btn"
+                data-testid="quick-toggle-sdf-debug-btn"
+                data-sdf-debug={v3DebugSdfOutline ? 'active' : 'inactive'}
+                aria-pressed={v3DebugSdfOutline}
+                onClick={() => {
+                  const next = !v3DebugSdfOutline;
+                  setV3DebugSdfOutline(next);
+                  v3EngineRef.current?.splatHandle.setDebugShowSdfOutline(next);
+                  showToast(
+                    next
+                      ? 'Đã bật Viền SDF: Đang hiển thị vùng va chạm SDF trực tiếp của vật thể đang chọn.'
+                      : 'Đã tắt Viền SDF.'
+                  );
+                }}
+                title="Bật/tắt nhanh kiểm tra thể tích va chạm SDF (Signed Distance Field) cho vật thể đang chọn"
+                className={`px-2.5 py-1 rounded-lg border-2 text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  v3DebugSdfOutline
+                    ? 'bg-blue-600/35 hover:bg-blue-600/45 border-blue-400 text-blue-100 shadow-[0_0_12px_rgba(59,130,246,0.5)] ring-1 ring-blue-400/40'
+                    : 'bg-slate-950/85 hover:bg-slate-900 border-slate-700/80 text-slate-300 hover:text-white shadow-lg'
+                }`}
+              >
+                {v3DebugSdfOutline ? (
+                  <Eye
+                    data-testid="sdf-debug-icon-active"
+                    className="w-3.5 h-3.5 text-blue-300 shrink-0"
+                  />
+                ) : (
+                  <EyeOff
+                    data-testid="sdf-debug-icon-inactive"
+                    className="w-3.5 h-3.5 text-slate-400 shrink-0"
+                  />
+                )}
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    v3DebugSdfOutline ? 'bg-blue-400 animate-ping' : 'bg-slate-500'
+                  }`}
+                />
+                <span>Viền SDF: {v3DebugSdfOutline ? 'BẬT' : 'TẮT'}</span>
+              </button>
+
+              <button
+                type="button"
+                id="toggle-v3-link-stamp-btn"
+                data-testid="toggle-v3-link-stamp-btn"
+                data-sdf-debug={v3DebugSdfOutline ? 'active' : 'inactive'}
+                aria-expanded={v3PanelOpen}
+                onClick={() => setV3PanelOpen((p) => !p)}
+                title={
+                  v3DebugSdfOutline
+                    ? 'Đang bật kiểm tra vùng va chạm SDF — Nhấn để đóng/mở bảng Tem SDF & Đường Nối V3'
+                    : 'Mở bảng Tem SDF & Đường Nối V3 (Kiểm tra vùng va chạm SDF đang tắt)'
+                }
+                className={`px-2.5 py-1 rounded-lg border-2 text-[11px] font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                  v3DebugSdfOutline
+                    ? 'bg-blue-950/90 hover:bg-blue-900/90 border-blue-400 text-blue-100 shadow-[0_0_14px_rgba(59,130,246,0.55)] ring-2 ring-blue-400/50 animate-pulse'
+                    : 'bg-slate-950/85 hover:bg-slate-900 border-cyan-500/40 text-cyan-200 shadow-lg'
+                }`}
+              >
+                {v3DebugSdfOutline ? (
+                  <Scan
+                    data-testid="toggle-v3-sdf-active-icon"
+                    className="w-3.5 h-3.5 text-blue-300 shrink-0"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <Layers
+                    data-testid="toggle-v3-sdf-inactive-icon"
+                    className="w-3.5 h-3.5 text-cyan-300 shrink-0"
+                    aria-hidden="true"
+                  />
+                )}
+                {v3DebugSdfOutline && (
+                  <span
+                    className="w-2 h-2 rounded-full bg-blue-400 shadow-[0_0_6px_#60a5fa]"
+                    aria-hidden="true"
+                  />
+                )}
+                <span>{v3PanelOpen ? 'Ẩn Tem SDF & Đường Nối V3' : 'Mở Tem SDF & Đường Nối V3'}</span>
+              </button>
+            </div>
             {v3PanelOpen && (
               <LinkAndStampPopoverV3
                 linkProps={{
@@ -1761,6 +2114,7 @@ export default function App() {
                     : null
                 }
                 onExportAtw={handleExportAtwV3}
+                onExportHeightmap16={handleExportHeightmap16}
               />
             )}
           </div>
@@ -1811,6 +2165,43 @@ export default function App() {
             </span>
             <span>·</span>
             <span data-testid="world-brush-spec">Cọ {brushRadius}m</span>
+            <span>·</span>
+            <button
+              type="button"
+              data-testid="quality-mode-toggle"
+              onClick={handleCycleQualityMode}
+              title="Đổi chế độ Chất lượng đồ họa thích ứng (Tự động / Cao / Thấp)"
+              className="px-1.5 py-0.5 rounded bg-slate-800/90 hover:bg-slate-700 border border-slate-600/80 text-sky-300 font-semibold cursor-pointer"
+            >
+              Chất lượng:{' '}
+              {qualityMode === 'auto' ? 'Tự động' : qualityMode === 'high' ? 'Cao' : 'Thấp'} (
+              {adaptiveScale.toFixed(2)}x)
+            </button>
+            <button
+              type="button"
+              data-testid="touch-mode-toggle"
+              onClick={() =>
+                setTouchMode((m) => (m === 'navigate' ? 'sculpt' : 'navigate'))
+              }
+              title="Công tắc chế độ Cảm ứng / Máy tính bảng: Xoay Camera hoặc Điêu Khắc"
+              className={`px-1.5 py-0.5 rounded border font-semibold cursor-pointer ${
+                touchMode === 'sculpt'
+                  ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                  : 'bg-slate-800/90 hover:bg-slate-700 border-slate-600/80 text-slate-300'
+              }`}
+            >
+              Cảm ứng: {touchMode === 'sculpt' ? 'Điêu Khắc' : 'Xoay'}
+            </button>
+            <button
+              type="button"
+              data-testid="shortcuts-help-btn"
+              aria-label="Danh sách phím tắt (?)"
+              onClick={() => setIsShortcutsModalOpen(true)}
+              title="Danh sách phím tắt (?)"
+              className="px-1.5 py-0.5 rounded bg-slate-800/90 hover:bg-slate-700 border border-slate-600/80 text-slate-200 font-bold cursor-pointer"
+            >
+              ?
+            </button>
           </div>
         </div>
 
@@ -2089,6 +2480,45 @@ export default function App() {
         );
       })()}
 
+      {/* Session Restore Prompt Banner */}
+      {pendingSession && (
+        <div
+          data-testid="session-restore-banner"
+          role="dialog"
+          aria-label="Khôi phục phiên làm việc"
+          className="fixed top-14 left-1/2 -translate-x-1/2 z-40 px-4 py-2.5 rounded-xl bg-[#111927]/95 border border-cyan-400/70 shadow-2xl text-xs text-slate-100 flex items-center gap-3 pointer-events-auto"
+        >
+          <span>
+            Khôi phục phiên lúc{' '}
+            <strong className="text-cyan-300 font-mono">
+              {new Date(pendingSession.savedAt).toLocaleTimeString('vi-VN', {
+                hour: '2-digit',
+                minute: '2-digit',
+              })}
+            </strong>
+            ?
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="restore-session-accept"
+              onClick={handleAcceptSessionRestore}
+              className="px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-[11px] transition-colors cursor-pointer"
+            >
+              Khôi phục
+            </button>
+            <button
+              type="button"
+              data-testid="restore-session-dismiss"
+              onClick={handleDismissSessionRestore}
+              className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 font-medium text-[11px] transition-colors cursor-pointer"
+            >
+              Bỏ qua
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Action Status Feedback Banner */}
       {statusBanner && (
         <div
@@ -2197,12 +2627,61 @@ export default function App() {
         onChangeTriplanarSharpness={setTriplanarSharpness}
       />
 
+      {/* Bottom-Left Save Status Indicator ('Đang lưu...' / 'Đã lưu') */}
+      <SaveStatusIndicator
+        status={saveStatus}
+        dirtyTiles={dirtyTileCount}
+        onSyncNow={handleForceSyncTerrain}
+      />
+
       {/* Bottom-Right Live Vector Distance Scale Bar / Ruler (1:1 Real-World Scale) */}
       <DistanceScaleBar
         metersPerPixel={scaleMetrics.metersPerPixel}
         cameraDistanceMeters={scaleMetrics.cameraDistanceMeters}
         hoverCoords={hoverCoords}
       />
+
+      {/* Keyboard Shortcuts Help Dialog (? key) */}
+      {isShortcutsModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Danh sách phím tắt"
+          data-testid="shortcuts-help-dialog"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4"
+          onClick={() => setIsShortcutsModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl border border-slate-700 bg-[#111927] p-4 text-slate-100 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-bold text-amber-300">Danh Sách Phím Tắt</h2>
+              <button
+                type="button"
+                data-testid="close-shortcuts-dialog-btn"
+                onClick={() => setIsShortcutsModalOpen(false)}
+                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 cursor-pointer"
+              >
+                Đóng (Esc)
+              </button>
+            </div>
+            <ul className="space-y-2 text-xs">
+              {SHORTCUTS.map((s) => (
+                <li
+                  key={s.id}
+                  className="flex items-center justify-between rounded-lg bg-slate-900/80 px-3 py-2 border border-slate-800"
+                >
+                  <span className="text-slate-200">{s.label}</span>
+                  <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-600 font-mono text-[11px] text-amber-300">
+                    {s.keys}
+                  </kbd>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {/* Lazy-Loaded Image-to-3D Terrain & Object Reconstruction Modal */}
       {isReconstructModalOpen && (

@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { reportClientError } from '../core/reportClientError';
 
 interface ErrorBoundaryProps {
   /** Tên vùng bị bao, hiển thị trong thông báo lỗi và log (vd. "Khung nhìn 3D"). */
@@ -22,6 +23,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error(`[ErrorBoundary:${this.props.label ?? 'app'}]`, error, info.componentStack);
+    reportClientError('boundary', error, this.props.label);
   }
 
   private handleRetry = () => this.setState({ error: null });

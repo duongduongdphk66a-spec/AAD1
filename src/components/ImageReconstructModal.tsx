@@ -14,10 +14,9 @@ import {
   BIOMES,
   GRID_SIZE,
   PlacedObject,
-  PrefabId,
-  PREFAB_CATALOG,
   WORLD_SIZE,
 } from '../world/registry';
+import { sanitizeAnalysis } from '../world/aiAnalysis';
 import { getGroundHeightAt } from '../world/sculpting';
 import {
   analyzeAndClassifyImage,
@@ -490,6 +489,8 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         ? 'image/jpeg'
         : payloadDataUrl.startsWith('data:image/webp')
         ? 'image/webp'
+        : payloadDataUrl.startsWith('data:image/gif')
+        ? 'image/gif'
         : 'image/png';
 
       const response = await fetch('/api/reconstruct', {
@@ -517,21 +518,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         return;
       }
 
-      if (data?.analysis) {
-        const ai = data.analysis;
-        const aiBiome: BiomeId =
-          typeof ai.biome === 'string' && Object.hasOwn(BIOMES, ai.biome)
-            ? (ai.biome as BiomeId)
-            : localResult.metrics.suggestedBiome;
-
-        const nextRelief =
-          typeof ai.reliefScale === 'number' && Number.isFinite(ai.reliefScale)
-            ? Math.max(0.6, Math.min(2.2, ai.reliefScale))
-            : reliefScale;
-        const nextTerrace =
-          typeof ai.terraceSteps === 'number' && Number.isFinite(ai.terraceSteps)
-            ? Math.max(0, Math.min(8, ai.terraceSteps))
-            : terraceSteps;
+      const sanitizedAi = data?.analysis ? sanitizeAnalysis(data.analysis) : null;
+      if (sanitizedAi) {
+        const aiBiome: BiomeId = sanitizedAi.biome ?? localResult.metrics.suggestedBiome;
+        const nextRelief = sanitizedAi.reliefScale;
+        const nextTerrace = sanitizedAi.terraceSteps;
 
         const updatedLocal = runLocalReconstruction(
           rgbaBufferRef.current.rgba,
@@ -543,39 +534,26 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
           mode
         );
 
-        const validPrefabs = PREFAB_CATALOG.map((p) => p.id);
-        const MAX_VILLAGE_COORD_M = 48;
-        if (Array.isArray(ai.detectedObjects) && ai.detectedObjects.length > 0) {
-          const aiPlaced: PlacedObject[] = ai.detectedObjects
-            .slice(0, 16)
-            .map((item: Record<string, unknown>, i: number) => {
-              const pId = validPrefabs.includes(item.prefabId as PrefabId)
-                ? (item.prefabId as PrefabId)
-                : 'windmill_cottage';
-              const rawX = Number(item.x);
-              const rawZ = Number(item.z);
-              const safeX = Number.isFinite(rawX) ? rawX : 0;
-              const safeZ = Number.isFinite(rawZ) ? rawZ : 0;
-              const wx = Math.max(-MAX_VILLAGE_COORD_M, Math.min(MAX_VILLAGE_COORD_M, safeX));
-              const wz = Math.max(-MAX_VILLAGE_COORD_M, Math.min(MAX_VILLAGE_COORD_M, safeZ));
-              const wy = getGroundHeightAt(
-                updatedLocal.heightMap,
-                GRID_SIZE,
-                WORLD_SIZE,
-                wx,
-                wz
-              );
-              return {
-                id: `ai-${i}-${pId}`,
-                prefabId: pId,
-                label: String(item.label || pId),
-                x: Number(wx.toFixed(1)),
-                y: Number(wy.toFixed(2)),
-                z: Number(wz.toFixed(1)),
-                scale: Math.max(0.75, Math.min(1.6, Number(item.scale) || 1.05)),
-                rotationY: Number(item.rotationY) || 0,
-              };
-            });
+        if (sanitizedAi.detectedObjects.length > 0) {
+          const aiPlaced: PlacedObject[] = sanitizedAi.detectedObjects.map((item, i) => {
+            const wy = getGroundHeightAt(
+              updatedLocal.heightMap,
+              GRID_SIZE,
+              WORLD_SIZE,
+              item.x,
+              item.z
+            );
+            return {
+              id: `ai-${i}-${item.prefabId}`,
+              prefabId: item.prefabId,
+              label: item.label || item.prefabId,
+              x: Number(item.x.toFixed(1)),
+              y: Number(wy.toFixed(2)),
+              z: Number(item.z.toFixed(1)),
+              scale: Math.max(0.75, Math.min(1.6, item.scale || 1.05)),
+              rotationY: item.rotationY,
+            };
+          });
           updatedLocal.detectedObjects = aiPlaced;
         }
         setReconstructed({ ...updatedLocal });
@@ -583,9 +561,17 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         setReliefScale(nextRelief);
         setTerraceSteps(nextTerrace);
         setOverrideBiome(aiBiome);
-        setAiSourceLabel('Gemini Vision 3D + Pixel Heightfield');
-        if (ai.regionName) setRegionTitle(ai.regionName);
-        if (ai.summary) setSummaryText(ai.summary);
+        setAiSourceLabel(
+          data.cached
+            ? 'Gemini Vision 3D (Cached) + Pixel Heightfield'
+            : 'Gemini Vision 3D + Pixel Heightfield'
+        );
+        if (sanitizedAi.regionName.trim()) {
+          setRegionTitle(sanitizedAi.regionName.trim());
+        }
+        if (sanitizedAi.summary.trim()) {
+          setSummaryText(sanitizedAi.summary.trim());
+        }
       } else {
         setAiSourceLabel('Pixel Depth & Chroma Engine');
         if (data && typeof data.warning === 'string') {

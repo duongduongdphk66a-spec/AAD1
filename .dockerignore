@@ -1,0 +1,6 @@
+node_modules
+dist
+server.js
+server.js.map
+.git
+.env*

@@ -16,5 +16,6 @@ export const amazon_congo_rainforest: BiomeConfig = {
   "defaultTexture": "tropical_rainforest_floor",
   "defaultWeather": "tropical_monsoon_rain",
   "waterLevel": -12,
-  "reliefScale": 0.96
+  "reliefScale": 0.96,
+  "roughness": 0.68
 };

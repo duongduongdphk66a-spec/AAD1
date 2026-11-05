@@ -16,5 +16,6 @@ export const hawaii_shield_volcano: BiomeConfig = {
   "defaultTexture": "volcanic_lava",
   "defaultWeather": "ash_ember_fall",
   "waterLevel": -16,
-  "reliefScale": 1.24
+  "reliefScale": 1.24,
+  "roughness": 1.22
 };

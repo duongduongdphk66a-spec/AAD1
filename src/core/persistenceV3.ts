@@ -1,5 +1,7 @@
 import { validateWorldSavePayload } from '../world/generation';
 import {
+  BIOMES,
+  BiomeId,
   MicroStrokeStamp,
   PREFAB_CATALOG,
   PlacedObject,
@@ -48,6 +50,11 @@ export interface WorldSaveV3 {
   links: Link[];
   splatLayers?: SerializedSplatLayer[];
   microStrokes?: MicroStrokeStamp[];
+  settings?: {
+    biomeId: BiomeId;
+    waterLevel: number;
+    regionTitle: string;
+  };
 }
 
 export interface WorldIO {
@@ -62,8 +69,44 @@ const ATW_VERSION = 3;
 export const MAX_META_DECOMPRESSED_BYTES = 32 * 1024 * 1024; // 32 MB ceiling for META JSON
 export const EXACT_BASE_DECOMPRESSED_BYTES = BASE_N * BASE_N * 4 * 2; // 207,368 bytes
 export const EXACT_TILE_DECOMPRESSED_BYTES = 20 + TILE * TILE * 2; // 131,092 bytes
-export const MAX_TOTAL_DECOMPRESSED_BYTES = 96 * 1024 * 1024; // 96 MB total across all chunks
-export const MAX_ATW_CHUNKS = 4096;
+export const MAX_TOTAL_DECOMPRESSED_BYTES = 256 * 1024 * 1024; // ~1,900 tiles (256 MB total across all chunks)
+export const MAX_ATW_CHUNKS = 2048;
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+export function crc32(b: Uint8Array): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < b.length; i++) {
+    c = CRC_TABLE[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+export function validateSettingsV3(raw: unknown): WorldSaveV3['settings'] | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const s = raw as Record<string, unknown>;
+  return {
+    biomeId:
+      typeof s.biomeId === 'string' && Object.hasOwn(BIOMES, s.biomeId)
+        ? (s.biomeId as BiomeId)
+        : 'mondstadt_meadow',
+    waterLevel:
+      typeof s.waterLevel === 'number' && Number.isFinite(s.waterLevel)
+        ? Math.min(5000, Math.max(-2000, s.waterLevel))
+        : 0,
+    regionTitle: typeof s.regionTitle === 'string' ? s.regionTitle.slice(0, 120) : '',
+  };
+}
 
 const VALID_PREFAB_IDS = new Set<string>(PREFAB_CATALOG.map((p) => p.id));
 const VALID_TEXTURE_IDS = new Set<string>(TEXTURE_INDEX_MAP);
@@ -430,7 +473,7 @@ function validateLinksV3(rawLinks: unknown): Link[] {
 export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   const encoder = new TextEncoder();
 
-  const metaObj = {
+  const metaObj: Record<string, unknown> = {
     version: 3,
     seed: state.seed,
     worldSize: 10000,
@@ -440,7 +483,22 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
     splatLayers: state.splatLayers ?? [],
     microStrokes: state.microStrokes ?? [],
   };
-  const metaBytes = await compressGzip(encoder.encode(JSON.stringify(metaObj)));
+  if (state.settings !== undefined) {
+    metaObj.settings = state.settings;
+  }
+  const metaRaw = encoder.encode(JSON.stringify(metaObj));
+  const projected =
+    EXACT_BASE_DECOMPRESSED_BYTES +
+    metaRaw.byteLength +
+    state.tiles.length * EXACT_TILE_DECOMPRESSED_BYTES;
+  if (
+    projected > MAX_TOTAL_DECOMPRESSED_BYTES ||
+    state.tiles.length + 2 > MAX_ATW_CHUNKS
+  ) {
+    throw new Error('Thế giới quá lớn để lưu thành một tệp .atw.');
+  }
+
+  const metaBytes = await compressGzip(metaRaw);
 
   const baseRaw = new Uint8Array(EXACT_BASE_DECOMPRESSED_BYTES);
   const f32View = new Float32Array(baseRaw.buffer, 0, BASE_N * BASE_N);
@@ -469,6 +527,19 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
     rawChunks.push({ tag: 'TILE', payload: compressedTile });
   }
 
+  const bodyParts: Uint8Array[] = [];
+  for (const ch of rawChunks) {
+    const chHeader = new ArrayBuffer(8);
+    const chView = new DataView(chHeader);
+    for (let i = 0; i < 4; i++) {
+      chView.setUint8(i, ch.tag.charCodeAt(i));
+    }
+    chView.setUint32(4, ch.payload.byteLength, true);
+    bodyParts.push(new Uint8Array(chHeader));
+    bodyParts.push(ch.payload);
+  }
+  const body = concatUint8Arrays(bodyParts);
+
   const header = new ArrayBuffer(16);
   const hView = new DataView(header);
   for (let i = 0; i < 4; i++) {
@@ -477,21 +548,9 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   hView.setUint16(4, ATW_VERSION, true);
   hView.setUint16(6, 1, true);
   hView.setUint32(8, rawChunks.length, true);
-  hView.setUint32(12, 0, true);
+  hView.setUint32(12, crc32(body), true);
 
-  const parts: Uint8Array[] = [new Uint8Array(header)];
-  for (const ch of rawChunks) {
-    const chHeader = new ArrayBuffer(8);
-    const chView = new DataView(chHeader);
-    for (let i = 0; i < 4; i++) {
-      chView.setUint8(i, ch.tag.charCodeAt(i));
-    }
-    chView.setUint32(4, ch.payload.byteLength, true);
-    parts.push(new Uint8Array(chHeader));
-    parts.push(ch.payload);
-  }
-
-  const combined = concatUint8Arrays(parts);
+  const combined = concatUint8Arrays([new Uint8Array(header), body]);
   return new Blob([combined as unknown as BlobPart], { type: 'application/octet-stream' });
 }
 
@@ -530,6 +589,10 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
   if (chunkCount > MAX_ATW_CHUNKS) {
     throw new Error(`Số lượng chunk (${chunkCount}) vượt quá giới hạn an toàn (${MAX_ATW_CHUNKS})`);
   }
+  const expected = dv.getUint32(12, true);
+  if (expected !== 0 && crc32(bytes.subarray(16)) !== expected) {
+    throw new Error('Tệp .atw bị hỏng (CRC không khớp)');
+  }
 
   let offset = 16;
   const decoder = new TextDecoder();
@@ -544,6 +607,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
   let links: Link[] = [];
   let splatLayers: SerializedSplatLayer[] = [];
   let microStrokes: MicroStrokeStamp[] = [];
+  let settings: WorldSaveV3['settings'] = undefined;
   let baseHeight = new Float32Array(BASE_N * BASE_N);
   let baseSplat = new Uint8Array(BASE_N * BASE_N * 4);
   const tiles: WorldSaveV3['tiles'] = [];
@@ -597,6 +661,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
       links = validateLinksV3(meta.links);
       splatLayers = Array.isArray(meta.splatLayers) ? meta.splatLayers : [];
       microStrokes = validateMicroStrokesV3(meta.microStrokes);
+      settings = validateSettingsV3(meta.settings);
     } else if (tag === 'BASE') {
       if (hasBase) {
         throw new Error('Tệp .atw chứa nhiều hơn một chunk BASE');
@@ -693,6 +758,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
     links,
     splatLayers,
     microStrokes,
+    ...(settings ? { settings } : {}),
   };
 }
 
@@ -758,6 +824,11 @@ export function migrateV2ToV3(v2Json: unknown): WorldSaveV3 {
     stamps,
     links: [],
     microStrokes: data.microStrokes,
+    settings: {
+      biomeId: data.biomeId,
+      waterLevel: data.waterLevel,
+      regionTitle: data.regionTitle,
+    },
   };
 }
 

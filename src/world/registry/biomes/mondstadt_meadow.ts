@@ -15,5 +15,6 @@ export const mondstadt_meadow: BiomeConfig = {
   "waterDeepHex": "#0284c7",
   "defaultTexture": "emerald_grass",
   "waterLevel": -25,
-  "reliefScale": 1
+  "reliefScale": 1,
+  "roughness": 0.72
 };

@@ -16,5 +16,6 @@ export const mars_olympus: BiomeConfig = {
   "defaultTexture": "mars_regolith",
   "defaultWeather": "mars_dust_storm",
   "waterLevel": -140,
-  "reliefScale": 1.28
+  "reliefScale": 1.28,
+  "roughness": 1.18
 };

@@ -5,37 +5,44 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "npm run lint && vite build",
-    "start": "tsx server.ts --prod",
+    "build": "npm run lint && vite build && npm run build:server",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --target=node22 --packages=external --sourcemap --outfile=server.js",
+    "start": "node server.js --prod",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && biome lint",
     "test": "npm run lint && npm run test:unit",
-    "test:unit": "tsx --test \"src/**/*.test.ts\""
+    "test:unit": "tsx --test \"src/**/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "clean": "rm -rf dist server.js server.js.map"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
-    "@tailwindcss/vite": "^4.3.3",
-    "@vitejs/plugin-react": "^6.1.1",
     "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "lucide-react": "^0.546.0",
-    "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "three": "^0.186.1",
-    "three-bvh-csg": "^0.0.18",
-    "three-mesh-bvh": "^0.9.17",
-    "vite": "^8.3.0"
+    "express": "^5.1.0",
+    "three": "^0.186.1"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
+    "@biomejs/biome": "^2.6.4",
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/express": "^5.0.0",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.2.7",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
     "tailwindcss": "^4.3.3",
+    "three-bvh-csg": "^0.0.18",
+    "three-mesh-bvh": "^0.9.17",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "zustand": "^5.0.16"
   },
   "engines": {
     "node": ">=22"

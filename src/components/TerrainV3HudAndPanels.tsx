@@ -203,22 +203,37 @@ export const LinkAndStampPopoverV3: React.FC<{
   linkProps: LinkPanelProps;
   stampProps: StampInspectorProps | null;
   onExportAtw: () => void;
-}> = React.memo(({ linkProps, stampProps, onExportAtw }) => {
+  onExportHeightmap16?: () => void;
+}> = React.memo(({ linkProps, stampProps, onExportAtw, onExportHeightmap16 }) => {
   return (
     <div
       data-testid="v3-link-stamp-panel"
       className="pointer-events-auto rounded-lg bg-slate-950/90 border border-slate-700/80 p-3 text-xs text-slate-200 shadow-xl backdrop-blur-md w-72 space-y-2.5"
     >
-      <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
-        <span className="font-semibold text-cyan-300">Kết Nối &amp; Tem Nền SDF (V3)</span>
-        <button
-          type="button"
-          onClick={onExportAtw}
-          className="px-2 py-0.5 rounded bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-400/40 text-emerald-200 text-[10.5px] transition"
-          title="Xuất tệp nhị phân nén .atw (WorldSaveV3)"
-        >
-          Lưu .ATW
-        </button>
+      <div className="flex items-center justify-between border-b border-slate-800 pb-1.5 gap-1">
+        <span className="font-semibold text-cyan-300 truncate">Kết Nối &amp; Tem SDF (V3)</span>
+        <div className="flex items-center gap-1 shrink-0">
+          {onExportHeightmap16 && (
+            <button
+              type="button"
+              data-testid="v3-export-raw16-btn"
+              onClick={onExportHeightmap16}
+              className="px-1.5 py-0.5 rounded bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-400/40 text-indigo-200 text-[10px] transition cursor-pointer"
+              title="Xuất Heightmap 16-bit (.raw + heightmap.json) chuẩn Unity/Unreal"
+            >
+              RAW 16b
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="v3-export-atw-btn"
+            onClick={onExportAtw}
+            className="px-2 py-0.5 rounded bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-400/40 text-emerald-200 text-[10.5px] transition cursor-pointer"
+            title="Xuất tệp nhị phân nén .atw (WorldSaveV3)"
+          >
+            Lưu .ATW
+          </button>
+        </div>
       </div>
 
       {/* Socket Snap & Link Controls */}

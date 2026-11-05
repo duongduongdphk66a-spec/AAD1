@@ -15,5 +15,6 @@ export const inazuma_sakura: BiomeConfig = {
   "waterDeepHex": "#4338ca",
   "defaultTexture": "flower_meadow",
   "waterLevel": -20,
-  "reliefScale": 1.1
+  "reliefScale": 1.1,
+  "roughness": 0.85
 };

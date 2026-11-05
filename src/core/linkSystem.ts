@@ -642,33 +642,117 @@ export class NonDestructiveLinkSystem implements LinkSystem {
     const objA = link ? this.objectsById.get(link.a.objectId) : undefined;
     const objB = link ? this.objectsById.get(link.b.objectId) : undefined;
 
-    const { ADDITION, Brush, Evaluator } = await import('three-bvh-csg');
-
     const boxA = new THREE.BoxGeometry(6, 6, 6);
-    const brushA = new Brush(boxA);
-    if (objA) {
-      brushA.position.set(objA.x, objA.y, objA.z);
-    }
-    brushA.updateMatrixWorld();
+    const matA = new THREE.Matrix4().makeTranslation(
+      objA ? objA.x : 0,
+      objA ? objA.y : 0,
+      objA ? objA.z : 0
+    );
+    const geoA = boxA.clone().applyMatrix4(matA);
 
     const boxB = new THREE.BoxGeometry(6, 6, 6);
-    const brushB = new Brush(boxB);
-    if (objB) {
-      brushB.position.set(objB.x, objB.y, objB.z);
-    } else {
-      brushB.position.set(3, 0, 0);
-    }
-    brushB.updateMatrixWorld();
+    const matB = new THREE.Matrix4().makeTranslation(
+      objB ? objB.x : 3,
+      objB ? objB.y : 0,
+      objB ? objB.z : 0
+    );
+    const geoB = boxB.clone().applyMatrix4(matB);
 
-    const evaluator = new Evaluator();
-    const result = evaluator.evaluate(brushA, brushB, ADDITION);
+    const t0 = performance.now();
+    let outGeo: THREE.BufferGeometry | null = null;
+
+    if (typeof Worker !== 'undefined') {
+      try {
+        outGeo = await new Promise<THREE.BufferGeometry>((resolve, reject) => {
+          const worker = new Worker(new URL('./csgWorker.ts', import.meta.url), {
+            type: 'module',
+          });
+          const timer = setTimeout(() => {
+            worker.terminate();
+            reject(new Error('CSG Worker timeout (15s)'));
+          }, 15_000);
+
+          worker.onmessage = (e) => {
+            clearTimeout(timer);
+            worker.terminate();
+            const data = e.data;
+            if (!data || !data.ok || !data.pos || !data.norm) {
+              reject(new Error(data?.error || 'CSG Worker failed'));
+              return;
+            }
+            const g = new THREE.BufferGeometry();
+            g.setAttribute('position', new THREE.BufferAttribute(data.pos, 3));
+            g.setAttribute('normal', new THREE.BufferAttribute(data.norm, 3));
+            if (data.idx) {
+              g.setIndex(new THREE.BufferAttribute(data.idx, 1));
+            }
+            resolve(g);
+          };
+          worker.onerror = (err) => {
+            clearTimeout(timer);
+            worker.terminate();
+            reject(err);
+          };
+
+          const posA = new Float32Array(
+            (geoA.getAttribute('position') as THREE.BufferAttribute).array as ArrayLike<number>
+          );
+          const normA = new Float32Array(
+            (geoA.getAttribute('normal') as THREE.BufferAttribute).array as ArrayLike<number>
+          );
+          const idxAAttr = geoA.getIndex();
+          const idxA = idxAAttr
+            ? new Uint32Array(idxAAttr.array as ArrayLike<number>)
+            : null;
+
+          const posB = new Float32Array(
+            (geoB.getAttribute('position') as THREE.BufferAttribute).array as ArrayLike<number>
+          );
+          const normB = new Float32Array(
+            (geoB.getAttribute('normal') as THREE.BufferAttribute).array as ArrayLike<number>
+          );
+          const idxBAttr = geoB.getIndex();
+          const idxB = idxBAttr
+            ? new Uint32Array(idxBAttr.array as ArrayLike<number>)
+            : null;
+
+          const transfer: Transferable[] = [
+            posA.buffer,
+            normA.buffer,
+            posB.buffer,
+            normB.buffer,
+          ];
+          if (idxA) transfer.push(idxA.buffer);
+          if (idxB) transfer.push(idxB.buffer);
+
+          worker.postMessage({ posA, normA, idxA, posB, normB, idxB }, transfer);
+        });
+      } catch {
+        outGeo = null;
+      }
+    }
+
+    if (!outGeo) {
+      const { ADDITION, Brush, Evaluator } = await import('three-bvh-csg');
+      const brushA = new Brush(geoA);
+      brushA.updateMatrixWorld();
+      const brushB = new Brush(geoB);
+      brushB.updateMatrixWorld();
+      const evaluator = new Evaluator();
+      const result = evaluator.evaluate(brushA, brushB, ADDITION);
+      outGeo = result.geometry;
+    }
+
+    boxA.dispose();
+    boxB.dispose();
+    console.debug('[csg] union ms', (performance.now() - t0).toFixed(1));
 
     if (link) {
       link.kind = 'merge';
       link.bakedMeshId = `csg_${link.id}`;
     }
 
-    return result.geometry;
+    return outGeo;
   }
 
   dispose(): void {

@@ -175,6 +175,7 @@ function onMsg(msg, reply) {
     if (typeof msg.amplitude === 'number') amplitude = msg.amplitude;
     if (typeof msg.persistence === 'number') persistence = msg.persistence;
     if (typeof msg.maxDetailMeters === 'number') maxDetailMeters = msg.maxDetailMeters;
+    if (typeof msg.biomeRoughness === 'number') biomeRoughness = msg.biomeRoughness;
     if (typeof msg.detailEnabled === 'boolean') detailEnabled = msg.detailEnabled;
     rebuildOctaves();
     return;
@@ -218,6 +219,18 @@ interface WorkerAdapter {
 let sharedWorkerInstance: WorkerAdapter | null = null;
 let sharedWorkerInitializing = false;
 const sharedMessageListeners = new Set<(data: unknown) => void>();
+const sharedErrorListeners = new Set<() => void>();
+
+function handleSharedWorkerFailure(terminate?: () => void): void {
+  try {
+    terminate?.();
+  } catch {
+    /* ignore */
+  }
+  sharedWorkerInstance = null;
+  // Keep sharedWorkerInitializing = true so ensureSharedWorker() stays null and falls back to main thread
+  for (const fn of sharedErrorListeners) fn();
+}
 
 function ensureSharedWorker(): WorkerAdapter | null {
   if (sharedWorkerInstance) return sharedWorkerInstance;
@@ -234,8 +247,10 @@ function ensureSharedWorker(): WorkerAdapter | null {
         for (const fn of sharedMessageListeners) fn(e.data);
       };
       w.onerror = () => {
-        sharedWorkerInstance = null;
-        URL.revokeObjectURL(url);
+        handleSharedWorkerFailure(() => {
+          w.terminate();
+          URL.revokeObjectURL(url);
+        });
       };
       sharedWorkerInstance = {
         postMessage: (msg, transfer) => w.postMessage(msg, transfer ?? []),
@@ -259,7 +274,9 @@ function ensureSharedWorker(): WorkerAdapter | null {
           for (const fn of sharedMessageListeners) fn(data);
         });
         nw.on('error', () => {
-          sharedWorkerInstance = null;
+          handleSharedWorkerFailure(() => {
+            void nw.terminate();
+          });
         });
         // Call unref() AFTER attaching 'message' listener because .on('message') re-refs the port in Node.js
         nw.unref();
@@ -271,7 +288,7 @@ function ensureSharedWorker(): WorkerAdapter | null {
         };
       })
       .catch(() => {
-        sharedWorkerInstance = null;
+        handleSharedWorkerFailure();
       });
   }
 
@@ -285,10 +302,13 @@ export class ComposeWorkerPool {
   private lastBaseMap: Float32Array | null = null;
   private lastDetailParams: DetailParams | null = null;
   private readonly boundListener: (data: unknown) => void;
+  private readonly boundErrorListener: () => void;
 
   constructor() {
     this.boundListener = (data: unknown) => this.handleMessage(data);
+    this.boundErrorListener = () => this.pendingCallbacks.clear();
     sharedMessageListeners.add(this.boundListener);
+    sharedErrorListeners.add(this.boundErrorListener);
     ensureSharedWorker();
   }
 
@@ -329,7 +349,12 @@ export class ComposeWorkerPool {
     return ensureSharedWorker() !== null && !this.disposed;
   }
 
-  syncState(baseMap: Float32Array, params?: DetailParams, detailEnabled = true): void {
+  syncState(
+    baseMap: Float32Array,
+    params?: DetailParams,
+    detailEnabled = true,
+    biomeRoughness = 0.72
+  ): void {
     this.lastBaseMap = baseMap;
     if (params) this.lastDetailParams = params;
     const worker = ensureSharedWorker();
@@ -342,6 +367,7 @@ export class ComposeWorkerPool {
       amplitude: params?.amplitude ?? 0.85,
       persistence: params?.persistence ?? 0.52,
       maxDetailMeters: params?.maxDetailMeters ?? 2.0,
+      biomeRoughness,
       detailEnabled,
     });
   }
@@ -385,6 +411,7 @@ export class ComposeWorkerPool {
     this.disposed = true;
     this.pendingCallbacks.clear();
     sharedMessageListeners.delete(this.boundListener);
+    sharedErrorListeners.delete(this.boundErrorListener);
   }
 }
 
