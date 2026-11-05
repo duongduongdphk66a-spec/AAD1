@@ -33,7 +33,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "esbuild": "^0.28.2",
     "fake-indexeddb": "^6.2.7",
-    "lucide-react": "^0.546.0",
+    "lucide-react": "^1.66.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "tailwindcss": "^4.3.3",
