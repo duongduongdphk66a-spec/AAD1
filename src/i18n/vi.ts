@@ -1,8 +1,20 @@
 export const vi = {
   'toast.undone': 'Đã hoàn tác: "{label}" ({n} bước hoàn tác còn lại).',
+  'toast.redone': 'Đã làm lại: "{label}" ({n} bước làm lại còn lại).',
   'toast.deletedObject': 'Đã xóa vật thể khỏi bản đồ (Có thể nhấn Hoàn Tác để khôi phục).',
   'toast.sdfEnabled': 'Đã bật Viền SDF: Đang hiển thị vùng va chạm SDF trực tiếp của vật thể đang chọn.',
   'toast.sdfDisabled': 'Đã tắt Viền SDF.',
+  'autosave.storageNearlyFull': 'Bộ nhớ trình duyệt gần đầy, hãy xuất .atw để sao lưu.',
+  'autosave.chunkQuotaWarning':
+    'Cảnh báo: Đã sửa {edited}/{max} ô địa hình (>80% trần lưu trữ) — hãy xuất .atw để sao lưu.',
+  'autosave.failed':
+    'Tự động lưu phiên thất bại (lần {count}: {reason}) — Hãy xuất .ATW để tránh mất dữ liệu.',
+  'errorBoundary.defaultLabel': 'Ứng dụng',
+  'errorBoundary.titleSuffix': '{label} gặp lỗi',
+  'errorBoundary.description':
+    'Thao tác gần nhất có thể chưa được lưu. Bạn có thể thử lại, hoặc tải lại trang nếu lỗi lặp lại.',
+  'errorBoundary.retry': 'Thử lại',
+  'errorBoundary.reload': 'Tải lại trang',
   'quality.label': 'Chất lượng',
   'quality.auto': 'Tự động',
   'quality.high': 'Cao',
@@ -11,4 +23,8 @@ export const vi = {
   'touch.sculpt': 'Điêu Khắc',
   'shortcuts.title': 'Danh Sách Phím Tắt',
   'shortcuts.close': 'Đóng (Esc)',
+  'shortcuts.undo': 'Hoàn tác thao tác gần nhất',
+  'shortcuts.redo': 'Làm lại thao tác vừa hoàn tác',
+  'shortcuts.zen': 'Chế độ điện ảnh (Ẩn/hiện thanh Dock)',
+  'shortcuts.help': 'Danh sách phím tắt',
 } as const;

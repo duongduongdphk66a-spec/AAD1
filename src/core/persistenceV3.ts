@@ -44,6 +44,7 @@ export interface WorldSaveV3 {
     min: number;
     scale: number;
     data: Int16Array;
+    version?: number;
   }>;
   objects: PlacedObject[];
   stamps: Stamp[];
@@ -517,8 +518,34 @@ function validateSplatLayersV3(rawLayers: unknown): SerializedSplatLayer[] {
   return out;
 }
 
+interface CachedCompressedTileChunk {
+  level: Level;
+  tx: number;
+  tz: number;
+  kind: TileKind;
+  min: number;
+  scale: number;
+  version: number;
+  compressed: Uint8Array;
+}
+
+const TILE_GZIP_CACHE = new WeakMap<Int16Array, CachedCompressedTileChunk>();
+const EVICTED_TILE_GZIP_CACHE = new Map<string, { crc: number; compressed: Uint8Array }>();
+let lastMetaChunkCache: { crc: number; compressed: Uint8Array } | null = null;
+let lastBaseChunkCache: { crc: number; compressed: Uint8Array } | null = null;
+let lastExportGzipCompressionCount = 0;
+
+/**
+ * Returns how many chunks required fresh `compressGzip` invocations during the most recent
+ * `exportAtw` call (0 for unchanged META + BASE + unchanged tiles).
+ */
+export function getLastExportGzipCompressionCount(): number {
+  return lastExportGzipCompressionCount;
+}
+
 export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   const encoder = new TextEncoder();
+  let gzipCount = 0;
 
   const metaObj: Record<string, unknown> = {
     version: 3,
@@ -545,13 +572,29 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
     throw new Error('Thế giới quá lớn để lưu thành một tệp .atw.');
   }
 
-  const metaBytes = await compressGzip(metaRaw);
+  const metaCrc = crc32(metaRaw);
+  let metaBytes: Uint8Array;
+  if (lastMetaChunkCache && lastMetaChunkCache.crc === metaCrc) {
+    metaBytes = lastMetaChunkCache.compressed;
+  } else {
+    metaBytes = await compressGzip(metaRaw);
+    gzipCount++;
+    lastMetaChunkCache = { crc: metaCrc, compressed: metaBytes };
+  }
 
   const baseRaw = new Uint8Array(EXACT_BASE_DECOMPRESSED_BYTES);
   const f32View = new Float32Array(baseRaw.buffer, 0, BASE_N * BASE_N);
   f32View.set(state.baseHeight.subarray(0, BASE_N * BASE_N));
   baseRaw.set(state.baseSplat.subarray(0, BASE_N * BASE_N * 4), BASE_N * BASE_N * 4);
-  const baseBytes = await compressGzip(baseRaw);
+  const baseCrc = crc32(baseRaw);
+  let baseBytes: Uint8Array;
+  if (lastBaseChunkCache && lastBaseChunkCache.crc === baseCrc) {
+    baseBytes = lastBaseChunkCache.compressed;
+  } else {
+    baseBytes = await compressGzip(baseRaw);
+    gzipCount++;
+    lastBaseChunkCache = { crc: baseCrc, compressed: baseBytes };
+  }
 
   const rawChunks: Array<{ tag: string; payload: Uint8Array }> = [
     { tag: 'META', payload: metaBytes },
@@ -559,6 +602,23 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   ];
 
   for (const t of state.tiles) {
+    const tileVersion = (t as { version?: number }).version;
+    const cached = tileVersion !== undefined ? TILE_GZIP_CACHE.get(t.data) : undefined;
+    if (
+      cached &&
+      tileVersion !== undefined &&
+      cached.version === tileVersion &&
+      cached.level === t.level &&
+      cached.tx === t.tx &&
+      cached.tz === t.tz &&
+      cached.kind === t.kind &&
+      cached.min === t.min &&
+      cached.scale === t.scale
+    ) {
+      rawChunks.push({ tag: 'TILE', payload: cached.compressed });
+      continue;
+    }
+
     const tileRaw = new ArrayBuffer(EXACT_TILE_DECOMPRESSED_BYTES);
     const dv = new DataView(tileRaw);
     dv.setUint8(0, t.level);
@@ -570,9 +630,39 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
     dv.setFloat32(16, t.scale, true);
     const i16 = new Int16Array(tileRaw, 20, TILE * TILE);
     i16.set(t.data.subarray(0, TILE * TILE));
-    const compressedTile = await compressGzip(new Uint8Array(tileRaw));
+    const tileRawU8 = new Uint8Array(tileRaw);
+    const coordKey = `${t.kind}:${t.level}:${t.tx}:${t.tz}`;
+    const tileCrc = crc32(tileRawU8);
+    const evictedHit = EVICTED_TILE_GZIP_CACHE.get(coordKey);
+    let compressedTile: Uint8Array;
+    if (evictedHit && evictedHit.crc === tileCrc) {
+      compressedTile = evictedHit.compressed;
+    } else {
+      compressedTile = await compressGzip(tileRawU8);
+      gzipCount++;
+      if (EVICTED_TILE_GZIP_CACHE.size >= MAX_ATW_CHUNKS) {
+        const oldestKey = EVICTED_TILE_GZIP_CACHE.keys().next().value;
+        if (oldestKey !== undefined) EVICTED_TILE_GZIP_CACHE.delete(oldestKey);
+      }
+      EVICTED_TILE_GZIP_CACHE.set(coordKey, { crc: tileCrc, compressed: compressedTile });
+    }
+
+    if (tileVersion !== undefined) {
+      TILE_GZIP_CACHE.set(t.data, {
+        level: t.level,
+        tx: t.tx,
+        tz: t.tz,
+        kind: t.kind,
+        min: t.min,
+        scale: t.scale,
+        version: tileVersion,
+        compressed: compressedTile,
+      });
+    }
     rawChunks.push({ tag: 'TILE', payload: compressedTile });
   }
+
+  lastExportGzipCompressionCount = gzipCount;
 
   const bodyParts: Uint8Array[] = [];
   for (const ch of rawChunks) {
@@ -919,5 +1009,6 @@ export function extractNonEmptyTilesForSave(tiles: readonly Tile[]): WorldSaveV3
       min: t.min,
       scale: t.scale,
       data: t.data,
+      version: t.version,
     }));
 }

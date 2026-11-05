@@ -81,6 +81,38 @@ interface LevelMruEntry {
   tile: Tile | undefined;
 }
 
+/**
+ * Pure bicubic Catmull-Rom interpolation on the 161x161 base grid (step 62.5 m),
+ * shared between `UnifiedTerrainField` on the main thread and `clipmapComposeWorker`.
+ */
+export function sampleBicubicBaseHeight(bm: Float32Array, x: number, z: number): number {
+  const cx = clamp(x, -HALF, HALF);
+  const cz = clamp(z, -HALF, HALF);
+  const gx = (cx + HALF) / BASE_STEP;
+  const gz = (cz + HALF) / BASE_STEP;
+
+  const ix = Math.floor(gx);
+  const iz = Math.floor(gz);
+  const tx = gx - ix;
+  const tz = gz - iz;
+
+  const c0 = clamp(ix - 1, 0, BASE_N - 1);
+  const c1 = clamp(ix, 0, BASE_N - 1);
+  const c2 = clamp(ix + 1, 0, BASE_N - 1);
+  const c3 = clamp(ix + 2, 0, BASE_N - 1);
+
+  const r0 = clamp(iz - 1, 0, BASE_N - 1) * BASE_N;
+  const r1 = clamp(iz, 0, BASE_N - 1) * BASE_N;
+  const r2 = clamp(iz + 1, 0, BASE_N - 1) * BASE_N;
+  const r3 = clamp(iz + 2, 0, BASE_N - 1) * BASE_N;
+
+  const p0 = catmullRom(bm[r0 + c0], bm[r0 + c1], bm[r0 + c2], bm[r0 + c3], tx);
+  const p1 = catmullRom(bm[r1 + c0], bm[r1 + c1], bm[r1 + c2], bm[r1 + c3], tx);
+  const p2 = catmullRom(bm[r2 + c0], bm[r2 + c1], bm[r2 + c2], bm[r2 + c3], tx);
+  const p3 = catmullRom(bm[r3 + c0], bm[r3 + c1], bm[r3 + c2], bm[r3 + c3], tx);
+  return catmullRom(p0, p1, p2, p3, tz);
+}
+
 export class UnifiedTerrainField implements TerrainField {
   private baseMap: Float32Array;
   private readonly tileStore: TileStore;
@@ -156,32 +188,7 @@ export class UnifiedTerrainField implements TerrainField {
    * Bicubic Catmull-Rom interpolation on the 161x161 base grid (step 62.5 m).
    */
   sampleBaseHeight(x: number, z: number): number {
-    const cx = clamp(x, -HALF, HALF);
-    const cz = clamp(z, -HALF, HALF);
-    const gx = (cx + HALF) / BASE_STEP;
-    const gz = (cz + HALF) / BASE_STEP;
-
-    const ix = Math.floor(gx);
-    const iz = Math.floor(gz);
-    const tx = gx - ix;
-    const tz = gz - iz;
-
-    const c0 = clamp(ix - 1, 0, BASE_N - 1);
-    const c1 = clamp(ix, 0, BASE_N - 1);
-    const c2 = clamp(ix + 1, 0, BASE_N - 1);
-    const c3 = clamp(ix + 2, 0, BASE_N - 1);
-
-    const r0 = clamp(iz - 1, 0, BASE_N - 1) * BASE_N;
-    const r1 = clamp(iz, 0, BASE_N - 1) * BASE_N;
-    const r2 = clamp(iz + 1, 0, BASE_N - 1) * BASE_N;
-    const r3 = clamp(iz + 2, 0, BASE_N - 1) * BASE_N;
-
-    const bm = this.baseMap;
-    const p0 = catmullRom(bm[r0 + c0], bm[r0 + c1], bm[r0 + c2], bm[r0 + c3], tx);
-    const p1 = catmullRom(bm[r1 + c0], bm[r1 + c1], bm[r1 + c2], bm[r1 + c3], tx);
-    const p2 = catmullRom(bm[r2 + c0], bm[r2 + c1], bm[r2 + c2], bm[r2 + c3], tx);
-    const p3 = catmullRom(bm[r3 + c0], bm[r3 + c1], bm[r3 + c2], bm[r3 + c3], tx);
-    return catmullRom(p0, p1, p2, p3, tz);
+    return sampleBicubicBaseHeight(this.baseMap, x, z);
   }
 
   private getTileCached(level: Level, tx: number, tz: number): Tile | undefined {

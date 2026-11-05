@@ -6,14 +6,19 @@ import {
   CSP_HEADER_VALUE,
   checkApiQuota,
   consumeGlobalAiBudget,
+  refundGlobalAiBudget,
   resetAiBudgetForTest,
   resetRateLimitsForTest,
   resolveSafeDistFile,
   safeDecodePathname,
+  sanitizeFrameAncestorOrigin,
   selectContentEncoding,
   serveCompressedOrStatic,
   verifyApiAuth,
 } from '../../server';
+import { selectNextWriteSlot } from '../core/sessionStore';
+import { resolveKeyboardShortcutAction } from '../hooks/useSessionAutosave';
+import { getLocalizedShortcuts } from '../ui/shortcuts';
 
 test('serveCompressedOrStatic blocks sibling path traversal via path.relative, allows valid filenames containing .., catches malformed decodeURIComponent with 400, and respects Accept-Encoding: br;q=0', async () => {
   const distDir = path.resolve('/app/applet/dist');
@@ -114,17 +119,28 @@ test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeho
   assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123', false), true);
   assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123', true), true);
 
-  // CSP includes worker-src 'self' blob: and frame-ancestors for AI Studio preview iframe without wildcard *.run.app
+  // CSP uses strict worker-src 'self' (standard ES Module Worker, no blob: in worker-src) and frame-ancestors without wildcard *.run.app or placeholder MY_APP_URL
   assert.ok(
-    CSP_HEADER_VALUE.includes("worker-src 'self' blob:"),
-    'CSP must permit Blob URL Web Workers via worker-src'
+    CSP_HEADER_VALUE.includes("worker-src 'self'; child-src 'self';") &&
+      !CSP_HEADER_VALUE.includes("worker-src 'self' blob:"),
+    'CSP must restrict worker-src to self without blob: URLs'
   );
   assert.ok(
     CSP_HEADER_VALUE.includes("frame-ancestors 'self' https://aistudio.google.com") &&
       !CSP_HEADER_VALUE.includes('https://*.run.app') &&
+      !CSP_HEADER_VALUE.includes('MY_APP_URL') &&
       CSP_HEADER_VALUE.includes("form-action 'self';"),
-    'CSP must permit framing by AI Studio preview, omit wildcard *.run.app, and restrict form-action to self'
+    'CSP must permit framing by AI Studio preview, omit wildcard *.run.app and placeholder MY_APP_URL, and restrict form-action to self'
   );
+  assert.equal(sanitizeFrameAncestorOrigin('MY_APP_URL'), null);
+  assert.equal(sanitizeFrameAncestorOrigin('https://example.com/some/path'), 'https://example.com');
+  assert.equal(sanitizeFrameAncestorOrigin('javascript:alert(1)'), null);
+
+  // Dismissed session slot pinning across 2nd, 3rd, and Nth autosaves
+  assert.equal(selectNextWriteSlot('a', null), 'b');
+  assert.equal(selectNextWriteSlot('b', null), 'a');
+  assert.equal(selectNextWriteSlot('b', 'a'), 'b', 'When slot a is pinned (dismissed), subsequent autosaves must keep writing to slot b');
+  assert.equal(selectNextWriteSlot('a', 'b'), 'a', 'When slot b is pinned (dismissed), subsequent autosaves must keep writing to slot a');
 
   // Global hourly AI budget + per-IP fairness check
   resetAiBudgetForTest();
@@ -137,8 +153,32 @@ test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeho
   assert.equal(consumeGlobalAiBudget(1000, 200, 500, '10.0.0.9', 2), true);
   assert.equal(consumeGlobalAiBudget(2000, 200, 500, '10.0.0.9', 2), true);
   assert.equal(consumeGlobalAiBudget(3000, 200, 500, '10.0.0.9', 2), false);
+  // Refunding a failed/null Gemini call restores both global and per-IP quota
+  refundGlobalAiBudget('10.0.0.9');
+  assert.equal(consumeGlobalAiBudget(3500, 200, 500, '10.0.0.9', 2), true);
   assert.equal(consumeGlobalAiBudget(3000, 200, 500, '10.0.0.10', 2), true);
   resetAiBudgetForTest();
+
+  // Keyboard shortcut action resolution (Ctrl+Z -> undo, Ctrl+Shift+Z / Ctrl+Y -> redo, input ignored)
+  assert.equal(
+    resolveKeyboardShortcutAction({ key: 'z', ctrlKey: true, metaKey: false, shiftKey: false, activeElementTagName: 'DIV' }),
+    'undo'
+  );
+  assert.equal(
+    resolveKeyboardShortcutAction({ key: 'Z', ctrlKey: true, metaKey: false, shiftKey: true, activeElementTagName: 'DIV' }),
+    'redo'
+  );
+  assert.equal(
+    resolveKeyboardShortcutAction({ key: 'y', ctrlKey: true, metaKey: false, shiftKey: false, activeElementTagName: 'DIV' }),
+    'redo'
+  );
+  assert.equal(
+    resolveKeyboardShortcutAction({ key: 'z', ctrlKey: true, metaKey: false, shiftKey: false, activeElementTagName: 'INPUT' }),
+    null
+  );
+  const localizedShortcuts = getLocalizedShortcuts();
+  assert.ok(localizedShortcuts.some((s) => s.id === 'undo' && s.keys === 'Ctrl+Z'));
+  assert.ok(localizedShortcuts.some((s) => s.id === 'redo' && s.keys.includes('Ctrl+Shift+Z')));
 
   resetRateLimitsForTest();
   // Byte quota check (25 MB per minute ceiling, including post-parse chunked byte adjustment without incrementing request count)
@@ -175,7 +215,10 @@ test('GET /api/<unknown> returns 404 JSON instead of SPA fallback and /healthz s
     const healthRes = await fetch(`${baseUrl}/healthz`);
     assert.equal(healthRes.status, 200);
     const csp = healthRes.headers.get('content-security-policy') || '';
-    assert.ok(csp.includes("worker-src 'self' blob:"), 'CSP header must include worker-src blob:');
+    assert.ok(
+      csp.includes("worker-src 'self'; child-src 'self';") && !csp.includes("worker-src 'self' blob:"),
+      'CSP header must restrict worker-src to self'
+    );
 
     const unknownApiRes = await fetch(`${baseUrl}/api/does-not-exist`);
     assert.equal(unknownApiRes.status, 404, 'Unknown /api/* route must return HTTP 404');

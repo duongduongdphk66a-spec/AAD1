@@ -30,6 +30,33 @@ app.disable('x-powered-by');
 
 export const CSP_SCRIPT_SRC = isProd ? "'self'" : "'self' 'unsafe-inline'";
 export const CSP_CONNECT_SRC = isProd ? "'self'" : "'self' ws: wss:";
+
+/**
+ * Validates that an environment URL intended for CSP `frame-ancestors` is a real HTTP(S) origin
+ * and not a placeholder (such as `MY_APP_URL`).
+ */
+export function sanitizeFrameAncestorOrigin(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    trimmed === 'MY_APP_URL' ||
+    trimmed === 'MY_SHARED_APP_URL' ||
+    (!trimmed.startsWith('https://') && !trimmed.startsWith('http://'))
+  ) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
 export const CSP_FRAME_ANCESTORS =
   process.env.CSP_FRAME_ANCESTORS ||
   [
@@ -37,14 +64,14 @@ export const CSP_FRAME_ANCESTORS =
     'https://aistudio.google.com',
     'https://*.google.com',
     'https://*.googleusercontent.com',
-    process.env.APP_URL,
-    process.env.SHARED_APP_URL,
+    sanitizeFrameAncestorOrigin(process.env.APP_URL),
+    sanitizeFrameAncestorOrigin(process.env.SHARED_APP_URL),
   ]
     .filter(Boolean)
     .join(' ');
 
 export const CSP_HEADER_VALUE =
-  `default-src 'self'; script-src ${CSP_SCRIPT_SRC}; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src ${CSP_CONNECT_SRC}; object-src 'none'; base-uri 'self'; frame-ancestors ${CSP_FRAME_ANCESTORS}; form-action 'self';`;
+  `default-src 'self'; script-src ${CSP_SCRIPT_SRC}; worker-src 'self'; child-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src ${CSP_CONNECT_SRC}; object-src 'none'; base-uri 'self'; frame-ancestors ${CSP_FRAME_ANCESTORS}; form-action 'self';`;
 
 // Security headers (CSP, X-Content-Type-Options, Referrer-Policy)
 app.use((_req, res, next) => {
@@ -151,6 +178,21 @@ export function consumeGlobalAiBudget(
     resetAt: dayExpired ? now + AI_DAILY_WINDOW_MS : aiDayWindow.resetAt,
   };
   return true;
+}
+
+export function refundGlobalAiBudget(clientIp?: string): void {
+  if (aiHourWindow.count > 0) {
+    aiHourWindow.count -= 1;
+  }
+  if (aiDayWindow.count > 0) {
+    aiDayWindow.count -= 1;
+  }
+  if (clientIp) {
+    const ipEntry = aiIpHourWindow.get(clientIp);
+    if (ipEntry && ipEntry.count > 0) {
+      ipEntry.count -= 1;
+    }
+  }
 }
 
 export function resetAiBudgetForTest(): void {
@@ -461,14 +503,17 @@ app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
     if (hit && Date.now() - hit.at < AI_CACHE_TTL_MS) {
       aiCache.delete(key);
       aiCache.set(key, hit);
+      res.setHeader('X-AI-Source', 'gemini-vision');
       res.json({ source: 'gemini-vision', analysis: hit.value, cached: true });
       return;
     }
 
+    let consumedBudgetForRequest = false;
     let job = aiInflight.get(key);
     if (!job) {
       const ai = getGeminiClient();
       if (!ai) {
+        res.setHeader('X-AI-Source', 'pixel-engine');
         res.json({
           source: 'pixel-engine',
           warning: 'Khóa GEMINI_API_KEY chưa được cấu hình — sử dụng bộ phân tích Pixel Depth cục bộ.',
@@ -478,6 +523,7 @@ app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
       }
 
       if (!consumeGlobalAiBudget(Date.now(), AI_MAX_CALLS_PER_HOUR, GEMINI_DAILY_BUDGET, clientIp)) {
+        res.setHeader('X-AI-Source', 'pixel-engine');
         res.json({
           source: 'pixel-engine',
           warning: 'Đã đạt giới hạn gọi AI trong giờ/ngày — sử dụng bộ phân tích Pixel Depth cục bộ.',
@@ -485,6 +531,7 @@ app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
         });
         return;
       }
+      consumedBudgetForRequest = true;
 
       const biomeIds = Object.keys(BIOMES);
       const prefabLines = PREFAB_CATALOG.map((p) => `   - '${p.id}' (${p.name})`).join('\n');
@@ -502,109 +549,137 @@ Hãy phân tích địa hình, độ cao (tối đa 1000m), mặt nước, thả
 ${prefabLines}`;
 
       job = (async () => {
-        const response = await ai.models.generateContent({
-          model: GEMINI_MODEL,
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: resolvedMime,
-                  data: cleanBase64,
-                },
-              },
-              { text: promptText },
-            ],
-          },
-          config: {
-            abortSignal: AbortSignal.timeout(20_000),
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                regionName: {
-                  type: Type.STRING,
-                  description: 'Tên vùng đất bằng tiếng Việt',
-                },
-                biome: {
-                  type: Type.STRING,
-                  enum: biomeIds,
-                  description: 'Quần xã / hành tinh phù hợp nhất từ registry',
-                },
-                dominantTexture: {
-                  type: Type.STRING,
-                  enum: TEXTURE_INDEX_MAP,
-                  description: 'Kết cấu bề mặt chủ đạo từ registry',
-                },
-                summary: {
-                  type: Type.STRING,
-                  description: 'Mô tả ngắn gọn (1-2 câu) cách tái tạo địa hình và vật thể từ bức ảnh.',
-                },
-                reliefScale: {
-                  type: Type.NUMBER,
-                  description: 'Hệ số độ cao địa hình từ 0.6 đến 2.2',
-                },
-                waterLevel: {
-                  type: Type.NUMBER,
-                  description: 'Mực nước tính bằng mét từ -120 đến 80',
-                },
-                terraceSteps: {
-                  type: Type.INTEGER,
-                  description: 'Số bậc thang địa hình (0 nếu mượt, 4-8 nếu có ruộng bậc thang/vách đá)',
-                },
-                detectedObjects: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      prefabId: {
-                        type: Type.STRING,
-                        enum: PREFAB_CATALOG.map((p) => p.id),
-                      },
-                      label: { type: Type.STRING },
-                      x: { type: Type.NUMBER, description: 'Tọa độ X từ -48 đến 48 mét' },
-                      z: { type: Type.NUMBER, description: 'Tọa độ Z từ -48 đến 48 mét' },
-                      scale: { type: Type.NUMBER },
-                      rotationY: { type: Type.NUMBER },
-                    },
-                    required: ['prefabId', 'label', 'x', 'z', 'scale', 'rotationY'],
+        try {
+          const response = await ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: resolvedMime,
+                    data: cleanBase64,
                   },
                 },
-              },
-              required: [
-                'regionName',
-                'biome',
-                'dominantTexture',
-                'summary',
-                'reliefScale',
-                'waterLevel',
-                'terraceSteps',
-                'detectedObjects',
+                { text: promptText },
               ],
             },
-          },
-        });
-        const rawText = response.text;
-        return sanitizeAnalysis(rawText ? JSON.parse(rawText.trim()) : null);
+            config: {
+              abortSignal: AbortSignal.timeout(20_000),
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  regionName: {
+                    type: Type.STRING,
+                    description: 'Tên vùng đất bằng tiếng Việt',
+                  },
+                  biome: {
+                    type: Type.STRING,
+                    enum: biomeIds,
+                    description: 'Quần xã / hành tinh phù hợp nhất từ registry',
+                  },
+                  dominantTexture: {
+                    type: Type.STRING,
+                    enum: TEXTURE_INDEX_MAP,
+                    description: 'Kết cấu bề mặt chủ đạo từ registry',
+                  },
+                  summary: {
+                    type: Type.STRING,
+                    description: 'Mô tả ngắn gọn (1-2 câu) cách tái tạo địa hình và vật thể từ bức ảnh.',
+                  },
+                  reliefScale: {
+                    type: Type.NUMBER,
+                    description: 'Hệ số độ cao địa hình từ 0.6 đến 2.2',
+                  },
+                  waterLevel: {
+                    type: Type.NUMBER,
+                    description: 'Mực nước tính bằng mét từ -120 đến 80',
+                  },
+                  terraceSteps: {
+                    type: Type.INTEGER,
+                    description: 'Số bậc thang địa hình (0 nếu mượt, 4-8 nếu có ruộng bậc thang/vách đá)',
+                  },
+                  detectedObjects: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        prefabId: {
+                          type: Type.STRING,
+                          enum: PREFAB_CATALOG.map((p) => p.id),
+                        },
+                        label: { type: Type.STRING },
+                        x: { type: Type.NUMBER, description: 'Tọa độ X từ -48 đến 48 mét' },
+                        z: { type: Type.NUMBER, description: 'Tọa độ Z từ -48 đến 48 mét' },
+                        scale: { type: Type.NUMBER },
+                        rotationY: { type: Type.NUMBER },
+                      },
+                      required: ['prefabId', 'label', 'x', 'z', 'scale', 'rotationY'],
+                    },
+                  },
+                },
+                required: [
+                  'regionName',
+                  'biome',
+                  'dominantTexture',
+                  'summary',
+                  'reliefScale',
+                  'waterLevel',
+                  'terraceSteps',
+                  'detectedObjects',
+                ],
+              },
+            },
+          });
+          const rawText = response.text;
+          const sanitized = sanitizeAnalysis(rawText ? JSON.parse(rawText.trim()) : null);
+          if (!sanitized && consumedBudgetForRequest) {
+            refundGlobalAiBudget(clientIp);
+            consumedBudgetForRequest = false;
+          }
+          return sanitized;
+        } catch (err) {
+          if (consumedBudgetForRequest) {
+            refundGlobalAiBudget(clientIp);
+            consumedBudgetForRequest = false;
+          }
+          throw err;
+        }
       })().finally(() => aiInflight.delete(key));
       aiInflight.set(key, job);
     }
 
     const analysis = await job;
-    if (analysis) {
-      if (aiCache.size >= AI_CACHE_MAX) {
-        const oldestKey = aiCache.keys().next().value;
-        if (oldestKey) aiCache.delete(oldestKey);
-      }
-      aiCache.set(key, { at: Date.now(), value: analysis });
+    if (!analysis) {
+      res.setHeader('X-AI-Source', 'pixel-engine');
+      res.status(200).json({
+        source: 'pixel-engine',
+        warning: 'Phân tích AI không trả về dữ liệu hợp lệ — đã tự động chuyển sang bộ tái tạo Pixel Depth cục bộ.',
+        analysis: null,
+      });
+      return;
     }
+
+    if (aiCache.size >= AI_CACHE_MAX) {
+      const oldestKey = aiCache.keys().next().value;
+      if (oldestKey) aiCache.delete(oldestKey);
+    }
+    aiCache.set(key, { at: Date.now(), value: analysis });
+    res.setHeader('X-AI-Source', 'gemini-vision');
     res.json({
       source: 'gemini-vision',
       analysis,
     });
   } catch (err: unknown) {
-    console.error('[server] /api/reconstruct error:', err instanceof Error ? err.message : err);
-    res.status(200).json({
-      source: 'pixel-engine-fallback',
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('[server] /api/reconstruct error:', errMsg);
+    const isTransientUnavailable =
+      /timeout|timed out|abort|503|429|overloaded|unavailable/i.test(errMsg);
+    const statusCode = isTransientUnavailable ? 503 : 502;
+    res.setHeader('X-AI-Source', 'pixel-engine');
+    res.status(statusCode).json({
+      source: 'pixel-engine',
+      error: 'Dịch vụ phân tích AI tạm thời gián đoạn — đã giữ kết quả tái tạo Pixel Depth cục bộ.',
       warning: 'Dịch vụ phân tích AI tạm thời không phản hồi — đã tự động chuyển sang bộ tái tạo Pixel Depth cục bộ.',
       analysis: null,
     });
@@ -760,12 +835,21 @@ export function serveCompressedOrStatic(distPath: string) {
           return;
         }
         pending = (async () => {
+          const [preBr, preGz] = await Promise.all([
+            fs.promises.readFile(`${resolvedFile}.br`).catch(() => null),
+            fs.promises.readFile(`${resolvedFile}.gz`).catch(() => null),
+          ]);
+          if (preBr && preGz) {
+            return { br: preBr, gzip: preGz, mime };
+          }
           const rawBuf = await fs.promises.readFile(resolvedFile);
           const [br, gzip] = await Promise.all([
-            brotliCompressAsync(rawBuf, {
-              params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
-            }),
-            gzipAsync(rawBuf, { level: 6 }),
+            preBr
+              ? Promise.resolve(preBr)
+              : brotliCompressAsync(rawBuf, {
+                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+                }),
+            preGz ? Promise.resolve(preGz) : gzipAsync(rawBuf, { level: 6 }),
           ]);
           return { br, gzip, mime };
         })();

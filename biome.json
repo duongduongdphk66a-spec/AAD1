@@ -7,14 +7,14 @@
     "rules": {
       "preset": "none",
       "correctness": {
-        "useExhaustiveDependencies": "warn",
+        "useExhaustiveDependencies": "error",
         "useHookAtTopLevel": "error",
-        "noUnusedVariables": "warn",
-        "noUnusedImports": "warn"
+        "noUnusedVariables": "error",
+        "noUnusedImports": "error"
       },
       "suspicious": {
-        "noExplicitAny": "warn",
-        "noDoubleEquals": "warn",
+        "noExplicitAny": "error",
+        "noDoubleEquals": "error",
         "noDebugger": "error"
       }
     }

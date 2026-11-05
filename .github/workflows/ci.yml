@@ -26,10 +26,10 @@ jobs:
         run: npm run lint
 
       - name: Run unit & security tests
-        run: npm test
+        run: npm run test:unit
 
       - name: Build production bundle
-        run: npm run build
+        run: npx vite build && npm run build:server
 
   docker-smoke:
     needs: verify

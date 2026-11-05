@@ -453,7 +453,9 @@ export function createTerrainV3Engine(
       const l0Count = tileStore.countTilesAtLevel(0, 'height');
       const l0SpanKm = tileSpan(0) / 1000;
       const fineAreaKm2 = l0Count * l0SpanKm * l0SpanKm;
-      const residentMB = 1.4 + tStats.bytes / (1024 * 1024);
+      const totalEngineBytes =
+        (tStats.bytesTotal ?? tStats.bytes) + brushEngine.historyBytes();
+      const residentMB = 1.4 + totalEngineBytes / (1024 * 1024);
 
       return {
         addressableSamples: ADDRESSABLE_SAMPLES_L0,

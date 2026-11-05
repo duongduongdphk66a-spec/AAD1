@@ -60,6 +60,7 @@ export interface BrushEngine {
   canUndo(): boolean;
   canRedo(): boolean;
   historyDepth(): number;
+  historyBytes(): number;
   estimateCost(radiusMeters: number): BrushCostEstimate;
 }
 
@@ -84,8 +85,8 @@ interface StrokeRecord {
   byteSize: number;
 }
 
-const MAX_UNDO_STROKES = 64;
-const MAX_UNDO_BYTES = 128 * 1024 * 1024; // 128 MB
+const MAX_UNDO_STROKES = 48;
+const MAX_UNDO_BYTES = 32 * 1024 * 1024; // 32 MB bounded undo budget
 
 /**
  * Pure formula from Section 8:
@@ -482,6 +483,14 @@ export class MultiResBrushEngine implements BrushEngine {
 
   historyDepth(): number {
     return this.undoStack.length;
+  }
+
+  historyBytes(): number {
+    let redoBytes = 0;
+    for (const r of this.redoStack) {
+      redoBytes += r.byteSize;
+    }
+    return this.totalUndoBytes + redoBytes;
   }
 
   undo(): Rect | null {

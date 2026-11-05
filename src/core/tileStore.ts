@@ -46,6 +46,7 @@ export interface TilePersistence {
   ): void;
   listKeys(worldId: string, kind: TileKind): Promise<TileKey[]>;
   clear(worldId: string): Promise<void>;
+  persistedBytes?(worldId?: string): number;
 }
 
 export interface TileStoreStats {
@@ -55,6 +56,8 @@ export interface TileStoreStats {
   resident: number;
   edited: number;
   bytesResident: number;
+  bytesPersisted: number;
+  bytesTotal: number;
   bytesEdited: number;
   fineEditTilesL0: number;
   maxResidentTiles: number;
@@ -72,6 +75,7 @@ export interface TileStore {
   entries(): Tile[];
   clear(): void;
   ensure(kind: TileKind, key: TileKey, create?: boolean): Promise<Tile | undefined>;
+  hydrateFromPersistence?(): Promise<number>;
   read(kind: TileKind, level: number, ix: number, iz: number): number;
   write(kind: TileKind, level: number, ix: number, iz: number, v: number): void;
   markTileDirty(tile: Tile): void;
@@ -85,7 +89,96 @@ export interface TileStore {
 const QUANT_OFFSET = 32768;
 const QUANT_STEPS = 65535;
 const BYTES_PER_TILE = TILE * TILE * 2; // 131,072 bytes (128 KB)
+const SERIALIZED_TILE_BYTES = 8 + BYTES_PER_TILE; // 131,080 bytes
 const DEFAULT_MAX_RESIDENT_TILES = 512; // 512 * 128 KB = 64 MB
+const RLE_MAGIC = 0x454c5254; // 'TRLE' little-endian
+
+/**
+ * Losslessly compresses a 131,080-byte serialized tile (`min`, `scale`, and `65,536` Int16 samples)
+ * using 16-bit Run-Length Encoding so sparse or smooth tiles in RAM persistence consume a fraction
+ * of 128 KB while supporting microsecond synchronous page-in (`loadSync`).
+ */
+export function packTileBytesRle(rawBytes: Uint8Array): Uint8Array {
+  if (rawBytes.byteLength !== SERIALIZED_TILE_BYTES) {
+    return new Uint8Array(rawBytes);
+  }
+  const view = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+  const min = view.getFloat32(0, true);
+  const scale = view.getFloat32(4, true);
+  const samples =
+    (rawBytes.byteOffset + 8) % 2 === 0
+      ? new Int16Array(rawBytes.buffer, rawBytes.byteOffset + 8, TILE * TILE)
+      : new Int16Array(rawBytes.slice(8, SERIALIZED_TILE_BYTES).buffer);
+
+  // First pass: count runs; if runs >= (TILE * TILE) / 2, raw representation is smaller or equal
+  const totalSamples = TILE * TILE;
+  const maxProfitableRuns = (totalSamples >> 1) - 4;
+  let runCount = 0;
+  let idx = 0;
+  while (idx < totalSamples) {
+    const val = samples[idx];
+    let len = 1;
+    while (idx + len < totalSamples && samples[idx + len] === val && len < 65535) {
+      len++;
+    }
+    runCount++;
+    if (runCount > maxProfitableRuns) {
+      return new Uint8Array(rawBytes);
+    }
+    idx += len;
+  }
+
+  const outBuf = new ArrayBuffer(12 + runCount * 4);
+  const outView = new DataView(outBuf);
+  outView.setUint32(0, RLE_MAGIC, true);
+  outView.setFloat32(4, min, true);
+  outView.setFloat32(8, scale, true);
+
+  let writeOffset = 12;
+  idx = 0;
+  while (idx < totalSamples) {
+    const val = samples[idx];
+    let len = 1;
+    while (idx + len < totalSamples && samples[idx + len] === val && len < 65535) {
+      len++;
+    }
+    outView.setUint16(writeOffset, len, true);
+    outView.setInt16(writeOffset + 2, val, true);
+    writeOffset += 4;
+    idx += len;
+  }
+  return new Uint8Array(outBuf);
+}
+
+export function unpackTileBytesRle(packedBytes: Uint8Array): Uint8Array {
+  if (packedBytes.byteLength === SERIALIZED_TILE_BYTES) {
+    return packedBytes;
+  }
+  if (packedBytes.byteLength < 12) {
+    return packedBytes;
+  }
+  const inView = new DataView(packedBytes.buffer, packedBytes.byteOffset, packedBytes.byteLength);
+  if (inView.getUint32(0, true) !== RLE_MAGIC) {
+    return packedBytes;
+  }
+
+  const outBuf = new ArrayBuffer(SERIALIZED_TILE_BYTES);
+  const outView = new DataView(outBuf);
+  outView.setFloat32(0, inView.getFloat32(4, true), true);
+  outView.setFloat32(4, inView.getFloat32(8, true), true);
+  const outSamples = new Int16Array(outBuf, 8, TILE * TILE);
+
+  const totalSamples = TILE * TILE;
+  let sampleIdx = 0;
+  for (let offset = 12; offset + 4 <= packedBytes.byteLength && sampleIdx < totalSamples; offset += 4) {
+    const runLen = inView.getUint16(offset, true);
+    const val = inView.getInt16(offset + 2, true);
+    const end = Math.min(totalSamples, sampleIdx + runLen);
+    outSamples.fill(val, sampleIdx, end);
+    sampleIdx = end;
+  }
+  return new Uint8Array(outBuf);
+}
 
 export function dequantizeSample(rawInt16: number, min: number, scale: number): number {
   if (scale === 0) return min;
@@ -219,6 +312,7 @@ export function deserializeTileFromBytes(
 
 export class InMemoryTilePersistence implements TilePersistence {
   private store = new Map<string, Uint8Array>();
+  private totalStoredBytes = 0;
 
   private makeKey(worldId: string, kind: TileKind, key: TileKey): string {
     const normKind = kind === 'edit' ? 'height' : kind;
@@ -232,7 +326,7 @@ export class InMemoryTilePersistence implements TilePersistence {
       // Refresh LRU insertion order
       this.store.delete(mapKey);
       this.store.set(mapKey, found);
-      return found;
+      return unpackTileBytesRle(found);
     }
     return null;
   }
@@ -247,22 +341,29 @@ export class InMemoryTilePersistence implements TilePersistence {
   ): void {
     for (const entry of entries) {
       const mapKey = this.makeKey(worldId, entry.kind, entry.key);
-      this.store.delete(mapKey);
-      this.store.set(mapKey, entry.bytes);
-    }
-  }
-
-  trimToMaxEntries(maxEntries: number): void {
-    if (maxEntries < 0) return;
-    while (this.store.size > maxEntries) {
-      const oldestKey = this.store.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.store.delete(oldestKey);
+      const prev = this.store.get(mapKey);
+      if (prev) {
+        this.totalStoredBytes -= prev.byteLength;
+        this.store.delete(mapKey);
+      }
+      const packed = packTileBytesRle(entry.bytes);
+      this.store.set(mapKey, packed);
+      this.totalStoredBytes += packed.byteLength;
     }
   }
 
   cachedEntryCount(): number {
     return this.store.size;
+  }
+
+  persistedBytes(worldId?: string): number {
+    if (!worldId) return this.totalStoredBytes;
+    const prefix = `${worldId}:`;
+    let sum = 0;
+    for (const [k, v] of this.store.entries()) {
+      if (k.startsWith(prefix)) sum += v.byteLength;
+    }
+    return sum;
   }
 
   async saveBatch(
@@ -277,7 +378,12 @@ export class InMemoryTilePersistence implements TilePersistence {
     entries: { kind: TileKind; key: TileKey }[]
   ): void {
     for (const entry of entries) {
-      this.store.delete(this.makeKey(worldId, entry.kind, entry.key));
+      const mapKey = this.makeKey(worldId, entry.kind, entry.key);
+      const prev = this.store.get(mapKey);
+      if (prev) {
+        this.totalStoredBytes -= prev.byteLength;
+        this.store.delete(mapKey);
+      }
     }
   }
 
@@ -302,30 +408,31 @@ export class InMemoryTilePersistence implements TilePersistence {
 
   async clear(worldId: string): Promise<void> {
     const prefix = `${worldId}:`;
-    for (const k of Array.from(this.store.keys())) {
+    for (const [k, v] of Array.from(this.store.entries())) {
       if (k.startsWith(prefix)) {
+        this.totalStoredBytes -= v.byteLength;
         this.store.delete(k);
       }
     }
   }
 }
 
-const DEFAULT_IDB_SYNC_CACHE_TILES = 64; // 64 * 128 KB = 8 MB bounded sync read cache
-
 export class IndexedDbTilePersistence implements TilePersistence {
   private fallback = new InMemoryTilePersistence();
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   public hasIndexedDbError = false;
   private dbName: string;
-  private maxSyncCacheTiles: number;
 
-  constructor(dbName = 'aetherterra_v3_tiles', maxSyncCacheTiles = DEFAULT_IDB_SYNC_CACHE_TILES) {
+  constructor(dbName = 'aetherterra_v3_tiles') {
     this.dbName = dbName;
-    this.maxSyncCacheTiles = Math.max(0, maxSyncCacheTiles);
   }
 
   cachedSyncCount(): number {
     return this.fallback.cachedEntryCount();
+  }
+
+  persistedBytes(worldId?: string): number {
+    return this.fallback.persistedBytes(worldId);
   }
 
   private getDb(): Promise<IDBDatabase | null> {
@@ -375,14 +482,14 @@ export class IndexedDbTilePersistence implements TilePersistence {
         req.onsuccess = () => {
           const res = req.result;
           if (res instanceof Uint8Array) {
-            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: res }]);
-            this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
-            resolve(res);
+            const unpacked = unpackTileBytesRle(res);
+            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: unpacked }]);
+            resolve(unpacked);
           } else if (ArrayBuffer.isView(res)) {
             const view = new Uint8Array(res.buffer, res.byteOffset, res.byteLength);
-            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: view }]);
-            this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
-            resolve(view);
+            const unpacked = unpackTileBytesRle(view);
+            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: unpacked }]);
+            resolve(unpacked);
           } else {
             resolve(null);
           }
@@ -419,7 +526,7 @@ export class IndexedDbTilePersistence implements TilePersistence {
           const store = tx.objectStore('tiles');
           for (const item of slice) {
             const normKind = item.kind === 'edit' ? 'height' : item.kind;
-            store.put(item.bytes, `${worldId}:${normKind}:${item.key}`);
+            store.put(packTileBytesRle(item.bytes), `${worldId}:${normKind}:${item.key}`);
           }
           tx.oncomplete = () => resolve();
           tx.onerror = tx.onabort = () => {
@@ -431,10 +538,6 @@ export class IndexedDbTilePersistence implements TilePersistence {
           reject(err instanceof Error ? err : new Error(String(err)));
         }
       });
-    }
-    // Once persisted to IndexedDB, bound the in-memory sync cache so RAM never grows unboundedly
-    if (!this.hasIndexedDbError) {
-      this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
     }
   }
 
@@ -814,6 +917,37 @@ export class SparseTileStore implements TileStore {
     return undefined;
   }
 
+  /**
+   * Preloads all persisted keys from `this.persistence` (such as `IndexedDbTilePersistence` after a page reload)
+   * into the store's synchronous RLE backing cache and `persistedEditKeys`/`persistedSplatKeys` sets so
+   * synchronous `read()` / `getByKey()` calls never miss persisted tiles.
+   */
+  async hydrateFromPersistence(): Promise<number> {
+    const [editKeys, splatKeys] = await Promise.all([
+      this.persistence.listKeys(this.worldId, 'height'),
+      this.persistence.listKeys(this.worldId, 'splat'),
+    ]);
+    let hydrated = 0;
+    for (const key of editKeys) {
+      const bytes = await this.persistence.load(this.worldId, 'height', key);
+      if (bytes) {
+        this.persistedEditKeys.add(key);
+        hydrated++;
+      }
+    }
+    for (const key of splatKeys) {
+      const bytes = await this.persistence.load(this.worldId, 'splat', key);
+      if (bytes) {
+        this.persistedSplatKeys.add(key);
+        hydrated++;
+      }
+    }
+    if (hydrated > 0) {
+      this.invalidateStatsCache();
+    }
+    return hydrated;
+  }
+
   read(kind: TileKind, level: number, ix: number, iz: number): number {
     if (level < 0 || level > MAX_LEVEL || ix < 0 || iz < 0) return 0;
     const tx = ix >>> 8;
@@ -965,15 +1099,19 @@ export class SparseTileStore implements TileStore {
       if (t.dirty) dirty++;
     }
     const bytesResident = resident * BYTES_PER_TILE;
+    const bytesPersisted = this.persistence.persistedBytes?.(this.worldId) ?? 0;
+    const bytesTotal = bytesResident + bytesPersisted;
     const bytesEdited = edited * BYTES_PER_TILE;
 
     this.cachedStats = {
       tiles: resident,
-      bytes: bytesResident,
+      bytes: bytesTotal,
       dirty,
       resident,
       edited,
       bytesResident,
+      bytesPersisted,
+      bytesTotal,
       bytesEdited,
       fineEditTilesL0,
       maxResidentTiles: this.maxResidentTiles,

@@ -5,6 +5,7 @@ import {
   Compass,
   CheckCircle2,
   Undo2,
+  Redo2,
   Moon,
   Sun,
   Eye,
@@ -84,7 +85,8 @@ import {
 import { downloadBlob } from './world/worldIoUtils';
 import { selectionStore, useSelection } from './state/selectionStore';
 import { QualityMode } from './core/adaptiveQuality';
-import { SHORTCUTS } from './ui/shortcuts';
+import { getLocalizedShortcuts } from './ui/shortcuts';
+import { t } from './i18n';
 import {
   BrushLevelBadgeV3,
   LinkAndStampPopoverV3,
@@ -116,7 +118,10 @@ const MAX_UNDO_STEPS = 25;
 
 export default function App() {
   // Initial 10x10 km world starts as a Flat Earth Plane ("Mặt Phẳng Đất Nguyên Bản") with 1:1 real-scale village
-  const initialWorldRef = useRef(generateFlatEarthTerrain('mondstadt_meadow'));
+  const initialWorldRef = useRef<ReturnType<typeof generateFlatEarthTerrain> | null>(null);
+  if (!initialWorldRef.current) {
+    initialWorldRef.current = generateFlatEarthTerrain('mondstadt_meadow');
+  }
 
   const heightMapRef = useRef<Float32Array>(initialWorldRef.current.heightMap);
   const splatMapRef = useRef<Uint8Array>(initialWorldRef.current.splatMap);
@@ -129,7 +134,7 @@ export default function App() {
 
   // Placed 3D Objects (Houses, Mountains, Trees, Landmarks at 1:1 Real-World Scale)
   const [placedObjects, setPlacedObjects] = useState<PlacedObject[]>(
-    initialWorldRef.current.initialObjects
+    () => initialWorldRef.current!.initialObjects
   );
 
   // 3D Physical Surface Ecosystem Patches (3-5cm real grass blades, 3D flowers, desert sand dunes, smoking lava)
@@ -137,15 +142,16 @@ export default function App() {
     generateInitialSurfaceShowcaseStrokes()
   );
 
-  const didInitSelectionRef = useRef(false);
-  if (!didInitSelectionRef.current) {
-    didInitSelectionRef.current = true;
-    selectionStore.getState().selectObject(
-      initialWorldRef.current.initialObjects.find((o) => o.prefabId === 'windmill_cottage')?.id ??
-        initialWorldRef.current.initialObjects[0]?.id ??
-        null
-    );
-  }
+  useEffect(() => {
+    const initialObjects = initialWorldRef.current?.initialObjects ?? [];
+    if (selectionStore.getState().selectedObjectId === null && initialObjects.length > 0) {
+      selectionStore.getState().selectObject(
+        initialObjects.find((o) => o.prefabId === 'windmill_cottage')?.id ??
+          initialObjects[0]?.id ??
+          null
+      );
+    }
+  }, []);
 
   const selectedObjectId = useSelection((s) => s.selectedObjectId);
   const sculptTool = useSelection((s) => s.sculptTool);
@@ -158,8 +164,9 @@ export default function App() {
     selectionStore.getState().selectObject(id);
   }, []);
 
-  // Undo History Stack (up to 25 steps)
+  // Undo & Redo History Stacks (up to 25 steps)
   const [undoStack, setUndoStack] = useState<WorldHistorySnapshot[]>([]);
+  const [redoStack, setRedoStack] = useState<WorldHistorySnapshot[]>([]);
   const lastStrokeSnapshotTimeRef = useRef<number>(0);
 
   // Unified Bottom Dock State (calibrated for 10x10 km / 161x161 grid (62.5m/cell) / min 1m brush / 1:1 scale)
@@ -264,6 +271,7 @@ export default function App() {
     waterLevel,
     regionTitle,
     undoStack,
+    redoStack,
     autoJunctionBlend,
     starlightMode,
   });
@@ -282,6 +290,7 @@ export default function App() {
     waterLevel,
     regionTitle,
     undoStack,
+    redoStack,
     autoJunctionBlend,
     starlightMode,
   };
@@ -303,10 +312,9 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [statusBanner]);
 
-  // Push current state onto Undo Stack before mutating world state
-  const pushUndoSnapshot = useCallback((actionLabel: string) => {
+  const captureCurrentSnapshot = useCallback((actionLabel: string): WorldHistorySnapshot => {
     const cur = latestStateRef.current;
-    const snapshot: WorldHistorySnapshot = {
+    return {
       actionLabel,
       heightMap: new Float32Array(heightMapRef.current),
       splatMap: new Uint8Array(splatMapRef.current),
@@ -319,8 +327,50 @@ export default function App() {
       regionTitle: cur.regionTitle,
       brushDepth: v3EngineRef.current?.brushEngine.historyDepth() ?? 0,
     };
-    setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), snapshot]);
   }, []);
+
+  // Push current state onto Undo Stack before mutating world state, and clear Redo Stack
+  const pushUndoSnapshot = useCallback(
+    (actionLabel: string) => {
+      const snapshot = captureCurrentSnapshot(actionLabel);
+      setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), snapshot]);
+      latestStateRef.current.redoStack = [];
+      setRedoStack([]);
+    },
+    [captureCurrentSnapshot]
+  );
+
+  const applyHistorySnapshot = useCallback(
+    (snapshot: WorldHistorySnapshot, direction: 'undo' | 'redo') => {
+      heightMapRef.current = new Float32Array(snapshot.heightMap);
+      splatMapRef.current = new Uint8Array(snapshot.splatMap);
+      colorMapRef.current = new Float32Array(snapshot.colorMap);
+      commitPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
+      setMicroStrokes(snapshot.microStrokes.map((m) => ({ ...m })));
+      setSelectedObjectId(snapshot.selectedObjectId);
+      setBiomeId(snapshot.biomeId);
+      setWaterLevel(snapshot.waterLevel);
+      setRegionTitle(snapshot.regionTitle);
+      dirtyRectRef.current = null;
+      const eng = v3EngineRef.current;
+      if (eng) {
+        if (direction === 'undo') {
+          while (eng.brushEngine.historyDepth() > snapshot.brushDepth && eng.brushEngine.canUndo()) {
+            eng.brushEngine.undo();
+          }
+        } else {
+          while (eng.brushEngine.historyDepth() < snapshot.brushDepth && eng.brushEngine.canRedo()) {
+            eng.brushEngine.redo();
+          }
+        }
+        eng.detailGen.setBiome(snapshot.biomeId);
+        eng.terrainField.setBaseHeightMap(heightMapRef.current);
+        eng.syncPlacedObjects(snapshot.placedObjects, latestStateRef.current.autoJunctionBlend);
+      }
+      setTerrainVersion((v) => v + 1);
+    },
+    [commitPlacedObjects, setSelectedObjectId]
+  );
 
   // Undo last action (pure state updates outside updater function for React StrictMode safety)
   const handleUndo = useCallback(() => {
@@ -328,32 +378,27 @@ export default function App() {
     if (stack.length === 0) return;
     const snapshot = stack[stack.length - 1];
     const remainingCount = stack.length - 1;
+    const redoSnap = captureCurrentSnapshot(snapshot.actionLabel);
 
     setUndoStack((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
-    heightMapRef.current = new Float32Array(snapshot.heightMap);
-    splatMapRef.current = new Uint8Array(snapshot.splatMap);
-    colorMapRef.current = new Float32Array(snapshot.colorMap);
-    commitPlacedObjects(snapshot.placedObjects.map((o) => ({ ...o })));
-    setMicroStrokes(snapshot.microStrokes.map((m) => ({ ...m })));
-    setSelectedObjectId(snapshot.selectedObjectId);
-    setBiomeId(snapshot.biomeId);
-    setWaterLevel(snapshot.waterLevel);
-    setRegionTitle(snapshot.regionTitle);
-    dirtyRectRef.current = null;
-    const eng = v3EngineRef.current;
-    if (eng) {
-      while (eng.brushEngine.historyDepth() > snapshot.brushDepth && eng.brushEngine.canUndo()) {
-        eng.brushEngine.undo();
-      }
-      eng.detailGen.setBiome(snapshot.biomeId);
-      eng.terrainField.setBaseHeightMap(heightMapRef.current);
-      eng.syncPlacedObjects(snapshot.placedObjects, latestStateRef.current.autoJunctionBlend);
-    }
-    setTerrainVersion((v) => v + 1);
-    showToast(
-      `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
-    );
-  }, [commitPlacedObjects, showToast, setSelectedObjectId]);
+    setRedoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), redoSnap]);
+    applyHistorySnapshot(snapshot, 'undo');
+    showToast(t('toast.undone', { label: snapshot.actionLabel, n: remainingCount }));
+  }, [applyHistorySnapshot, captureCurrentSnapshot, showToast]);
+
+  // Redo last undone action (Ctrl+Shift+Z / Ctrl+Y)
+  const handleRedo = useCallback(() => {
+    const stack = latestStateRef.current.redoStack;
+    if (stack.length === 0) return;
+    const redoSnapshot = stack[stack.length - 1];
+    const remainingCount = stack.length - 1;
+    const undoSnap = captureCurrentSnapshot(redoSnapshot.actionLabel);
+
+    setRedoStack((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
+    setUndoStack((prev) => [...prev.slice(-(MAX_UNDO_STEPS - 1)), undoSnap]);
+    applyHistorySnapshot(redoSnapshot, 'redo');
+    showToast(t('toast.redone', { label: redoSnapshot.actionLabel, n: remainingCount }));
+  }, [applyHistorySnapshot, captureCurrentSnapshot, showToast]);
 
   // Keep V3 StampIndex and LinkSystem synchronized with placedObjects & autoJunctionBlend
   useEffect(() => {
@@ -369,6 +414,7 @@ export default function App() {
     setDirtyTileCount,
     pendingSession,
     setPendingSession,
+    dismissPendingSession,
     setAutosaveEnabled,
     handleForceSyncTerrain,
   } = useSessionAutosaveAndShortcuts({
@@ -381,6 +427,7 @@ export default function App() {
     microStrokes,
     showToast,
     onUndo: handleUndo,
+    onRedo: handleRedo,
     setIsDockCollapsed,
     setIsShortcutsModalOpen,
   });
@@ -1501,9 +1548,8 @@ export default function App() {
   }, [applyAtwBlob, pendingSession, setAutosaveEnabled, setPendingSession, showToast]);
 
   const handleDismissSessionRestore = useCallback(() => {
-    setPendingSession(null);
-    setAutosaveEnabled(true);
-  }, [setAutosaveEnabled, setPendingSession]);
+    dismissPendingSession();
+  }, [dismissPendingSession]);
 
   const handleImportWorldJson = useCallback(
     (file: File) => {
@@ -1749,6 +1795,8 @@ export default function App() {
 
   const canUndo = undoStack.length > 0;
   const lastUndoLabel = undoStack[undoStack.length - 1]?.actionLabel;
+  const canRedo = redoStack.length > 0;
+  const lastRedoLabel = redoStack[redoStack.length - 1]?.actionLabel;
 
   return (
     <main className="relative w-screen h-screen overflow-hidden bg-[#0f1722] select-none">
@@ -2099,6 +2147,26 @@ export default function App() {
           >
             <Undo2 className="w-3.5 h-3.5" />
             <span>Hoàn Tác {undoStack.length > 0 ? `(${undoStack.length})` : ''}</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="top-redo-button"
+            onClick={handleRedo}
+            disabled={!canRedo}
+            title={
+              canRedo
+                ? `Làm lại: ${lastRedoLabel || ''} (Ctrl+Shift+Z / Ctrl+Y)`
+                : 'Chưa có thao tác nào để làm lại (Ctrl+Shift+Z / Ctrl+Y)'
+            }
+            className={`px-2.5 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1 shadow-lg transition-colors whitespace-nowrap ${
+              canRedo
+                ? 'bg-cyan-600 hover:bg-cyan-500 border-cyan-400 text-white cursor-pointer'
+                : 'bg-[#111927]/95 border-slate-700/90 text-slate-500 cursor-not-allowed'
+            }`}
+          >
+            <Redo2 className="w-3.5 h-3.5" />
+            <span>Làm Lại {redoStack.length > 0 ? `(${redoStack.length})` : ''}</span>
           </button>
 
           <div className="hidden md:flex items-center gap-0.5 p-0.5 rounded-xl bg-[#111927]/95 border border-slate-700/90 shadow-lg">
@@ -2506,18 +2574,18 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-bold text-amber-300">Danh Sách Phím Tắt</h2>
+              <h2 className="text-sm font-bold text-amber-300">{t('shortcuts.title')}</h2>
               <button
                 type="button"
                 data-testid="close-shortcuts-dialog-btn"
                 onClick={() => setIsShortcutsModalOpen(false)}
                 className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 cursor-pointer"
               >
-                Đóng (Esc)
+                {t('shortcuts.close')}
               </button>
             </div>
             <ul className="space-y-2 text-xs">
-              {SHORTCUTS.map((s) => (
+              {getLocalizedShortcuts().map((s) => (
                 <li
                   key={s.id}
                   className="flex items-center justify-between rounded-lg bg-slate-900/80 px-3 py-2 border border-slate-800"

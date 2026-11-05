@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "npm run lint && vite build && npm run build:server",
+    "build": "vite build && npm run build:server",
     "build:server": "esbuild server.ts --bundle --platform=node --format=esm --target=node22 --packages=external --sourcemap --outfile=server.js",
     "start": "node server.js --prod",
     "preview": "vite preview",
-    "lint": "tsc --noEmit && biome lint",
+    "lint": "tsc --noEmit && biome lint --error-on-warnings",
     "test": "npm run lint && npm run test:unit",
     "test:unit": "tsx --test \"src/**/*.test.ts\"",
     "test:e2e": "playwright test",

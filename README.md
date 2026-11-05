@@ -40,6 +40,40 @@ npm test
 # Chạy benchmark hiệu năng v3 (Link 800 vật thể, Clipmap, Cọ 1m/10m/100m)
 npx tsx bench/terrainV3Bench.ts
 
-# Đóng gói bản phân phối Production
+# Đóng gói bản phân phối Production (Client + Server + nén Gzip/Brotli tĩnh)
 npm run build
+
+# Chạy máy chủ Production trên cổng 3000
+npm start
 ```
+
+---
+
+## 3. Biến Môi Trường, AI Vision & Triển Khai Production
+
+Sao chép `.env.example` sang `.env` (hoặc cấu hình biến môi trường trên hạ tầng Cloud Run / Docker / Kubernetes):
+
+| Biến môi trường | Mặc định | Mô tả |
+|---|---|---|
+| `GEMINI_API_KEY` | *(rỗng)* | Khóa API Gemini cho tính năng phân tích địa hình từ ảnh (`POST /api/reconstruct`). Khi để trống hoặc khi `analysis` là `null`, API trả về `source: 'pixel-engine'` để trình duyệt dùng bộ giải tích Pixel Depth & Mahalanobis cục bộ. Khi dịch vụ Gemini gặp lỗi thượng nguồn hoặc quá thời gian chờ, API trả về mã HTTP `502`/`503` và hoàn lại hạn ngạch. |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | Tên model Gemini sử dụng cho phân tích thị giác. |
+| `VITE_TERRAIN_V3` | `true` | Bật kiến trúc địa hình v3 (10-level Geometry Clipmap + Sparse Tile Pyramid RLE + SDF Stamp & Link). |
+| `AI_MAX_CALLS_PER_HOUR` | `200` | Trần số lượt gọi Gemini toàn cục mỗi giờ (các lượt gọi lỗi tự động được hoàn lại hạn ngạch). |
+| `AI_MAX_CALLS_PER_IP_HOUR` | `40` | Trần số lượt gọi Gemini tối đa cho mỗi IP trong 1 giờ để chống một IP chiếm trọn hạn ngạch chung. |
+| `GEMINI_DAILY_BUDGET` | `500` | Trần ngân sách số lượt gọi Gemini toàn cục mỗi ngày (24h). |
+| `TRUST_PROXY_HOPS` | `0` | Số tầng reverse proxy tin cậy để đọc `X-Forwarded-For`. Không gán cứng trong `Dockerfile`; đặt `TRUST_PROXY_HOPS=1` qua biến môi trường khi chạy sau 1 tầng Cloud Run / Nginx / Cloudflare. |
+| `CSP_FRAME_ANCESTORS` | `'self' https://aistudio.google.com ...` | Danh sách nguồn được phép nhúng ứng dụng qua `iframe` trong header `Content-Security-Policy`. Đặt `CSP_FRAME_ANCESTORS="'self'"` khi tự host độc lập. |
+| `API_AUTH_TOKEN` | *(rỗng)* | Khóa xác thực Bearer / `X-API-Key` tùy chọn cho `/api/reconstruct` (so sánh hằng thời gian qua `crypto.timingSafeEqual`). |
+| `REQUIRE_API_TOKEN` | `false` | Đặt `true` để bắt buộc mọi yêu cầu tới `/api/reconstruct` phải gửi `API_AUTH_TOKEN` hợp lệ. |
+
+### Đóng gói & chạy bằng Docker
+
+```bash
+docker build --build-arg VITE_TERRAIN_V3=true -t aetherterra:latest .
+docker run -d -p 3000:3000 \
+  -e GEMINI_API_KEY="your_key" \
+  -e TRUST_PROXY_HOPS=1 \
+  -e CSP_FRAME_ANCESTORS="'self'" \
+  aetherterra:latest
+```
+

@@ -9,6 +9,9 @@ import { PrefabId } from './registry';
 export class ProceduralPrefabFactory {
   private contactShadowMat: THREE.MeshBasicMaterial;
   private isSoftwareGl: boolean;
+  private prototypeCache = new Map<PrefabId, THREE.Group>();
+  private materialPool = new Map<string, THREE.Material>();
+  private sharedGeometries = new Set<THREE.BufferGeometry>();
 
   constructor(contactShadowTexture: THREE.Texture, isSoftwareGl: boolean) {
     this.isSoftwareGl = isSoftwareGl;
@@ -26,8 +29,95 @@ export class ProceduralPrefabFactory {
   }
 
   public dispose(): void {
+    this.prototypeCache.clear();
+    for (const geo of this.sharedGeometries) {
+      geo.userData.shared = false;
+      geo.dispose();
+    }
+    this.sharedGeometries.clear();
+    for (const mat of this.materialPool.values()) {
+      mat.userData.shared = false;
+      mat.dispose();
+    }
+    this.materialPool.clear();
     this.contactShadowMat.userData.shared = false;
     this.contactShadowMat.dispose();
+  }
+
+  private getPooledMaterial(mat: THREE.Material): THREE.Material {
+    if (mat === this.contactShadowMat || mat.userData?.shared) {
+      mat.userData = { ...mat.userData, shared: true };
+      return mat;
+    }
+    const std = mat as THREE.MeshStandardMaterial & THREE.MeshBasicMaterial;
+    if (
+      !std.map &&
+      !std.alphaMap &&
+      !std.bumpMap &&
+      !std.normalMap &&
+      !std.roughnessMap &&
+      !std.emissiveMap &&
+      Object.keys(mat.userData || {}).length === 0
+    ) {
+      const colorHex = std.color ? std.color.getHexString() : 'none';
+      const emissiveHex = std.emissive ? std.emissive.getHexString() : 'none';
+      const key = [
+        mat.type,
+        colorHex,
+        std.roughness ?? '',
+        std.metalness ?? '',
+        std.flatShading ? '1' : '0',
+        mat.side,
+        mat.transparent ? '1' : '0',
+        mat.opacity,
+        mat.depthWrite ? '1' : '0',
+        emissiveHex,
+        std.emissiveIntensity ?? '',
+      ].join('|');
+      const existing = this.materialPool.get(key);
+      if (existing) {
+        mat.dispose();
+        return existing;
+      }
+      mat.userData = { ...mat.userData, shared: true };
+      this.materialPool.set(key, mat);
+      return mat;
+    }
+    mat.userData = { ...mat.userData, shared: true };
+    this.materialPool.set(`unique_${this.materialPool.size}_${mat.uuid}`, mat);
+    return mat;
+  }
+
+  private cloneUserData(data: Record<string, unknown> | undefined): Record<string, unknown> {
+    if (!data) return {};
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (v && typeof v === 'object' && !Array.isArray(v) && !(v as THREE.Object3D).isObject3D) {
+        out[k] = { ...(v as Record<string, unknown>) };
+      } else if (Array.isArray(v)) {
+        out[k] = [...v];
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  private clonePrefabNode<T extends THREE.Object3D>(source: T): T {
+    const cloned = source.clone(false) as T;
+    cloned.userData = this.cloneUserData(source.userData);
+    const mesh = cloned as unknown as THREE.Mesh;
+    const srcMesh = source as unknown as THREE.Mesh;
+    if (srcMesh.isMesh) {
+      mesh.geometry = srcMesh.geometry;
+      mesh.material = srcMesh.material;
+      mesh.castShadow = srcMesh.castShadow;
+      mesh.receiveShadow = srcMesh.receiveShadow;
+    }
+    for (const child of source.children) {
+      cloned.add(this.clonePrefabNode(child));
+    }
+    return cloned;
   }
 
   private addContactShadow(group: THREE.Group, radius: number): void {
@@ -40,14 +130,30 @@ export class ProceduralPrefabFactory {
   }
 
   public createPrefab(prefabId: PrefabId): THREE.Group {
-    const group = this.createPrefabInternal(prefabId);
-    group.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh && child.name !== 'contact_shadow') {
-        child.castShadow = true;
-        child.receiveShadow = true;
-      }
-    });
-    return group;
+    let prototype = this.prototypeCache.get(prefabId);
+    if (!prototype) {
+      prototype = this.createPrefabInternal(prefabId);
+      prototype.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (mesh.isMesh) {
+          if (mesh.name !== 'contact_shadow') {
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+          }
+          if (mesh.geometry) {
+            mesh.geometry.userData = { ...mesh.geometry.userData, shared: true };
+            this.sharedGeometries.add(mesh.geometry);
+          }
+          if (Array.isArray(mesh.material)) {
+            mesh.material = mesh.material.map((m) => this.getPooledMaterial(m));
+          } else if (mesh.material) {
+            mesh.material = this.getPooledMaterial(mesh.material);
+          }
+        }
+      });
+      this.prototypeCache.set(prefabId, prototype);
+    }
+    return this.clonePrefabNode(prototype);
   }
 
   private createPrefabInternal(prefabId: PrefabId): THREE.Group {

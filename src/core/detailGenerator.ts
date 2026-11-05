@@ -1,5 +1,27 @@
 import { MAX_LEVEL, deterministicGradientNoise2D, spacing } from './units';
-import { BIOMES, BiomeId } from '../world/registry';
+
+const BIOME_ROUGHNESS_MAP: Readonly<Record<string, number>> = {
+  mondstadt_meadow: 0.72,
+  inazuma_sakura: 0.85,
+  liyue_amber: 1.15,
+  paldea_coast: 0.65,
+  snowpeak_glacier: 1.25,
+  celestia_sky_isles: 1.2,
+  natlan_volcano_abyss: 1.35,
+  mars_olympus: 1.18,
+  venus_ishtar: 1.12,
+  kepler_crystalline: 1.28,
+  trappist_tidally_locked: 1.2,
+  pluto_cryovolcano: 0.92,
+  titan_methane_sea: 0.78,
+  europa_chaos_ridge: 1.08,
+  corot_lava_ocean: 1.38,
+  himalaya_alps_andes: 1.45,
+  sahara_atacama_gobi: 0.55,
+  hawaii_shield_volcano: 1.22,
+  amazon_congo_rainforest: 0.68,
+  boreal_taiga_forest: 0.82,
+};
 
 export interface DetailParams {
   seed: number;
@@ -13,6 +35,7 @@ export interface DetailGenerator {
   configure(p: Partial<DetailParams>): void;
   getParams(): DetailParams;
   setBiome(biomeId: string): void;
+  setBiomeRoughness?(roughness: number): void;
   getBiomeRoughness(): number;
   setEnabled(enabled: boolean): void;
   isEnabled(): boolean;
@@ -36,7 +59,7 @@ export class DeterministicDetailGenerator implements DetailGenerator {
     maxDetailMeters: 2.0,
   };
   private biomeId = 'mondstadt_meadow';
-  private biomeRoughness = BIOMES.mondstadt_meadow.roughness;
+  private biomeRoughness = BIOME_ROUGHNESS_MAP.mondstadt_meadow;
   private enabled = true;
 
   private octaveTableByLevel: Array<
@@ -71,11 +94,17 @@ export class DeterministicDetailGenerator implements DetailGenerator {
 
   setBiome(biomeId: string): void {
     this.biomeId = biomeId;
-    this.biomeRoughness =
-      Object.hasOwn(BIOMES, biomeId)
-        ? BIOMES[biomeId as BiomeId].roughness
-        : 0.85;
+    this.biomeRoughness = Object.hasOwn(BIOME_ROUGHNESS_MAP, biomeId)
+      ? BIOME_ROUGHNESS_MAP[biomeId]
+      : 0.85;
     this.rebuildOctaveTable();
+  }
+
+  setBiomeRoughness(roughness: number): void {
+    if (Number.isFinite(roughness) && roughness >= 0) {
+      this.biomeRoughness = roughness;
+      this.rebuildOctaveTable();
+    }
   }
 
   getBiomeRoughness(): number {

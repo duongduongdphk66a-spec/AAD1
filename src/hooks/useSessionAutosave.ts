@@ -9,11 +9,13 @@ import {
   loadNewestSession,
   nextOppositeSlot,
   putSession,
+  selectNextWriteSlot,
 } from '../core/sessionStore';
 import {
   TerrainSaveStatus,
   TerrainV3EngineBundle,
 } from '../core/terrainV3Controller';
+import { t } from '../i18n';
 import { BiomeId, MicroStrokeStamp, PlacedObject } from '../world/registry';
 
 export interface SessionAutosaveWorldState {
@@ -22,6 +24,54 @@ export interface SessionAutosaveWorldState {
   biomeId: BiomeId;
   waterLevel: number;
   regionTitle: string;
+}
+
+export type ShortcutKeyAction = 'escape' | 'undo' | 'redo' | 'zen' | 'help' | null;
+
+/**
+ * Pure keyboard shortcut classifier:
+ * - Ctrl/Cmd+Z (without Shift) -> 'undo'
+ * - Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y -> 'redo'
+ * - Escape -> 'escape'
+ * - H (when not focused in an input/textarea/select) -> 'zen'
+ * - ? (when not focused in an input/textarea/select) -> 'help'
+ */
+export function resolveKeyboardShortcutAction(event: {
+  key: string;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  altKey?: boolean;
+  shiftKey?: boolean;
+  activeElementTagName?: string | null;
+}): ShortcutKeyAction {
+  if (event.key === 'Escape') {
+    return 'escape';
+  }
+  const tag = event.activeElementTagName ? event.activeElementTagName.toUpperCase() : '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+    return null;
+  }
+  const mod = Boolean(event.ctrlKey || event.metaKey);
+  if (mod && !event.altKey) {
+    const lower = event.key.toLowerCase();
+    if (lower === 'z') {
+      return event.shiftKey ? 'redo' : 'undo';
+    }
+    if (lower === 'y' && !event.shiftKey) {
+      return 'redo';
+    }
+    return null;
+  }
+  if (mod || event.altKey) {
+    return null;
+  }
+  if (event.key === 'h' || event.key === 'H') {
+    return 'zen';
+  }
+  if (event.key === '?') {
+    return 'help';
+  }
+  return null;
 }
 
 export function useSessionAutosaveAndShortcuts(options: {
@@ -34,6 +84,7 @@ export function useSessionAutosaveAndShortcuts(options: {
   microStrokes: MicroStrokeStamp[];
   showToast: (msg: string) => void;
   onUndo: () => void;
+  onRedo?: () => void;
   setIsDockCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
   setIsShortcutsModalOpen: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
@@ -47,6 +98,7 @@ export function useSessionAutosaveAndShortcuts(options: {
     microStrokes,
     showToast,
     onUndo,
+    onRedo,
     setIsDockCollapsed,
     setIsShortcutsModalOpen,
   } = options;
@@ -57,16 +109,24 @@ export function useSessionAutosaveAndShortcuts(options: {
   const [autosaveEnabled, setAutosaveEnabled] = useState<boolean>(false);
   const scheduleSessionAutosaveRef = useRef<(() => void) | null>(null);
   const nextSessionSlotRef = useRef<'a' | 'b'>('a');
+  const pinnedDismissedSlotRef = useRef<'a' | 'b' | null>(null);
+  const sessionSaveErrorRef = useRef<boolean>(false);
+  const warnedStorageQuotaRef = useRef<boolean>(false);
+  const warnedChunkCeilingRef = useRef<boolean>(false);
 
-  // Subscribe to V3 tileStore dirty status & autosave lifecycle
+  // Subscribe to V3 tileStore dirty status & autosave lifecycle without letting tileStore 'saved' mask an active session autosave error
   useEffect(() => {
     const engine = v3EngineRef.current;
     if (!engine) return;
-    setSaveStatus(engine.getSaveStatus());
+    setSaveStatus(sessionSaveErrorRef.current ? 'error' : engine.getSaveStatus());
     setDirtyTileCount(engine.tileStore.stats().dirty);
     return engine.onSaveStatusChange((nextStatus, nextDirtyCount) => {
-      setSaveStatus(nextStatus);
       setDirtyTileCount(nextDirtyCount);
+      if (sessionSaveErrorRef.current && nextStatus === 'saved') {
+        setSaveStatus('error');
+      } else {
+        setSaveStatus(nextStatus);
+      }
     });
   }, [v3EngineRef]);
 
@@ -100,7 +160,16 @@ export function useSessionAutosaveAndShortcuts(options: {
     };
   }, []);
 
-  // 5-second debounced session autosave into alternating 'a' / 'b' IndexedDB slots
+  const dismissPendingSession = useCallback(() => {
+    if (pendingSession?.slot) {
+      pinnedDismissedSlotRef.current = pendingSession.slot;
+      nextSessionSlotRef.current = nextOppositeSlot(pendingSession.slot);
+    }
+    setPendingSession(null);
+    setAutosaveEnabled(true);
+  }, [pendingSession]);
+
+  // 5-second debounced session autosave into alternating 'a' / 'b' IndexedDB slots with in-flight guard
   useEffect(() => {
     const eng = v3EngineRef.current;
     if (!eng || !autosaveEnabled) {
@@ -109,22 +178,39 @@ export function useSessionAutosaveAndShortcuts(options: {
     }
     let timer = 0;
     let dirty = false;
+    let inFlight = false;
     let consecutiveErrors = 0;
 
     const flush = async () => {
-      if (!dirty) return;
+      if (!dirty || inFlight) return;
+      inFlight = true;
       dirty = false;
       try {
         const q = await checkStorageQuotaWarning();
         if (q.warning80Pct) {
-          showToast('Bộ nhớ trình duyệt gần đầy, hãy xuất .atw để sao lưu.');
+          if (!warnedStorageQuotaRef.current) {
+            warnedStorageQuotaRef.current = true;
+            showToast(t('autosave.storageNearlyFull'));
+          }
+        } else {
+          warnedStorageQuotaRef.current = false;
         }
+
         const tStats = eng.tileStore.stats();
         if (tStats.edited >= ATW_CHUNK_WARNING_THRESHOLD) {
-          showToast(
-            `Cảnh báo: Đã sửa ${tStats.edited}/${MAX_ATW_CHUNKS - 2} ô địa hình (>80% trần lưu trữ) — hãy xuất .atw để sao lưu.`
-          );
+          if (!warnedChunkCeilingRef.current) {
+            warnedChunkCeilingRef.current = true;
+            showToast(
+              t('autosave.chunkQuotaWarning', {
+                edited: tStats.edited,
+                max: MAX_ATW_CHUNKS - 2,
+              })
+            );
+          }
+        } else {
+          warnedChunkCeilingRef.current = false;
         }
+
         const cur = latestStateRef.current;
         const blob = await eng.exportWorldSaveV3(cur.placedObjects, {
           microStrokes: cur.microStrokes,
@@ -134,23 +220,33 @@ export function useSessionAutosaveAndShortcuts(options: {
             regionTitle: cur.regionTitle,
           },
         });
-        const targetSlot = nextSessionSlotRef.current;
+        const targetSlot = pinnedDismissedSlotRef.current
+          ? nextOppositeSlot(pinnedDismissedSlotRef.current)
+          : nextSessionSlotRef.current;
         await putSession(targetSlot, {
           savedAt: Date.now(),
           title: cur.regionTitle,
           bytes: await blob.arrayBuffer(),
           slot: targetSlot,
         });
-        nextSessionSlotRef.current = nextOppositeSlot(targetSlot);
+        nextSessionSlotRef.current = selectNextWriteSlot(
+          targetSlot,
+          pinnedDismissedSlotRef.current
+        );
         consecutiveErrors = 0;
+        sessionSaveErrorRef.current = false;
         setSaveStatus(eng.getSaveStatus());
       } catch (err) {
         dirty = true;
         consecutiveErrors += 1;
+        sessionSaveErrorRef.current = true;
         setSaveStatus('error');
-        const reason = err instanceof Error ? err.message : 'Lỗi không xác định';
+        const reason = err instanceof Error ? err.message : 'Unknown error';
         showToast(
-          `Tự động lưu phiên thất bại (lần ${consecutiveErrors}: ${reason}) — Hãy xuất .ATW để tránh mất dữ liệu.`
+          t('autosave.failed', {
+            count: consecutiveErrors,
+            reason,
+          })
         );
         if (consecutiveErrors <= 3) {
           window.clearTimeout(timer);
@@ -158,11 +254,20 @@ export function useSessionAutosaveAndShortcuts(options: {
             void flush();
           }, 5000 * consecutiveErrors);
         }
+      } finally {
+        inFlight = false;
+        if (dirty && consecutiveErrors === 0) {
+          window.clearTimeout(timer);
+          timer = window.setTimeout(() => {
+            void flush();
+          }, 5000);
+        }
       }
     };
 
     const schedule = () => {
       dirty = true;
+      if (inFlight) return;
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void flush();
@@ -171,30 +276,57 @@ export function useSessionAutosaveAndShortcuts(options: {
 
     scheduleSessionAutosaveRef.current = schedule;
     const off = eng.terrainField.on('changed', schedule);
-    const onHide = () => {
+    const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         void flush();
       }
     };
-    document.addEventListener('visibilitychange', onHide);
+    const onPageHide = () => {
+      void flush();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', onPageHide);
 
     return () => {
       scheduleSessionAutosaveRef.current = null;
       off();
       window.clearTimeout(timer);
-      document.removeEventListener('visibilitychange', onHide);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', onPageHide);
     };
   }, [autosaveEnabled, latestStateRef, showToast, v3EngineRef]);
 
   // Schedule session autosave when React world state changes
   const isInitialMountRef = useRef(true);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: schedule debounced autosave whenever world state props change
+  const lastWorldStateSnapshotRef = useRef({
+    placedObjects,
+    biomeId,
+    waterLevel,
+    regionTitle,
+    microStrokes,
+  });
   useEffect(() => {
+    const prev = lastWorldStateSnapshotRef.current;
+    lastWorldStateSnapshotRef.current = {
+      placedObjects,
+      biomeId,
+      waterLevel,
+      regionTitle,
+      microStrokes,
+    };
     if (isInitialMountRef.current) {
       isInitialMountRef.current = false;
       return;
     }
-    scheduleSessionAutosaveRef.current?.();
+    if (
+      prev.placedObjects !== placedObjects ||
+      prev.biomeId !== biomeId ||
+      prev.waterLevel !== waterLevel ||
+      prev.regionTitle !== regionTitle ||
+      prev.microStrokes !== microStrokes
+    ) {
+      scheduleSessionAutosaveRef.current?.();
+    }
   }, [placedObjects, biomeId, waterLevel, regionTitle, microStrokes]);
 
   const handleForceSyncTerrain = useCallback(() => {
@@ -216,34 +348,32 @@ export function useSessionAutosaveAndShortcuts(options: {
   // Keyboard shortcuts driven by single source of truth (SHORTCUTS in src/ui/shortcuts.ts)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      const action = resolveKeyboardShortcutAction({
+        key: e.key,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        altKey: e.altKey,
+        shiftKey: e.shiftKey,
+        activeElementTagName: document.activeElement?.tagName ?? null,
+      });
+      if (action === 'escape') {
         setIsShortcutsModalOpen(false);
-        return;
-      }
-      if (
-        document.activeElement &&
-        ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)
-      ) {
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
+      } else if (action === 'undo') {
         e.preventDefault();
         onUndo();
-        return;
-      }
-      if (e.ctrlKey || e.metaKey || e.altKey) {
-        return;
-      }
-      if (e.key === 'h' || e.key === 'H') {
+      } else if (action === 'redo') {
+        e.preventDefault();
+        onRedo?.();
+      } else if (action === 'zen') {
         setIsDockCollapsed((prev) => !prev);
-      } else if (e.key === '?') {
+      } else if (action === 'help') {
         e.preventDefault();
         setIsShortcutsModalOpen((prev) => !prev);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onUndo, setIsDockCollapsed, setIsShortcutsModalOpen]);
+  }, [onUndo, onRedo, setIsDockCollapsed, setIsShortcutsModalOpen]);
 
   return {
     saveStatus,
@@ -252,6 +382,7 @@ export function useSessionAutosaveAndShortcuts(options: {
     setDirtyTileCount,
     pendingSession,
     setPendingSession,
+    dismissPendingSession,
     autosaveEnabled,
     setAutosaveEnabled,
     handleForceSyncTerrain,

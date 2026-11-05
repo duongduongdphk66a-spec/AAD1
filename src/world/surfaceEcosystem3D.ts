@@ -944,7 +944,7 @@ function disposeMaterialWithTextures(mat: THREE.Material): void {
 export function disposeObject3DTree(root: THREE.Object3D): void {
   root.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
-    if (mesh.geometry) {
+    if (mesh.geometry && !mesh.geometry.userData?.shared) {
       mesh.geometry.dispose();
     }
     if (mesh.material) {

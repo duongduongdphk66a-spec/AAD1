@@ -97,6 +97,21 @@ export function nextOppositeSlot(latestSlot?: 'a' | 'b' | null): 'a' | 'b' {
   return latestSlot === 'a' ? 'b' : 'a';
 }
 
+/**
+ * Computes the next slot to write to after `writtenSlot`.
+ * If `pinnedDismissedSlot` is set (because the user dismissed restoring that session on startup),
+ * all subsequent autosaves in the current browser session write to the opposite slot so the
+ * dismissed session is never overwritten on the 2nd, 3rd, or Nth autosave.
+ */
+export function selectNextWriteSlot(
+  writtenSlot: 'a' | 'b',
+  pinnedDismissedSlot?: 'a' | 'b' | null
+): 'a' | 'b' {
+  if (pinnedDismissedSlot === 'a') return 'b';
+  if (pinnedDismissedSlot === 'b') return 'a';
+  return nextOppositeSlot(writtenSlot);
+}
+
 export async function clearSessions(): Promise<void> {
   memoryFallbackSlots.clear();
   if (!hasIndexedDb()) return;

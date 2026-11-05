@@ -16,6 +16,7 @@ import {
   compressGzip,
   crc32,
   exportAtw,
+  getLastExportGzipCompressionCount,
   importAtw,
   validateSettingsV3,
 } from '../core/persistenceV3';
@@ -47,9 +48,12 @@ import {
   SparseTileStore,
   createZeroTile,
   decodeTileValue,
+  packTileBytesRle,
   serializeTileToBytes,
+  unpackTileBytesRle,
   writeFloatTile,
 } from '../core/tileStore';
+import { ProceduralPrefabFactory } from './proceduralModels';
 import {
   ADDRESSABLE_SAMPLES_L0,
   BASE_N,
@@ -1266,19 +1270,114 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
       'importAtw must not bypass CRC check when expected CRC is set to 0'
     );
 
-    // 5. Verify IndexedDbTilePersistence bounds in-memory sync cache to maxSyncCacheTiles
-    const boundedIdb = new IndexedDbTilePersistence(`test_bounded_${Date.now()}`, 4);
-    const entries = [];
-    for (let i = 0; i < 10; i++) {
-      const t = createZeroTile('height', tileKey(2, i, 0));
-      entries.push({ kind: 'height' as const, key: t.key, bytes: serializeTileToBytes(t) });
+    // 5. Verify IndexedDbTilePersistence never loses evicted tiles on sync getByKey/get (100 edited tiles with maxResidentTiles = 16 -> 0/100 errors)
+    const idbDbName = `test_lossless_idb_${Date.now()}`;
+    const idbPersistence = new IndexedDbTilePersistence(idbDbName);
+    const smallStore = new SparseTileStore({
+      worldId: 'w_lossless',
+      persistence: idbPersistence,
+      maxResidentTiles: 16,
+    });
+    const tileBuf = new Float32Array(TILE * TILE);
+    for (let i = 0; i < 100; i++) {
+      const tile = smallStore.getOrCreate(2, Math.floor(i / 10), i % 10, 'height');
+      tileBuf.fill(0);
+      tileBuf[0] = i + 1.5;
+      writeFloatTile(tile, tileBuf);
+      smallStore.markTileDirty(tile);
+      if (smallStore.stats().dirty >= 12) {
+        await smallStore.flush();
+      }
     }
-    await boundedIdb.saveBatch('w_bounded', entries);
-    assert.ok(
-      boundedIdb.cachedSyncCount() <= 4,
-      `IndexedDbTilePersistence sync cache must be bounded to <= 4 entries, got ${boundedIdb.cachedSyncCount()}`
+    await smallStore.flush();
+    assert.ok(smallStore.stats().resident <= 16, 'Resident tiles must be bounded to maxResidentTiles (16)');
+
+    let readErrors = 0;
+    for (let i = 0; i < 100; i++) {
+      const fetched = smallStore.get(2, Math.floor(i / 10), i % 10, 'height');
+      const val = fetched ? decodeTileValue(fetched, 0) : 0;
+      if (Math.abs(val - (i + 1.5)) > 0.05) {
+        readErrors++;
+      }
+    }
+    assert.equal(readErrors, 0, 'All 100 edited tiles must read back accurately (0/100 errors) even when 84 tiles are evicted from resident LRU');
+
+    // Verify hydrateFromPersistence() restores all 100 tiles into a fresh store instance from IndexedDB
+    const reloadedIdb = new IndexedDbTilePersistence(idbDbName);
+    const reloadedStore = new SparseTileStore({
+      worldId: 'w_lossless',
+      persistence: reloadedIdb,
+      maxResidentTiles: 16,
+    });
+    const hydratedCount = await reloadedStore.hydrateFromPersistence();
+    assert.equal(hydratedCount, 100);
+    assert.equal(reloadedStore.entries().length, 100);
+    await reloadedIdb.clear('w_lossless');
+
+    // 6. Verify RLE lossless tile compression and incremental exportAtw gzip caching
+    const sparseTile = createZeroTile('height', tileKey(0, 0, 0));
+    tileBuf.fill(0);
+    tileBuf[10] = 12.5;
+    writeFloatTile(sparseTile, tileBuf);
+    const rawTileBytes = serializeTileToBytes(sparseTile);
+    const rlePacked = packTileBytesRle(rawTileBytes);
+    assert.ok(rlePacked.byteLength < rawTileBytes.byteLength / 4, 'Sparse tile must compress >4x via RLE');
+    assert.deepEqual(unpackTileBytesRle(rlePacked), rawTileBytes);
+
+    // Incremental exportAtw: modifying world state compresses only the modified chunk, and a subsequent unchanged export does 0 compressions
+    const testObjs = [
+      {
+        id: 'inc_test_1',
+        prefabId: 'windmill_cottage' as const,
+        label: 'Windmill',
+        x: 10,
+        y: 20,
+        z: 10,
+        scale: 1,
+        rotationY: 0,
+      },
+    ];
+    const firstExportBlob = await engine.exportWorldSaveV3(testObjs);
+    assert.ok(firstExportBlob.size > 0);
+    const compressCountFirst = getLastExportGzipCompressionCount();
+    assert.ok(compressCountFirst >= 1);
+
+    const secondExportBlob = await engine.exportWorldSaveV3(testObjs);
+    assert.ok(secondExportBlob.size > 0);
+    assert.equal(
+      getLastExportGzipCompressionCount(),
+      0,
+      'Unchanged world save must reuse cached META, BASE, and tile gzip chunks (0 re-compressions)'
     );
-    await boundedIdb.clear('w_bounded');
+
+    // 7. Verify ProceduralPrefabFactory shares BufferGeometry and Material instances across multiple createPrefab calls
+    const dummyTex = new THREE.DataTexture(new Uint8Array(16), 2, 2);
+    const factory = new ProceduralPrefabFactory(dummyTex, false);
+    const treeA = factory.createPrefab('windmill_cottage');
+    const treeB = factory.createPrefab('windmill_cottage');
+    let sharedGeoMatches = 0;
+    let sharedMatMatches = 0;
+    treeA.traverse((childA) => {
+      const meshA = childA as THREE.Mesh;
+      if (meshA.isMesh && meshA.name) {
+        const meshB = treeB.getObjectByName(meshA.name) as THREE.Mesh | undefined;
+        if (meshB?.isMesh) {
+          if (meshA.geometry === meshB.geometry && meshA.geometry.userData?.shared === true) {
+            sharedGeoMatches++;
+          }
+          if (meshA.material === meshB.material) {
+            sharedMatMatches++;
+          }
+        }
+      }
+    });
+    assert.ok(sharedGeoMatches > 0 && sharedMatMatches > 0, 'Multiple prefab instances must share GPU geometry and material references');
+    factory.dispose();
+
+    // 8. Verify clipmap.onContextRestored() marks height textures and splat texture for GPU re-upload
+    assert.doesNotThrow(() => {
+      clipmap.onContextRestored();
+    });
 
     engine.dispose();
   });

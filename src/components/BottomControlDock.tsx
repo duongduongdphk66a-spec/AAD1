@@ -385,17 +385,15 @@ const BottomControlDockComponent: React.FC<BottomControlDockProps> = ({
     });
   };
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reset horizontal scroll when tab or category filter changes
   useEffect(() => {
     const el = horizontalRowRef.current;
-    if (!el) return;
+    if (!el || !activeTab || !prefabCategoryFilter) return;
     el.scrollLeft = 0;
     setHorizontalScrollPct(0);
   }, [activeTab, prefabCategoryFilter]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll selected prefab into view when category filter changes
   useEffect(() => {
-    if (activeTab !== 'prefabs') return;
+    if (activeTab !== 'prefabs' || !prefabCategoryFilter) return;
     const el = horizontalRowRef.current;
     if (!el) return;
     const btn = el.querySelector<HTMLElement>(`[data-testid="prefab-card-${selectedPrefab}"]`);

@@ -1,6 +1,7 @@
 import React from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { reportClientError } from '../core/reportClientError';
+import { t } from '../i18n';
 
 interface ErrorBoundaryProps {
   /** Tên vùng bị bao, hiển thị trong thông báo lỗi và log (vd. "Khung nhìn 3D"). */
@@ -32,7 +33,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
     const { error } = this.state;
     if (!error) return this.props.children;
 
-    const { label = 'Ứng dụng', inline = false } = this.props;
+    const { label = t('errorBoundary.defaultLabel'), inline = false } = this.props;
     return (
       <div
         role="alert"
@@ -42,12 +43,10 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
         <div className="max-w-md w-full rounded-2xl border border-rose-500/50 bg-[#111927] p-5 shadow-2xl">
           <div className="flex items-center gap-2 text-rose-300 font-bold">
             <AlertTriangle className="w-5 h-5 shrink-0" />
-            <span>{label} gặp lỗi</span>
+            <span>{t('errorBoundary.titleSuffix', { label })}</span>
           </div>
           <p className="mt-2 text-xs text-slate-300 break-words font-mono">{error.message}</p>
-          <p className="mt-2 text-xs text-slate-400">
-            Thao tác gần nhất có thể chưa được lưu. Bạn có thể thử lại, hoặc tải lại trang nếu lỗi lặp lại.
-          </p>
+          <p className="mt-2 text-xs text-slate-400">{t('errorBoundary.description')}</p>
           <div className="mt-4 flex gap-2">
             <button
               type="button"
@@ -55,14 +54,14 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
               className="px-3 py-1.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold flex items-center gap-1 cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              Thử lại
+              {t('errorBoundary.retry')}
             </button>
             <button
               type="button"
               onClick={() => window.location.reload()}
               className="px-3 py-1.5 rounded-xl border border-slate-600 text-slate-200 text-xs font-medium hover:bg-slate-800 cursor-pointer"
             >
-              Tải lại trang
+              {t('errorBoundary.reload')}
             </button>
           </div>
         </div>

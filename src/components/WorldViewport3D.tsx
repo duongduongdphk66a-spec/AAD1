@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
@@ -188,7 +188,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     placedObjects,
     microStrokes,
     heightMap,
+    colorMap,
     biomeId,
+    activeWeather,
+    gpuShaderEnabled,
+    waterLevel,
     autoJunctionBlend,
     v3Engine,
     v3Enabled,
@@ -212,7 +216,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     placedObjects,
     microStrokes,
     heightMap,
+    colorMap,
     biomeId,
+    activeWeather,
+    gpuShaderEnabled,
+    waterLevel,
     autoJunctionBlend,
     v3Engine,
     v3Enabled,
@@ -228,14 +236,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onScaleMetricsChange,
   };
 
-  const clearJunctionDebounceTimer = () => {
+  const clearJunctionDebounceTimer = useCallback(() => {
     if (junctionDebounceTimerRef.current !== null) {
       window.clearTimeout(junctionDebounceTimerRef.current);
       junctionDebounceTimerRef.current = null;
     }
-  };
+  }, []);
 
-  const flushJunctionContinuumRebuild = () => {
+  const flushJunctionContinuumRebuild = useCallback(() => {
     clearJunctionDebounceTimer();
     const handles = sceneHandlesRef.current;
     if (!handles) return;
@@ -255,20 +263,23 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         buildJunctionContinuumGroup(objs, strokes, hMap, bId)
       );
     }
-  };
+  }, [clearJunctionDebounceTimer]);
 
-  const scheduleDebouncedJunctionRebuild = (delayMs = 180) => {
-    clearJunctionDebounceTimer();
-    pendingJunctionRebuildRef.current = true;
-    junctionDebounceTimerRef.current = window.setTimeout(() => {
-      junctionDebounceTimerRef.current = null;
-      if (!isPointerDraggingTerrainRef.current) {
-        flushJunctionContinuumRebuild();
-      } else {
-        pendingJunctionRebuildRef.current = true;
-      }
-    }, delayMs);
-  };
+  const scheduleDebouncedJunctionRebuild = useCallback(
+    (delayMs = 180) => {
+      clearJunctionDebounceTimer();
+      pendingJunctionRebuildRef.current = true;
+      junctionDebounceTimerRef.current = window.setTimeout(() => {
+        junctionDebounceTimerRef.current = null;
+        if (!isPointerDraggingTerrainRef.current) {
+          flushJunctionContinuumRebuild();
+        } else {
+          pendingJunctionRebuildRef.current = true;
+        }
+      }, delayMs);
+    },
+    [clearJunctionDebounceTimer, flushJunctionContinuumRebuild]
+  );
 
   const sceneHandlesRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -306,10 +317,21 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   } | null>(null);
 
   // 1. Initialize WebGLRenderer & 10x10 km Vector 3D Scene once on mount
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mount WebGLRenderer and 3D scene once on initial mount
   useEffect(() => {
     const container = canvasMountRef.current;
     if (!container) return;
+
+    const {
+      heightMap: initHeightMap,
+      colorMap: initColorMap,
+      biomeId: initBiomeId,
+      activeWeather: initActiveWeather,
+      gpuShaderEnabled: initGpuShaderEnabled,
+      waterLevel: initWaterLevel,
+      placedObjects: initPlacedObjects,
+      microStrokes: initMicroStrokes,
+      autoJunctionBlend: initAutoJunctionBlend,
+    } = latestPropsRef.current;
 
     const isSoftwareGl = (() => {
       const probeCanvas = document.createElement('canvas');
@@ -353,7 +375,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    const initialBiome = BIOMES[biomeId];
+    const initialBiome = BIOMES[initBiomeId];
     scene.background = new THREE.Color(initialBiome.skyHorizonHex);
     const fog = new THREE.FogExp2(initialBiome.fogHex, 0.000032);
     scene.fog = fog;
@@ -423,19 +445,19 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     terrainGeo.rotateX(-Math.PI / 2);
 
     const posAttr = terrainGeo.attributes.position as THREE.BufferAttribute;
-    const linearColorArray = new Float32Array(colorMap.length);
+    const linearColorArray = new Float32Array(initColorMap.length);
     for (let i = 0; i < posAttr.count; i++) {
-      posAttr.setY(i, heightMap[i] ?? 0);
-      linearColorArray[i * 3] = Math.pow(colorMap[i * 3] ?? 0.4, 2.2);
-      linearColorArray[i * 3 + 1] = Math.pow(colorMap[i * 3 + 1] ?? 0.3, 2.2);
-      linearColorArray[i * 3 + 2] = Math.pow(colorMap[i * 3 + 2] ?? 0.2, 2.2);
+      posAttr.setY(i, initHeightMap[i] ?? 0);
+      linearColorArray[i * 3] = Math.pow(initColorMap[i * 3] ?? 0.4, 2.2);
+      linearColorArray[i * 3 + 1] = Math.pow(initColorMap[i * 3 + 1] ?? 0.3, 2.2);
+      linearColorArray[i * 3 + 2] = Math.pow(initColorMap[i * 3 + 2] ?? 0.2, 2.2);
     }
     posAttr.needsUpdate = true;
     const colorAttr = new THREE.BufferAttribute(linearColorArray, 3);
     terrainGeo.setAttribute('color', colorAttr);
     const initNormAttr = terrainGeo.attributes.normal as THREE.BufferAttribute | undefined;
     if (initNormAttr) {
-      computePartialVertexNormals(heightMap, initNormAttr.array as Float32Array, null);
+      computePartialVertexNormals(initHeightMap, initNormAttr.array as Float32Array, null);
       initNormAttr.needsUpdate = true;
     } else {
       terrainGeo.computeVertexNormals();
@@ -451,13 +473,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     const envController = new WorldEnvironmentController(
       scene,
-      mapBiomeOrWeatherToGPUPreset(biomeId, activeWeather)
+      mapBiomeOrWeatherToGPUPreset(initBiomeId, initActiveWeather)
     );
-    envController.getWeatherPoints().visible = activeWeather !== 'clear_sky' || gpuShaderEnabled;
+    envController.getWeatherPoints().visible =
+      initActiveWeather !== 'clear_sky' || initGpuShaderEnabled;
 
     const terrainMesh = new THREE.Mesh(
       terrainGeo,
-      gpuShaderEnabled ? envController.getTerrainMaterial() : terrainMat
+      initGpuShaderEnabled ? envController.getTerrainMaterial() : terrainMat
     );
     terrainMesh.receiveShadow = true;
     terrainMesh.castShadow = true;
@@ -491,7 +514,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       polygonOffsetUnits: 1,
     });
     const waterMesh = new THREE.Mesh(waterGeo, waterMat);
-    waterMesh.position.y = waterLevel;
+    waterMesh.position.y = initWaterLevel;
     scene.add(waterMesh);
 
     // Distant Perimeter Silhouettes (Natural Horizon Mountain Range beyond 10km)
@@ -607,8 +630,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     scene.add(junctionContinuumRoot);
 
     const weatherRoot = new THREE.Group();
-    weatherRoot.userData.activeWeather = activeWeather;
-    weatherRoot.add(buildPlanetaryWeatherGroup(activeWeather));
+    weatherRoot.userData.activeWeather = initActiveWeather;
+    weatherRoot.add(buildPlanetaryWeatherGroup(initActiveWeather));
     scene.add(weatherRoot);
 
     const {
@@ -649,10 +672,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     };
 
     // Populate initial placed objects immediately before first render at true 1:1 scale
-    for (const item of placedObjects) {
+    for (const item of initPlacedObjects) {
       const group = prefabFactory.createPrefab(item.prefabId);
       group.userData.placedObjectId = item.id;
-      const groundY = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, item.x, item.z);
+      const groundY = getGroundHeightAt(initHeightMap, GRID_SIZE, WORLD_SIZE, item.x, item.z);
       group.position.set(item.x, groundY, item.z);
       group.rotation.y = item.rotationY;
       group.scale.setScalar(item.scale * WORLD_PROP_BASE_SCALE);
@@ -662,18 +685,23 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     collectAnimatedPropNodes();
 
     // Populate initial 3D surface ecosystems (3-5cm grass, 3D flowers, desert sand dunes, smoking lava)
-    for (let idx = 0; idx < microStrokes.length; idx++) {
-      const st = microStrokes[idx];
+    for (let idx = 0; idx < initMicroStrokes.length; idx++) {
+      const st = initMicroStrokes[idx];
       const patchGroup = createSurfaceEcosystemPatch(st, idx + 1);
-      const wy = getGroundHeightAt(heightMap, GRID_SIZE, WORLD_SIZE, st.x, st.z);
+      const wy = getGroundHeightAt(initHeightMap, GRID_SIZE, WORLD_SIZE, st.x, st.z);
       patchGroup.position.set(st.x, wy + (idx % 12) * 0.003, st.z);
       microStrokesRoot.add(patchGroup);
       microMeshMap.set(st.id, patchGroup);
     }
 
-    if (autoJunctionBlend) {
+    if (initAutoJunctionBlend) {
       junctionContinuumRoot.add(
-        buildJunctionContinuumGroup(placedObjects, microStrokes, heightMap, biomeId)
+        buildJunctionContinuumGroup(
+          initPlacedObjects,
+          initMicroStrokes,
+          initHeightMap,
+          initBiomeId
+        )
       );
     }
 
@@ -945,11 +973,36 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
       }
     };
+    const domElem = renderer.domElement;
+
+    // Render loop with demand-driven sleep/wake (`requestWake`), software-WebGL fenceSync pacing (`afterDraw`), and visibility pause
+    const startTimeMs = performance.now();
+    let lastTimeMs = startTimeMs;
+    let frameId = 0;
+    let unmounted = false;
+    let loopRunning = false;
+    let awakeFramesRemaining = 90;
+
+    const requestWake = () => {
+      awakeFramesRemaining = 90;
+      if (unmounted || loopRunning) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      loopRunning = true;
+      lastTimeMs = performance.now();
+      tick();
+    };
+
     const onVisibilityChange = () => {
       if (document.hidden) {
         onBlur();
+        loopRunning = false;
+        cancelAnimationFrame(frameId);
+        clearTimeout(frameId);
+      } else {
+        requestWake();
       }
     };
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (
         document.activeElement &&
@@ -964,25 +1017,44 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         return;
       }
       keysPressed[e.code] = true;
+      requestWake();
     };
     const onKeyUp = (e: KeyboardEvent) => {
       keysPressed[e.code] = false;
     };
 
-    const domElem = renderer.domElement;
     const onContextLost = (e: Event) => {
       e.preventDefault();
       onBlur();
+      loopRunning = false;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
     };
     const onContextRestored = () => {
+      terrainGeo.attributes.position.needsUpdate = true;
+      terrainGeo.attributes.color.needsUpdate = true;
+      if (terrainGeo.attributes.normal) {
+        terrainGeo.attributes.normal.needsUpdate = true;
+      }
+      terrainMat.needsUpdate = true;
+      contactShadowMap.needsUpdate = true;
+      latestPropsRef.current.v3Engine?.clipmap?.onContextRestored();
       renderer.render(scene, camera);
+      requestWake();
+    };
+
+    const onControlsChange = () => {
+      emitScaleMetrics();
+      requestWake();
     };
 
     domElem.addEventListener('pointerdown', onPointerDown);
     domElem.addEventListener('pointermove', onPointerMove);
     domElem.addEventListener('pointercancel', onPointerCancel);
+    domElem.addEventListener('wheel', requestWake, { passive: true });
     domElem.addEventListener('webglcontextlost', onContextLost, false);
     domElem.addEventListener('webglcontextrestored', onContextRestored, false);
+    controls.addEventListener('change', onControlsChange);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -993,21 +1065,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (!container) return;
       const w = container.clientWidth || window.innerWidth;
       const h = container.clientHeight || window.innerHeight;
+      if (w <= 0 || h <= 0) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      renderer.setSize(w, h, false);
       renderer.render(scene, camera);
       emitScaleMetrics();
     };
     window.addEventListener('resize', onResize);
-
-    // Render loop with mandatory software-WebGL fenceSync pacing (`afterDraw`)
-    const startTimeMs = performance.now();
-    let lastTimeMs = startTimeMs;
-    let frameId = 0;
-    let unmounted = false;
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            onResize();
+          })
+        : null;
+    resizeObserver?.observe(container);
 
     function afterDraw(cb: () => void) {
+      if (unmounted || (typeof document !== 'undefined' && document.hidden)) {
+        loopRunning = false;
+        return;
+      }
       const gl = renderer.getContext() as WebGL2RenderingContext;
       if (!gl || typeof gl.fenceSync !== 'function') {
         frameId = window.setTimeout(cb, 80);
@@ -1016,7 +1094,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
       gl.flush();
       const poll = () => {
-        if (unmounted) return;
+        if (unmounted || (typeof document !== 'undefined' && document.hidden)) {
+          if (sync) gl.deleteSync(sync);
+          loopRunning = false;
+          return;
+        }
         const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
         if (state === gl.UNSIGNALED) {
           frameId = window.setTimeout(poll, 5);
@@ -1029,10 +1111,15 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     }
 
     function tick() {
-      if (unmounted) return;
+      if (unmounted || (typeof document !== 'undefined' && document.hidden)) {
+        loopRunning = false;
+        return;
+      }
+      loopRunning = true;
       const nowMs = performance.now();
       const dtMs = nowMs - lastTimeMs;
       const dt = Math.min(Math.max(dtMs / 1000, 0.001), 0.1);
+      const rawFps = dtMs > 0 ? Math.min(60, Math.max(1, Math.round(1000 / dtMs))) : 60;
       lastTimeMs = nowMs;
       const elapsed = (nowMs - startTimeMs) / 1000;
 
@@ -1121,7 +1208,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         activeV3.linkSystem.getMergedGroup().visible = true;
         activeV3.clipmap!.update(camera);
         if (v3HudStore.shouldPublish()) {
-          v3HudStore.publish(activeV3.getHudMetrics(Math.min(60, Math.round(1 / dt))), true);
+          v3HudStore.publish(activeV3.getHudMetrics(rawFps), true);
         }
       } else if (activeV3 && activeV3.clipmap) {
         activeV3.clipmap.root.visible = false;
@@ -1130,6 +1217,38 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
       controls.update();
       renderer.render(scene, camera);
+
+      const hasKeyPan = Boolean(
+        keysPressed['KeyW'] ||
+          keysPressed['ArrowUp'] ||
+          keysPressed['KeyS'] ||
+          keysPressed['ArrowDown'] ||
+          keysPressed['KeyA'] ||
+          keysPressed['ArrowLeft'] ||
+          keysPressed['KeyD'] ||
+          keysPressed['ArrowRight']
+      );
+      const hasV3Work = Boolean(activeV3 && isV3On && activeV3.scheduler.pendingCount() > 0);
+      const hasSceneAnimation =
+        camTransitionActive ||
+        isPointerDraggingTerrain ||
+        hasKeyPan ||
+        hasV3Work ||
+        animatedPropNodes.length > 0 ||
+        microStrokesRoot.children.length > 0 ||
+        weatherRoot.children.length > 0 ||
+        Boolean(latestPropsRef.current.gpuShaderEnabled);
+
+      if (hasSceneAnimation) {
+        awakeFramesRemaining = Math.max(awakeFramesRemaining, 30);
+      } else if (awakeFramesRemaining > 0) {
+        awakeFramesRemaining--;
+      }
+
+      if (awakeFramesRemaining <= 0 && !hasSceneAnimation) {
+        loopRunning = false;
+        return;
+      }
 
       if (isSoftwareGl) {
         afterDraw(tick);
@@ -1169,20 +1288,23 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       objectMeshMap,
       microMeshMap,
       animatedPropNodes,
-      requestWake: () => {},
+      requestWake,
       triggerCameraPreset,
     };
 
-    tick();
+    requestWake();
 
     return () => {
       unmounted = true;
+      loopRunning = false;
       clearJunctionDebounceTimer();
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
+      resizeObserver?.disconnect();
       domElem.removeEventListener('pointerdown', onPointerDown);
       domElem.removeEventListener('pointermove', onPointerMove);
       domElem.removeEventListener('pointercancel', onPointerCancel);
+      domElem.removeEventListener('wheel', requestWake);
       domElem.removeEventListener('webglcontextlost', onContextLost, false);
       domElem.removeEventListener('webglcontextrestored', onContextRestored, false);
       window.removeEventListener('pointerup', onPointerUp);
@@ -1193,6 +1315,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       window.removeEventListener('resize', onResize);
       controls.removeEventListener('start', cancelCamTransition);
       controls.removeEventListener('change', emitScaleMetrics);
+      controls.removeEventListener('change', onControlsChange);
       controls.dispose();
       microCircleGeo.dispose();
       if (scene.environment) {
@@ -1216,13 +1339,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
       sceneHandlesRef.current = null;
     };
-  }, []);
+  }, [clearJunctionDebounceTimer, scheduleDebouncedJunctionRebuild]);
 
   // 2. Sync Terrain Geometry Heights & Vector Vertex Colors whenever terrainVersion increments
-  // biome-ignore lint/correctness/useExhaustiveDependencies: terrainVersion counter triggers typed-array height/color sync
   useEffect(() => {
     const handles = sceneHandlesRef.current;
-    if (!handles) return;
+    if (!handles || terrainVersion < 0) return;
 
     const posAttr = handles.terrainGeo.attributes.position as THREE.BufferAttribute;
     const colAttr = handles.terrainGeo.attributes.color as THREE.BufferAttribute;
@@ -1473,10 +1595,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   // 3c. Sync 3D Junction & Ground Continuum Bridges:
   // Rebuild ONLY when placedObjects, microStrokes, or autoJunctionBlend changes,
   // and debounce events during sculpt or paint.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: placedObjects and microStrokes trigger continuum bridge rebuild
   useEffect(() => {
     const handles = sceneHandlesRef.current;
-    if (!handles) return;
+    if (!handles || placedObjects.length < 0 || microStrokes.length < 0) return;
 
     if (!autoJunctionBlend) {
       flushJunctionContinuumRebuild();
@@ -1490,7 +1611,13 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     }
 
     flushJunctionContinuumRebuild();
-  }, [placedObjects, microStrokes, autoJunctionBlend]);
+  }, [
+    placedObjects,
+    microStrokes,
+    autoJunctionBlend,
+    flushJunctionContinuumRebuild,
+    scheduleDebouncedJunctionRebuild,
+  ]);
 
   // 4. Sync Biome Atmosphere, Planetary Weather, Day/Night Cycle, Sun Azimuth Shadows & Starry Sky
   useEffect(() => {
@@ -1684,6 +1811,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       triplanarSharpness,
       sunDirection: new THREE.Vector3(sunDir.x, sunDir.y, sunDir.z),
     });
+    handles.requestWake();
   }, [
     gpuShaderEnabled,
     gpuWeatherPreset,

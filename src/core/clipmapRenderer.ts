@@ -732,6 +732,18 @@ export class ClipmapRenderer {
     };
   }
 
+  /**
+   * Re-marks all custom ring DataTextures and materials for GPU upload after a `webglcontextrestored` event.
+   */
+  onContextRestored(): void {
+    this.splatHandle.syncBaseSplatFromField();
+    this.splatHandle.material.needsUpdate = true;
+    for (const ring of this.rings) {
+      ring.heightTexture.needsUpdate = true;
+      ring.material.needsUpdate = true;
+    }
+  }
+
   dispose(): void {
     this.unsubscribeField();
     if (this.ownsScheduler) {

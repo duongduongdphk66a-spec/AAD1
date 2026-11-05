@@ -79,12 +79,24 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     width: number;
     height: number;
   } | null>(null);
-  const loadedImageElementRef = useRef<HTMLImageElement | null>(null);
+  const loadedImageElementRef = useRef<HTMLImageElement | ImageBitmap | null>(null);
   const aiImageDataUrlRef = useRef<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [aiNotice, setAiNotice] = useState<string | null>(null);
+
+  const releaseLoadedImageSource = () => {
+    const prev = loadedImageElementRef.current;
+    loadedImageElementRef.current = null;
+    if (prev && typeof (prev as ImageBitmap).close === 'function') {
+      try {
+        (prev as ImageBitmap).close();
+      } catch {
+        // Ignore already closed bitmap
+      }
+    }
+  };
 
   const cancelPendingAiRequest = () => {
     if (abortControllerRef.current) {
@@ -97,15 +109,15 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   // Helper to draw an image onto a square canvas using either 'fill' (center-crop) or 'fit' (proportional full frame with edge-clamped margins)
   const drawImageWithCropMode = (
     ctx: CanvasRenderingContext2D,
-    img: HTMLImageElement,
+    img: HTMLImageElement | ImageBitmap,
     targetSize: number,
     activeCropMode: 'fill' | 'fit',
     padWithEdgePixels = true
   ) => {
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, targetSize, targetSize);
-    const iw = Math.max(1, img.naturalWidth || img.width);
-    const ih = Math.max(1, img.naturalHeight || img.height);
+    const iw = Math.max(1, (img as HTMLImageElement).naturalWidth || img.width);
+    const ih = Math.max(1, (img as HTMLImageElement).naturalHeight || img.height);
     if (activeCropMode === 'fit') {
       const scale = Math.min(targetSize / iw, targetSize / ih);
       const dw = Math.max(1, Math.round(iw * scale));
@@ -135,12 +147,12 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
 
   // Helper to encode a high-resolution (up to 896px) JPEG matching the active cropMode for both preview & Gemini Vision
   const buildMatchedPreviewAndAiUrl = (
-    img: HTMLImageElement,
+    img: HTMLImageElement | ImageBitmap,
     activeCropMode: 'fill' | 'fit',
     maxDimension = 896
   ): string => {
-    const iw = Math.max(1, img.naturalWidth || img.width);
-    const ih = Math.max(1, img.naturalHeight || img.height);
+    const iw = Math.max(1, (img as HTMLImageElement).naturalWidth || img.width);
+    const ih = Math.max(1, (img as HTMLImageElement).naturalHeight || img.height);
     if (activeCropMode === 'fit') {
       const scale = Math.min(1, maxDimension / Math.max(iw, ih));
       const outW = Math.max(1, Math.round(iw * scale));
@@ -171,7 +183,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     const offscreen = document.createElement('canvas');
     offscreen.width = srcSize;
     offscreen.height = srcSize;
-    const offCtx = offscreen.getContext('2d')!;
+    const offCtx = offscreen.getContext('2d');
+    if (!offCtx) {
+      setUploadError('Trình duyệt không thể khởi tạo bộ đệm Canvas 2D để hiển thị bản đồ độ cao.');
+      return '';
+    }
     const imgData = offCtx.createImageData(srcSize, srcSize);
 
     for (let i = 0; i < srcSize * srcSize; i++) {
@@ -189,7 +205,11 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     const canvas = document.createElement('canvas');
     canvas.width = outSize;
     canvas.height = outSize;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      setUploadError('Trình duyệt không thể khởi tạo bộ đệm Canvas 2D để hiển thị bản đồ độ cao.');
+      return '';
+    }
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(offscreen, 0, 0, outSize, outSize);
@@ -274,7 +294,10 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
         canvas.width = targetSize;
         canvas.height = targetSize;
         const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+        if (!ctx) {
+          setUploadError('Trình duyệt không thể khởi tạo bộ đệm Canvas 2D để xử lý ảnh mẫu.');
+          return;
+        }
         drawImageWithCropMode(ctx, img, targetSize, cropMode);
         const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
         rgbaBufferRef.current = {
@@ -305,17 +328,31 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   };
 
   // Load initial preset when modal opens, and cancel pending AI requests on close/unmount
-  // biome-ignore lint/correctness/useExhaustiveDependencies: only run preset initialization when modal open state transitions
+  const modalOpenCallbacksRef = useRef({
+    cancelPendingAiRequest,
+    openInitialPreset: () => {
+      const preset =
+        SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
+      loadPresetWithOptionalImage(preset, reliefScale, terraceSteps, overrideBiome, mode);
+    },
+  });
+  modalOpenCallbacksRef.current = {
+    cancelPendingAiRequest,
+    openInitialPreset: () => {
+      const preset =
+        SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
+      loadPresetWithOptionalImage(preset, reliefScale, terraceSteps, overrideBiome, mode);
+    },
+  };
+
   useEffect(() => {
     if (!isOpen) {
-      cancelPendingAiRequest();
+      modalOpenCallbacksRef.current.cancelPendingAiRequest();
       return;
     }
-    const preset =
-      SAMPLE_PHOTO_PRESETS.find((p) => p.id === selectedPresetId) || SAMPLE_PHOTO_PRESETS[0];
-    loadPresetWithOptionalImage(preset, reliefScale, terraceSteps, overrideBiome, mode);
+    modalOpenCallbacksRef.current.openInitialPreset();
     return () => {
-      cancelPendingAiRequest();
+      modalOpenCallbacksRef.current.cancelPendingAiRequest();
     };
   }, [isOpen]);
 
@@ -376,59 +413,75 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
       return;
     }
 
-    const reader = new FileReader();
-    reader.onerror = () => {
-      setUploadError('Không thể đọc tệp ảnh từ thiết bị. Vui lòng thử lại.');
+    const applyDecodedSource = (source: HTMLImageElement | ImageBitmap) => {
+      releaseLoadedImageSource();
+      loadedImageElementRef.current = source;
+      const canvas = document.createElement('canvas');
+      const targetSize = 256;
+      canvas.width = targetSize;
+      canvas.height = targetSize;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        setUploadError('Trình duyệt không thể khởi tạo bộ đệm Canvas 2D để xử lý ảnh tải lên.');
+        return;
+      }
+      drawImageWithCropMode(ctx, source, targetSize, cropMode);
+      const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
+
+      rgbaBufferRef.current = {
+        rgba: imgData.data,
+        width: targetSize,
+        height: targetSize,
+      };
+      const highResAiUrl = buildMatchedPreviewAndAiUrl(source, cropMode, 896);
+      aiImageDataUrlRef.current = highResAiUrl || canvas.toDataURL('image/jpeg', 0.92);
+      setCustomImageName(file.name);
+      setSelectedPresetId('custom');
+      setPreviewDataUrl(aiImageDataUrlRef.current);
+
+      const localResult = runLocalReconstruction(
+        imgData.data,
+        targetSize,
+        targetSize,
+        reliefScale,
+        terraceSteps,
+        overrideBiome,
+        mode
+      );
+      setRegionTitle(`Vùng Đất Tái Tạo: ${file.name.replace(/\.[^.]+$/, '')}`);
+      setSummaryText(
+        `Đã phân tích ảnh "${file.name}" — phát hiện ${Math.round(
+          localResult.metrics.greenRatio * 100
+        )}% thảm thực vật, ${Math.round(
+          localResult.metrics.waterRatio * 100
+        )}% mặt nước và tạo ${localResult.detectedObjects.length} vật thể 3D.`
+      );
     };
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '');
+
+    if (typeof createImageBitmap === 'function') {
+      createImageBitmap(file)
+        .then((bitmap) => {
+          applyDecodedSource(bitmap);
+        })
+        .catch(() => {
+          setUploadError('Tệp ảnh bị lỗi hoặc không thể giải mã. Vui lòng chọn ảnh khác.');
+        });
+      return;
+    }
+
+    if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+      const objectUrl = URL.createObjectURL(file);
       const img = new Image();
       img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
         setUploadError('Tệp ảnh bị lỗi hoặc không thể giải mã. Vui lòng chọn ảnh khác.');
       };
       img.onload = () => {
-        loadedImageElementRef.current = img;
-        const canvas = document.createElement('canvas');
-        const targetSize = 256;
-        canvas.width = targetSize;
-        canvas.height = targetSize;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        drawImageWithCropMode(ctx, img, targetSize, cropMode);
-        const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
-
-        rgbaBufferRef.current = {
-          rgba: imgData.data,
-          width: targetSize,
-          height: targetSize,
-        };
-        const highResAiUrl = buildMatchedPreviewAndAiUrl(img, cropMode, 896);
-        aiImageDataUrlRef.current = highResAiUrl || canvas.toDataURL('image/jpeg', 0.92);
-        setCustomImageName(file.name);
-        setSelectedPresetId('custom');
-        setPreviewDataUrl(aiImageDataUrlRef.current);
-
-        const localResult = runLocalReconstruction(
-          imgData.data,
-          targetSize,
-          targetSize,
-          reliefScale,
-          terraceSteps,
-          overrideBiome,
-          mode
-        );
-        setRegionTitle(`Vùng Đất Tái Tạo: ${file.name.replace(/\.[^.]+$/, '')}`);
-        setSummaryText(
-          `Đã phân tích ảnh "${file.name}" — phát hiện ${Math.round(
-            localResult.metrics.greenRatio * 100
-          )}% thảm thực vật, ${Math.round(
-            localResult.metrics.waterRatio * 100
-          )}% mặt nước và tạo ${localResult.detectedObjects.length} vật thể 3D.`
-        );
+        URL.revokeObjectURL(objectUrl);
+        applyDecodedSource(img);
       };
-      img.src = dataUrl;
-    };
-    reader.readAsDataURL(file);
+      img.src = objectUrl;
+    }
   };
 
   const handleCropModeChange = (nextCropMode: 'fill' | 'fit') => {
@@ -441,7 +494,10 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
     canvas.width = targetSize;
     canvas.height = targetSize;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) {
+      setUploadError('Trình duyệt không thể khởi tạo bộ đệm Canvas 2D để đổi chế độ cắt khung ảnh.');
+      return;
+    }
     drawImageWithCropMode(ctx, img, targetSize, nextCropMode);
     const imgData = ctx.getImageData(0, 0, targetSize, targetSize);
     rgbaBufferRef.current = {
