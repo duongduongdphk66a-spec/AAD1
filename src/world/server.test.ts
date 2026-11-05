@@ -114,29 +114,40 @@ test('verifyApiAuth enforces timingSafeEqual token verification, ignores placeho
   assert.equal(verifyApiAuth({ authorization: 'Bearer secret-123' }, 'secret-123', false), true);
   assert.equal(verifyApiAuth({ 'x-api-key': 'secret-123' }, 'secret-123', true), true);
 
-  // CSP includes worker-src 'self' blob: and frame-ancestors for AI Studio preview iframe
+  // CSP includes worker-src 'self' blob: and frame-ancestors for AI Studio preview iframe without wildcard *.run.app
   assert.ok(
     CSP_HEADER_VALUE.includes("worker-src 'self' blob:"),
     'CSP must permit Blob URL Web Workers via worker-src'
   );
   assert.ok(
     CSP_HEADER_VALUE.includes("frame-ancestors 'self' https://aistudio.google.com") &&
+      !CSP_HEADER_VALUE.includes('https://*.run.app') &&
       CSP_HEADER_VALUE.includes("form-action 'self';"),
-    'CSP must permit framing by AI Studio preview and restrict form-action to self'
+    'CSP must permit framing by AI Studio preview, omit wildcard *.run.app, and restrict form-action to self'
   );
 
-  // Global hourly AI budget check
+  // Global hourly AI budget + per-IP fairness check
   resetAiBudgetForTest();
   assert.equal(consumeGlobalAiBudget(1000, 2), true);
   assert.equal(consumeGlobalAiBudget(2000, 2), true);
   assert.equal(consumeGlobalAiBudget(3000, 2), false);
   assert.equal(consumeGlobalAiBudget(3_602_000, 2), true);
   resetAiBudgetForTest();
+  // Single IP cannot exceed maxPerIpHourly even when global budget has room
+  assert.equal(consumeGlobalAiBudget(1000, 200, 500, '10.0.0.9', 2), true);
+  assert.equal(consumeGlobalAiBudget(2000, 200, 500, '10.0.0.9', 2), true);
+  assert.equal(consumeGlobalAiBudget(3000, 200, 500, '10.0.0.9', 2), false);
+  assert.equal(consumeGlobalAiBudget(3000, 200, 500, '10.0.0.10', 2), true);
+  resetAiBudgetForTest();
 
   resetRateLimitsForTest();
-  // Byte quota check (25 MB per minute ceiling)
+  // Byte quota check (25 MB per minute ceiling, including post-parse chunked byte adjustment without incrementing request count)
   const q1 = checkApiQuota('10.0.0.1', 15 * 1024 * 1024);
   assert.equal(q1.allowed, true);
+  assert.equal(q1.remainingRequests, 19);
+  const qChunked = checkApiQuota('10.0.0.1', 5 * 1024 * 1024, false);
+  assert.equal(qChunked.allowed, true);
+  assert.equal(qChunked.remainingRequests, 19, 'Post-parse chunked byte accounting must not double-count request');
   const q2 = checkApiQuota('10.0.0.1', 12 * 1024 * 1024);
   assert.equal(q2.allowed, false);
   assert.equal(q2.reason, 'byte_quota');

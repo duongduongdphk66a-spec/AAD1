@@ -5,6 +5,7 @@ export interface SessionRecord {
   savedAt: number;
   title: string;
   bytes: ArrayBuffer;
+  slot?: 'a' | 'b';
 }
 
 const memoryFallbackSlots = new Map<'a' | 'b', SessionRecord>();
@@ -31,10 +32,11 @@ export async function putSession(slot: 'a' | 'b', rec: SessionRecord): Promise<v
     savedAt: rec.savedAt,
     title: rec.title,
     bytes: rec.bytes.slice(0),
+    slot,
   };
-  memoryFallbackSlots.set(slot, safeCopy);
 
   if (!hasIndexedDb()) {
+    memoryFallbackSlots.set(slot, safeCopy);
     return;
   }
 
@@ -46,6 +48,10 @@ export async function putSession(slot: 'a' | 'b', rec: SessionRecord): Promise<v
       tx.oncomplete = () => resolve();
       tx.onerror = tx.onabort = () => reject(tx.error);
     });
+    memoryFallbackSlots.delete(slot);
+  } catch (err) {
+    memoryFallbackSlots.set(slot, safeCopy);
+    throw err;
   } finally {
     db.close();
   }
@@ -53,10 +59,12 @@ export async function putSession(slot: 'a' | 'b', rec: SessionRecord): Promise<v
 
 export async function loadNewestSession(): Promise<SessionRecord | null> {
   if (!hasIndexedDb()) {
-    const fallbackList = [memoryFallbackSlots.get('a'), memoryFallbackSlots.get('b')].filter(
-      (x): x is SessionRecord => !!x
-    );
-    return fallbackList.sort((x, y) => y.savedAt - x.savedAt)[0] ?? null;
+    const a = memoryFallbackSlots.get('a');
+    const b = memoryFallbackSlots.get('b');
+    const candidates: SessionRecord[] = [];
+    if (a) candidates.push({ ...a, slot: 'a' });
+    if (b) candidates.push({ ...b, slot: 'b' });
+    return candidates.sort((x, y) => y.savedAt - x.savedAt)[0] ?? null;
   }
 
   const db = await openDb();
@@ -64,7 +72,10 @@ export async function loadNewestSession(): Promise<SessionRecord | null> {
     const get = (k: 'a' | 'b') =>
       new Promise<SessionRecord | undefined>((res, rej) => {
         const r = db.transaction(STORE, 'readonly').objectStore(STORE).get(k);
-        r.onsuccess = () => res(r.result as SessionRecord | undefined);
+        r.onsuccess = () => {
+          const val = r.result as SessionRecord | undefined;
+          res(val ? { ...val, slot: k } : undefined);
+        };
         r.onerror = () => rej(r.error);
       });
     const [a, b] = await Promise.all([get('a'), get('b')]);
@@ -76,6 +87,14 @@ export async function loadNewestSession(): Promise<SessionRecord | null> {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Returns the slot ('a' or 'b') that should be written next so that the newest
+ * existing session is never overwritten first after a page reload.
+ */
+export function nextOppositeSlot(latestSlot?: 'a' | 'b' | null): 'a' | 'b' {
+  return latestSlot === 'a' ? 'b' : 'a';
 }
 
 export async function clearSessions(): Promise<void> {

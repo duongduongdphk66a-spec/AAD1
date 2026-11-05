@@ -8,7 +8,6 @@ import {
   Rect,
   S0,
   TILE,
-  WORLD_SIZE,
   clamp,
   smoothstep,
   spacing,

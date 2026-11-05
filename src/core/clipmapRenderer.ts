@@ -32,6 +32,9 @@ export interface ClipmapStats {
   samplesComposedLastFrame?: number;
 }
 
+const STRIP_HEIGHT = 8;
+const STRIP_COUNT = TILE / STRIP_HEIGHT;
+
 interface RingLevelData {
   level: Level;
   originX: number;
@@ -56,6 +59,7 @@ interface RingLevelData {
   dirtyRects: Rect[];
   initialized: boolean;
   pendingFullEpoch: number;
+  completedStrips: Uint8Array;
 }
 
 /**
@@ -250,6 +254,7 @@ export class ClipmapRenderer {
   private readonly rings: RingLevelData[] = [];
   private patchGeometries: THREE.BufferGeometry[][] = [];
   private readonly minFineLevel: Level;
+  private readonly maxRingLevel: Level;
   private toroidalShiftCount = 0;
   private lastStats: ClipmapStats = {
     activeLevels: 10,
@@ -288,12 +293,21 @@ export class ClipmapRenderer {
         : this.options.gpuProfile === 'integrated'
           ? 1
           : 0;
+    this.maxRingLevel = Math.max(
+      this.minFineLevel,
+      Math.min(MAX_LEVEL, this.options.levels - 1)
+    ) as Level;
 
     this.root.name = 'ClipmapTerrainRootV3';
     this.buildSharedPatchGeometries();
     this.buildRings();
 
-    this.scheduler.syncWorkerTerrainState(this.terrainField.getBaseHeightMap());
+    this.scheduler.syncWorkerTerrainState(
+      this.terrainField.getBaseHeightMap(),
+      this.terrainField.getDetailParams?.(),
+      this.terrainField.isDetailEnabled?.(),
+      this.terrainField.getBiomeRoughness?.()
+    );
 
     this.unsubscribeField = this.terrainField.on('changed', (rect) => {
       this.markDirty(rect);
@@ -309,7 +323,7 @@ export class ClipmapRenderer {
   }
 
   private buildRings(): void {
-    for (let l = this.minFineLevel; l <= MAX_LEVEL; l++) {
+    for (let l = this.minFineLevel; l <= this.maxRingLevel; l++) {
       const level = l as Level;
       const step = spacing(level);
       const extent = 128 * step;
@@ -375,12 +389,14 @@ export class ClipmapRenderer {
         dirtyRects: [],
         initialized: false,
         pendingFullEpoch: 0,
+        completedStrips: new Uint8Array(STRIP_COUNT),
       });
     }
   }
 
   markDirty(rect: Rect): void {
     for (const ring of this.rings) {
+      if (!ring.initialized) continue;
       const ringMaxX = ring.originX + (TILE - 1) * ring.step;
       const ringMaxZ = ring.originZ + (TILE - 1) * ring.step;
       if (
@@ -389,7 +405,22 @@ export class ClipmapRenderer {
         rect.maxZ >= ring.originZ &&
         rect.minZ <= ringMaxZ
       ) {
-        ring.dirtyRects.push(rect);
+        if (!ring.group.visible && ring.dirtyRects.length >= 8) {
+          let minX = rect.minX;
+          let minZ = rect.minZ;
+          let maxX = rect.maxX;
+          let maxZ = rect.maxZ;
+          for (const r of ring.dirtyRects) {
+            if (r.minX < minX) minX = r.minX;
+            if (r.minZ < minZ) minZ = r.minZ;
+            if (r.maxX > maxX) maxX = r.maxX;
+            if (r.maxZ > maxZ) maxZ = r.maxZ;
+          }
+          ring.dirtyRects.length = 0;
+          ring.dirtyRects.push({ minX, minZ, maxX, maxZ });
+        } else {
+          ring.dirtyRects.push(rect);
+        }
       }
     }
   }
@@ -429,17 +460,23 @@ export class ClipmapRenderer {
   }
 
   /**
-   * Enqueues progressive 32-row strip composition jobs into Scheduler AND dispatches
+   * Enqueues progressive 8-row strip composition jobs into Scheduler AND dispatches
    * off-thread Worker composition for full-window jumps (cold start or 4.5km teleport)
    * so that any single frame stays strictly within <= 2.2 ms on the main thread.
+   *
+   * Worker results only populate strips that have NOT yet been completed by the main thread,
+   * and never cancel the main-thread strips (which layer tileStore edits + SDF stamps on top).
    */
   private scheduleFullRingComposition(ring: RingLevelData, epoch: number): void {
+    this.scheduler.cancelLevelJobsBeforeEpoch(ring.level, epoch);
     ring.pendingFullEpoch = epoch;
+    ring.completedStrips.fill(0);
+
     const reqOriginX = ring.originX;
     const reqOriginZ = ring.originZ;
     const priority = ring.level <= 2 ? 2 : 3;
 
-    // 1. Dispatch off-thread worker composition for base+detail
+    // 1. Dispatch off-thread worker composition for fast initial base+detail preview
     this.scheduler.dispatchWorkerCompose(
       ring.level,
       reqOriginX,
@@ -454,17 +491,29 @@ export class ClipmapRenderer {
         ) {
           return;
         }
-        ring.heightBuffer.set(res.heights);
-        ring.heightTexture.needsUpdate = true;
-        ring.pendingFullEpoch = 0;
-      }
+        // Only write worker base+detail into strips not yet composed by the accurate main-thread jobs
+        let wroteAny = false;
+        for (let stripIdx = 0; stripIdx < STRIP_COUNT; stripIdx++) {
+          if (ring.completedStrips[stripIdx] === 0) {
+            const rz0 = stripIdx * STRIP_HEIGHT;
+            const h = Math.min(STRIP_HEIGHT, TILE - rz0);
+            const rowStart = rz0 * TILE;
+            const rowEnd = (rz0 + h) * TILE;
+            ring.heightBuffer.set(res.heights.subarray(rowStart, rowEnd), rowStart);
+            wroteAny = true;
+          }
+        }
+        if (wroteAny) {
+          ring.heightTexture.needsUpdate = true;
+        }
+      },
+      epoch
     );
 
     // 2. Schedule progressive 8-row strip jobs on Scheduler within frame budget
-    const stripHeight = 8;
-    for (let startRz = 0; startRz < TILE; startRz += stripHeight) {
-      const rz0 = startRz;
-      const h = Math.min(stripHeight, TILE - rz0);
+    for (let stripIdx = 0; stripIdx < STRIP_COUNT; stripIdx++) {
+      const rz0 = stripIdx * STRIP_HEIGHT;
+      const h = Math.min(STRIP_HEIGHT, TILE - rz0);
       this.scheduler.enqueue({
         id: `ring_L${ring.level}_strip_${rz0}`,
         priority,
@@ -472,10 +521,18 @@ export class ClipmapRenderer {
         level: ring.level,
         run: () => {
           if (ring.pendingFullEpoch !== epoch) return;
-          // Note: ring.originX/Z may have shifted slightly by toroidal steps; fill current ring origin
           this.fillSubWindowOnRing(ring, 0, rz0, TILE, h);
-          if (rz0 + h >= TILE) {
+          ring.completedStrips[stripIdx] = 1;
+          let allDone = true;
+          for (let i = 0; i < STRIP_COUNT; i++) {
+            if (ring.completedStrips[i] === 0) {
+              allDone = false;
+              break;
+            }
+          }
+          if (allDone) {
             ring.pendingFullEpoch = 0;
+            this.scheduler.cancelLevelJobsBeforeEpoch(ring.level, epoch + 1);
           }
         },
       });
@@ -501,11 +558,11 @@ export class ClipmapRenderer {
     else if (camHeight > 450) dynamicFineLevel = Math.max(this.minFineLevel, 3) as Level;
     else if (camHeight > 160) dynamicFineLevel = Math.max(this.minFineLevel, 2) as Level;
     else if (camHeight > 55) dynamicFineLevel = Math.max(this.minFineLevel, 1) as Level;
+    dynamicFineLevel = Math.min(dynamicFineLevel, this.maxRingLevel) as Level;
 
     let visiblePatches = 0;
     let visibleTriangles = 0;
     let samplesComposed = 0;
-    let hadLargeTeleport = false;
 
     for (const ring of this.rings) {
       if (ring.level < dynamicFineLevel) {
@@ -520,17 +577,14 @@ export class ClipmapRenderer {
       const shiftZ = Math.round((snappedZ - ring.originZ) / ring.step);
 
       if (!ring.initialized || Math.abs(shiftX) >= TILE || Math.abs(shiftZ) >= TILE) {
-        if (!hadLargeTeleport) {
-          this.scheduler.bumpEpoch();
-          hadLargeTeleport = true;
-        }
+        const ringEpoch = this.scheduler.bumpEpoch(false);
         ring.originX = snappedX;
         ring.originZ = snappedZ;
         ring.toroidalOffsetX = 0;
         ring.toroidalOffsetZ = 0;
         ring.dirtyRects.length = 0;
         ring.initialized = true;
-        this.scheduleFullRingComposition(ring, this.scheduler.currentEpoch);
+        this.scheduleFullRingComposition(ring, ringEpoch);
       } else if (shiftX !== 0 || shiftZ !== 0) {
         // Toroidal / sliding-window strip update: only compose newly exposed rows & columns!
         shiftRingBufferInPlace(ring.heightBuffer, shiftX, shiftZ);
@@ -562,6 +616,20 @@ export class ClipmapRenderer {
             zRemHeight
           );
         }
+
+        // If a full-ring progressive rebuild was still in progress when the ring shifted,
+        // reschedule remaining composition at the new shifted origin so no stale strips remain
+        if (ring.pendingFullEpoch !== 0) {
+          const ringEpoch = this.scheduler.bumpEpoch(false);
+          this.scheduleFullRingComposition(ring, ringEpoch);
+        }
+      } else if (
+        ring.pendingFullEpoch !== 0 &&
+        !this.scheduler.hasPendingJobsForLevel(ring.level, ring.pendingFullEpoch)
+      ) {
+        // Safeguard: if a ring still has pendingFullEpoch !== 0 but its jobs were cleared externally, reschedule
+        const ringEpoch = this.scheduler.bumpEpoch(false);
+        this.scheduleFullRingComposition(ring, ringEpoch);
       }
 
       if (ring.dirtyRects.length > 0) {
@@ -619,12 +687,12 @@ export class ClipmapRenderer {
     const elapsedSoFar = performance.now() - t0;
     const remainingBudget = this.options.frameBudgetMs - elapsedSoFar;
     if (this.scheduler.pendingCount() > 0 && remainingBudget > 0.1) {
-      this.scheduler.tick(remainingBudget, this.scheduler.currentEpoch);
+      this.scheduler.tick(remainingBudget, 0);
     }
 
     const uploadMs = performance.now() - t0;
     this.lastStats = {
-      activeLevels: MAX_LEVEL - dynamicFineLevel + 1,
+      activeLevels: this.maxRingLevel - dynamicFineLevel + 1,
       fineActiveLevel: dynamicFineLevel,
       visiblePatches,
       visibleTriangles,
@@ -640,7 +708,7 @@ export class ClipmapRenderer {
    */
   flushPendingCompositions(): void {
     while (this.scheduler.pendingCount() > 0) {
-      const ran = this.scheduler.tick(50, this.scheduler.currentEpoch);
+      const ran = this.scheduler.tick(50, 0);
       if (ran === 0) break;
     }
   }
@@ -654,6 +722,7 @@ export class ClipmapRenderer {
     if (!ring) return null;
     if (ring.pendingFullEpoch !== 0) {
       this.fillSubWindowOnRing(ring, 0, 0, TILE, TILE);
+      ring.completedStrips.fill(1);
       ring.pendingFullEpoch = 0;
     }
     return {

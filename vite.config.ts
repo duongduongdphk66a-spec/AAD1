@@ -17,6 +17,24 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, './src'),
       },
     },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (
+              id.includes('node_modules/three') ||
+              id.includes('node_modules/three-mesh-bvh') ||
+              id.includes('node_modules/three-bvh-csg')
+            ) {
+              return 'three-vendor';
+            }
+            if (id.includes('/src/world/registry/')) {
+              return 'world-registry';
+            }
+          },
+        },
+      },
+    },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
@@ -26,5 +44,3 @@ export default defineConfig(() => {
     },
   };
 });
-
-

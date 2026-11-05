@@ -52,14 +52,14 @@ class V3HudTelemetryStore {
   private snapshot: ResolutionHudProps = {
     addressableSamples: ADDRESSABLE_SAMPLES_L0,
     residentTiles: 0,
-    residentMB: 1.5,
+    residentMB: 1.4,
     fineAreaKm2: 0,
-    activeLevels: 10,
+    activeLevels: 0,
     fineActiveLevel: 0,
-    visibleTriangles: 131_072,
+    visibleTriangles: 0,
     pendingJobs: 0,
     fps: 60,
-    uploadMs: 0.2,
+    uploadMs: 0,
     softCapExceeded: false,
     dirtyTiles: 0,
   };
@@ -76,6 +76,10 @@ class V3HudTelemetryStore {
   getSnapshot = (): ResolutionHudProps => {
     return this.snapshot;
   };
+
+  shouldPublish(now = performance.now()): boolean {
+    return now - this.lastEmitTime >= 250;
+  }
 
   publish(partial: Partial<ResolutionHudProps>, force = false): void {
     const now = performance.now();

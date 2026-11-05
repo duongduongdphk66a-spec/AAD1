@@ -527,7 +527,6 @@ test('Day/Night cycle engine computes solar/lunar vectors, real-time shadow cast
 });
 
 test('surfaceEcosystem3D PATCH_BUILDERS exhaustively builds and disposes all 18 TextureBrushId brushes (including earth_soil, atacama_salt_crust, tropical_rainforest_floor, taiga_moss_needles) without ReferenceError', () => {
-  const flatWorld = generateFlatEarthTerrain('mondstadt_meadow');
   assert.equal(Object.keys(PATCH_BUILDERS).length, TEXTURE_INDEX_MAP.length);
 
   for (const brushId of TEXTURE_INDEX_MAP) {

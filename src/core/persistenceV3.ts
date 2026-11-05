@@ -70,7 +70,9 @@ export const MAX_META_DECOMPRESSED_BYTES = 32 * 1024 * 1024; // 32 MB ceiling fo
 export const EXACT_BASE_DECOMPRESSED_BYTES = BASE_N * BASE_N * 4 * 2; // 207,368 bytes
 export const EXACT_TILE_DECOMPRESSED_BYTES = 20 + TILE * TILE * 2; // 131,092 bytes
 export const MAX_TOTAL_DECOMPRESSED_BYTES = 256 * 1024 * 1024; // ~1,900 tiles (256 MB total across all chunks)
+export const MAX_ATW_COMPRESSED_BYTES = 64 * 1024 * 1024; // 64 MB ceiling for compressed .atw archive
 export const MAX_ATW_CHUNKS = 2048;
+export const ATW_CHUNK_WARNING_THRESHOLD = Math.floor((MAX_ATW_CHUNKS - 2) * 0.8); // 1,636 tiles (80% of ceiling)
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -112,23 +114,27 @@ const VALID_PREFAB_IDS = new Set<string>(PREFAB_CATALOG.map((p) => p.id));
 const VALID_TEXTURE_IDS = new Set<string>(TEXTURE_INDEX_MAP);
 const VALID_LINK_KINDS = new Set<string>(['path', 'bridge', 'stairs', 'wall']);
 
-async function compressGzip(bytes: Uint8Array): Promise<Uint8Array> {
-  if (typeof CompressionStream !== 'undefined') {
-    const cs = new CompressionStream('gzip');
-    const writer = cs.writable.getWriter();
-    writer.write(bytes as unknown as BufferSource);
-    writer.close();
-    const res = new Response(cs.readable);
-    const ab = await res.arrayBuffer();
-    return new Uint8Array(ab);
+export async function compressGzip(bytes: Uint8Array): Promise<Uint8Array> {
+  if (typeof CompressionStream === 'undefined') {
+    throw new Error(
+      'Môi trường hiện tại thiếu CompressionStream (gzip) nên không thể nén dữ liệu .atw.'
+    );
   }
-  return bytes;
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  const writeTask = (async () => {
+    await writer.write(bytes as unknown as BufferSource);
+    await writer.close();
+  })();
+  const readTask = new Response(cs.readable).arrayBuffer();
+  const [, ab] = await Promise.all([writeTask, readTask]);
+  return new Uint8Array(ab);
 }
 
-function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {
   let total = 0;
   for (const c of chunks) total += c.byteLength;
-  const out = new Uint8Array(total);
+  const out = new Uint8Array(new ArrayBuffer(total));
   let offset = 0;
   for (const c of chunks) {
     out.set(c, offset);
@@ -145,19 +151,11 @@ export async function decompressGzipBounded(
   bytes: Uint8Array,
   maxOutputBytes: number,
   exactOutputBytes?: number
-): Promise<Uint8Array> {
+): Promise<Uint8Array<ArrayBuffer>> {
   if (typeof DecompressionStream === 'undefined') {
-    if (bytes.byteLength > maxOutputBytes) {
-      throw new Error(
-        `Kích thước dữ liệu (${bytes.byteLength} byte) vượt quá trần cho phép (${maxOutputBytes} byte)`
-      );
-    }
-    if (exactOutputBytes !== undefined && bytes.byteLength !== exactOutputBytes) {
-      throw new Error(
-        `Kích thước dữ liệu (${bytes.byteLength} byte) không khớp chuẩn (${exactOutputBytes} byte)`
-      );
-    }
-    return bytes;
+    throw new Error(
+      'Môi trường hiện tại thiếu DecompressionStream (gzip) nên không thể giải nén tệp .atw.'
+    );
   }
 
   const ds = new DecompressionStream('gzip');
@@ -470,6 +468,55 @@ function validateLinksV3(rawLinks: unknown): Link[] {
   return out;
 }
 
+function validateSplatLayersV3(rawLayers: unknown): SerializedSplatLayer[] {
+  if (rawLayers === undefined) return [];
+  if (!Array.isArray(rawLayers)) {
+    throw new Error('Trường META.splatLayers phải là một mảng');
+  }
+  if (rawLayers.length > 32) {
+    throw new Error('Số lượng lớp vật liệu splatLayers vượt quá giới hạn (32)');
+  }
+  const out: SerializedSplatLayer[] = [];
+  for (let i = 0; i < rawLayers.length; i++) {
+    const item = rawLayers[i];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`Lớp splatLayer tại [${i}] không hợp lệ`);
+    }
+    const layer = item as Record<string, unknown>;
+    if (
+      typeof layer.id !== 'number' ||
+      !Number.isFinite(layer.id) ||
+      typeof layer.name !== 'string' ||
+      layer.name.length > 128 ||
+      typeof layer.albedoHex !== 'string' ||
+      !/^#[0-9a-fA-F]{6}$/.test(layer.albedoHex) ||
+      typeof layer.roughness !== 'number' ||
+      !Number.isFinite(layer.roughness) ||
+      layer.roughness < 0 ||
+      layer.roughness > 1 ||
+      typeof layer.slopeBias !== 'number' ||
+      !Number.isFinite(layer.slopeBias) ||
+      !Array.isArray(layer.heightRange) ||
+      layer.heightRange.length !== 2 ||
+      typeof layer.heightRange[0] !== 'number' ||
+      typeof layer.heightRange[1] !== 'number' ||
+      !Number.isFinite(layer.heightRange[0]) ||
+      !Number.isFinite(layer.heightRange[1])
+    ) {
+      throw new Error(`Dữ liệu splatLayer tại [${i}] không hợp lệ`);
+    }
+    out.push({
+      id: layer.id,
+      name: layer.name,
+      albedoHex: layer.albedoHex,
+      roughness: layer.roughness,
+      slopeBias: layer.slopeBias,
+      heightRange: [layer.heightRange[0], layer.heightRange[1]],
+    });
+  }
+  return out;
+}
+
 export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   const encoder = new TextEncoder();
 
@@ -551,11 +598,16 @@ export async function exportAtw(state: WorldSaveV3): Promise<Blob> {
   hView.setUint32(12, crc32(body), true);
 
   const combined = concatUint8Arrays([new Uint8Array(header), body]);
+  if (combined.byteLength > MAX_ATW_COMPRESSED_BYTES) {
+    throw new Error(
+      `Kích thước tệp .atw sau nén (${(combined.byteLength / (1024 * 1024)).toFixed(1)}MB) vượt quá giới hạn nhập lại an toàn (64MB).`
+    );
+  }
   return new Blob([combined as unknown as BlobPart], { type: 'application/octet-stream' });
 }
 
 export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
-  if (blob.size > 64 * 1024 * 1024) {
+  if (blob.size > MAX_ATW_COMPRESSED_BYTES) {
     throw new Error('Kích thước tệp .atw vượt quá giới hạn an toàn (64MB)');
   }
   const ab = await blob.arrayBuffer();
@@ -590,7 +642,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
     throw new Error(`Số lượng chunk (${chunkCount}) vượt quá giới hạn an toàn (${MAX_ATW_CHUNKS})`);
   }
   const expected = dv.getUint32(12, true);
-  if (expected !== 0 && crc32(bytes.subarray(16)) !== expected) {
+  if (crc32(bytes.subarray(16)) !== expected) {
     throw new Error('Tệp .atw bị hỏng (CRC không khớp)');
   }
 
@@ -659,7 +711,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
       objects = validatePlacedObjectsV3(meta.objects ?? []);
       stamps = validateStampsV3(meta.stamps);
       links = validateLinksV3(meta.links);
-      splatLayers = Array.isArray(meta.splatLayers) ? meta.splatLayers : [];
+      splatLayers = validateSplatLayersV3(meta.splatLayers);
       microStrokes = validateMicroStrokesV3(meta.microStrokes);
       settings = validateSettingsV3(meta.settings);
     } else if (tag === 'BASE') {
@@ -677,8 +729,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
         throw new Error('Tổng dung lượng giải nén vượt quá giới hạn an toàn');
       }
 
-      const aligned = raw.slice();
-      baseHeight = new Float32Array(aligned.buffer, 0, BASE_N * BASE_N);
+      baseHeight = new Float32Array(raw.buffer, raw.byteOffset, BASE_N * BASE_N);
       for (let i = 0; i < baseHeight.length; i++) {
         const h = baseHeight[i];
         if (!Number.isFinite(h) || h < -2000 || h > 5000) {
@@ -686,8 +737,8 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
         }
       }
       baseSplat = new Uint8Array(
-        aligned.buffer,
-        BASE_N * BASE_N * 4,
+        raw.buffer,
+        raw.byteOffset + BASE_N * BASE_N * 4,
         BASE_N * BASE_N * 4
       );
     } else if (tag === 'TILE') {
@@ -701,8 +752,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
         throw new Error('Tổng dung lượng giải nén vượt quá giới hạn an toàn');
       }
 
-      const aligned = raw.slice();
-      const tView = new DataView(aligned.buffer);
+      const tView = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
       const rawLevel = tView.getUint8(0);
       if (rawLevel > MAX_LEVEL) {
         throw new Error(`Mức LOD của TILE không hợp lệ: ${rawLevel}`);
@@ -739,7 +789,7 @@ export async function importAtw(blob: Blob): Promise<WorldSaveV3> {
       }
       seenTileKeys.add(dedupKey);
 
-      const data = new Int16Array(aligned.buffer, 20, TILE * TILE);
+      const data = new Int16Array(raw.buffer, raw.byteOffset + 20, TILE * TILE);
       tiles.push({ level, tx, tz, kind, min, scale, data });
     } else {
       throw new Error(`Tag chunk không xác định trong tệp .atw: "${tag}"`);
@@ -868,6 +918,6 @@ export function extractNonEmptyTilesForSave(tiles: readonly Tile[]): WorldSaveV3
       kind: t.kind,
       min: t.min,
       scale: t.scale,
-      data: new Int16Array(t.data),
+      data: t.data,
     }));
 }

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, Suspense, lazy } from 'react';
+import { useState, useRef, useEffect, useCallback, Suspense, lazy } from 'react';
 import {
   Sparkles,
   Camera,
@@ -74,15 +74,8 @@ import { SaveStatusIndicator } from './components/SaveStatusIndicator';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   createTerrainV3Engine,
-  TerrainSaveStatus,
   TerrainV3EngineBundle,
 } from './core/terrainV3Controller';
-import { checkStorageQuotaWarning } from './core/persistenceV3';
-import {
-  loadNewestSession,
-  putSession,
-  SessionRecord,
-} from './core/sessionStore';
 import { isTerrainV3DefaultEnabled } from './core/units';
 import {
   encodeHeightmapRawLittleEndian,
@@ -97,6 +90,7 @@ import {
   LinkAndStampPopoverV3,
   ResolutionHudV3,
 } from './components/TerrainV3HudAndPanels';
+import { useSessionAutosaveAndShortcuts } from './hooks/useSessionAutosave';
 
 const ImageReconstructModal = lazy(() =>
   import('./components/ImageReconstructModal').then((m) => ({
@@ -234,10 +228,6 @@ export default function App() {
   const [v3DebugSdfOutline, setV3DebugSdfOutline] = useState<boolean>(false);
   const [v3PanelOpen, setV3PanelOpen] = useState<boolean>(false);
   const [v3UiTick, setV3UiTick] = useState<number>(0);
-  const [saveStatus, setSaveStatus] = useState<TerrainSaveStatus>('saved');
-  const [dirtyTileCount, setDirtyTileCount] = useState<number>(0);
-  const [pendingSession, setPendingSession] = useState<SessionRecord | null>(null);
-  const [autosaveEnabled, setAutosaveEnabled] = useState<boolean>(false);
   const [qualityMode, setQualityMode] = useState<QualityMode>(() => {
     try {
       const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('qualityMode') : null;
@@ -250,7 +240,6 @@ export default function App() {
   const [adaptiveScale, setAdaptiveScale] = useState<number>(1);
   const [touchMode, setTouchMode] = useState<'navigate' | 'sculpt'>('navigate');
   const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState<boolean>(false);
-  const scheduleSessionAutosaveRef = useRef<(() => void) | null>(null);
   const v3EngineRef = useRef<TerrainV3EngineBundle | null>(null);
   if (!v3EngineRef.current) {
     v3EngineRef.current = createTerrainV3Engine(heightMapRef.current, 1337, false);
@@ -364,7 +353,7 @@ export default function App() {
     showToast(
       `Đã hoàn tác: "${snapshot.actionLabel}" (${remainingCount} bước hoàn tác còn lại).`
     );
-  }, [commitPlacedObjects, showToast]);
+  }, [commitPlacedObjects, showToast, setSelectedObjectId]);
 
   // Keep V3 StampIndex and LinkSystem synchronized with placedObjects & autoJunctionBlend
   useEffect(() => {
@@ -373,167 +362,28 @@ export default function App() {
     setV3UiTick((t) => t + 1);
   }, [placedObjects, autoJunctionBlend]);
 
-  // Subscribe to V3 tileStore dirty status & autosave lifecycle
-  useEffect(() => {
-    const engine = v3EngineRef.current;
-    if (!engine) return;
-    setSaveStatus(engine.getSaveStatus());
-    setDirtyTileCount(engine.tileStore.stats().dirty);
-    return engine.onSaveStatusChange((nextStatus, nextDirtyCount) => {
-      setSaveStatus(nextStatus);
-      setDirtyTileCount(nextDirtyCount);
-    });
-  }, []);
-
-  // Startup: request persistent storage and check for recoverable session in IndexedDB
-  useEffect(() => {
-    let cancelled = false;
-    if (
-      typeof navigator !== 'undefined' &&
-      navigator.storage &&
-      typeof navigator.storage.persist === 'function'
-    ) {
-      void navigator.storage.persist().catch(() => {});
-    }
-    loadNewestSession()
-      .then((rec) => {
-        if (cancelled) return;
-        if (rec && rec.bytes && rec.bytes.byteLength > 16) {
-          setPendingSession(rec);
-        } else {
-          setAutosaveEnabled(true);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setAutosaveEnabled(true);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // 5-second debounced session autosave into alternating 'a' / 'b' IndexedDB slots
-  useEffect(() => {
-    const eng = v3EngineRef.current;
-    if (!eng || !autosaveEnabled) {
-      scheduleSessionAutosaveRef.current = null;
-      return;
-    }
-    let timer = 0;
-    let dirty = false;
-    let slot: 'a' | 'b' = 'a';
-
-    const flush = async () => {
-      if (!dirty) return;
-      dirty = false;
-      try {
-        const q = await checkStorageQuotaWarning();
-        if (q.warning80Pct) {
-          showToast('Bộ nhớ trình duyệt gần đầy, hãy xuất .atw để sao lưu.');
-        }
-        const cur = latestStateRef.current;
-        const blob = await eng.exportWorldSaveV3(cur.placedObjects, {
-          microStrokes: cur.microStrokes,
-          settings: {
-            biomeId: cur.biomeId,
-            waterLevel: cur.waterLevel,
-            regionTitle: cur.regionTitle,
-          },
-        });
-        await putSession(slot, {
-          savedAt: Date.now(),
-          title: cur.regionTitle,
-          bytes: await blob.arrayBuffer(),
-        });
-        slot = slot === 'a' ? 'b' : 'a';
-      } catch {
-        // Ignore transient session save errors
-      }
-    };
-
-    const schedule = () => {
-      dirty = true;
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void flush();
-      }, 5000);
-    };
-
-    scheduleSessionAutosaveRef.current = schedule;
-    const off = eng.terrainField.on('changed', schedule);
-    const onHide = () => {
-      if (document.visibilityState === 'hidden') {
-        void flush();
-      }
-    };
-    document.addEventListener('visibilitychange', onHide);
-
-    return () => {
-      scheduleSessionAutosaveRef.current = null;
-      off();
-      window.clearTimeout(timer);
-      document.removeEventListener('visibilitychange', onHide);
-    };
-  }, [autosaveEnabled, showToast]);
-
-  // Schedule session autosave when React world state changes
-  const isInitialMountRef = useRef(true);
-  useEffect(() => {
-    if (isInitialMountRef.current) {
-      isInitialMountRef.current = false;
-      return;
-    }
-    scheduleSessionAutosaveRef.current?.();
-  }, [placedObjects, biomeId, waterLevel, regionTitle, microStrokes]);
-
-  const handleForceSyncTerrain = useCallback(() => {
-    const engine = v3EngineRef.current;
-    if (!engine) return;
-    setSaveStatus('saving');
-    void engine
-      .verifyPostImportIntegrity()
-      .then((res) => {
-        setDirtyTileCount(res.remainingDirtyTiles);
-        setSaveStatus(res.remainingDirtyTiles > 0 ? 'saving' : 'saved');
-      })
-      .catch(() => {
-        setSaveStatus(engine.getSaveStatus());
-      });
-  }, []);
-
-  // Keyboard shortcuts driven by single source of truth (SHORTCUTS in src/ui/shortcuts.ts)
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsShortcutsModalOpen(false);
-        return;
-      }
-      if (
-        document.activeElement &&
-        ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)
-      ) {
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
-        e.preventDefault();
-        handleUndo();
-        return;
-      }
-      if (e.ctrlKey || e.metaKey || e.altKey) {
-        return;
-      }
-      if (e.key === 'h' || e.key === 'H') {
-        setIsDockCollapsed((prev) => !prev);
-      } else if (e.key === '?') {
-        e.preventDefault();
-        setIsShortcutsModalOpen((prev) => !prev);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleUndo]);
+  const {
+    saveStatus,
+    setSaveStatus,
+    dirtyTileCount,
+    setDirtyTileCount,
+    pendingSession,
+    setPendingSession,
+    setAutosaveEnabled,
+    handleForceSyncTerrain,
+  } = useSessionAutosaveAndShortcuts({
+    v3EngineRef,
+    latestStateRef,
+    placedObjects,
+    biomeId,
+    waterLevel,
+    regionTitle,
+    microStrokes,
+    showToast,
+    onUndo: handleUndo,
+    setIsDockCollapsed,
+    setIsShortcutsModalOpen,
+  });
 
   const handleCycleQualityMode = useCallback(() => {
     setQualityMode((prev) => {
@@ -710,7 +560,7 @@ export default function App() {
     dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast(result.summary);
-  }, [terrainRules, biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
+  }, [terrainRules, biomeId, commitPlacedObjects, pushUndoSnapshot, showToast, setSelectedObjectId]);
 
   const sculptSyncDebounceRef = useRef<number | null>(null);
   const lastSculptCoordsRef = useRef<{ x: number; z: number }>({ x: 0, z: 0 });
@@ -1023,10 +873,6 @@ export default function App() {
       textureBrush,
       brushRadius,
       brushStrength,
-      spawnObjectOnSculpt,
-      sculptPrefabOverride,
-      placementScale,
-      placementRotationDeg,
       grassHeightCm,
       flowerSpecies,
       flowerColorHex,
@@ -1035,6 +881,7 @@ export default function App() {
       commitPlacedObjects,
       flushSculptObjectSync,
       pushUndoSnapshot,
+      setSelectedObjectId,
       v3Enabled,
     ]
   );
@@ -1114,7 +961,7 @@ export default function App() {
     showToast(
       `Đã đưa bản đồ 10×10km (lưới ${GRID_SIZE + 1}×${GRID_SIZE + 1} · ${TOTAL_VERTICES.toLocaleString()} đỉnh) về Mặt Phẳng Đất Nguyên Bản (Cao độ 0m).`
     );
-  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
+  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast, setSelectedObjectId]);
 
   // Place a 3D prefab at specific world coordinates with chosen orientation & scale (1:1 real dimensions)
   // Automatically fuses overlapping structures ("nối liền như 2 khối là 1") and interpolates/extrapolates bottom ground for distant objects
@@ -1197,6 +1044,7 @@ export default function App() {
       selectedPrefab,
       commitPlacedObjects,
       pushUndoSnapshot,
+      setSelectedObjectId,
       showToast,
     ]
   );
@@ -1330,7 +1178,7 @@ export default function App() {
         `Đã chuyển sang "${bConfig.name}" · Thời tiết: ${weatherMeta?.name || 'Trời Quang Đãng'}.`
       );
     },
-    [grassHeightCm, flowerSpecies, flowerColorHex, commitPlacedObjects, pushUndoSnapshot, showToast]
+    [grassHeightCm, flowerSpecies, flowerColorHex, commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId, showToast]
   );
 
   // Switch active planetary weather mode
@@ -1374,7 +1222,7 @@ export default function App() {
         `Tái tạo lục địa Vector 10×10km hoàn tất: ${payload.regionTitle} (${payload.placedObjects.length} vật thể 1:1).`
       );
     },
-    [syncObjectsToGround, commitPlacedObjects, pushUndoSnapshot, showToast]
+    [syncObjectsToGround, commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId, showToast]
   );
 
   const handleResetWorld = useCallback(() => {
@@ -1389,7 +1237,7 @@ export default function App() {
     dirtyRectRef.current = null;
     setTerrainVersion((v) => v + 1);
     showToast('Đã kiến tạo mẫu địa hình đồi núi Vector 10×10km (cao độ tối đa 1km).');
-  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, showToast]);
+  }, [biomeId, commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId, showToast]);
 
   // Auto Day/Night Cycle progression timer when isDayNightAuto is active
   useEffect(() => {
@@ -1521,6 +1369,8 @@ export default function App() {
     grassHeightCm,
     flowerSpecies,
     flowerColorHex,
+    setDirtyTileCount,
+    setSaveStatus,
     showToast,
   ]);
 
@@ -1628,7 +1478,7 @@ export default function App() {
       setV3UiTick((t) => t + 1);
       return stateV3;
     },
-    [commitPlacedObjects, pushUndoSnapshot]
+    [commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId]
   );
 
   const handleAcceptSessionRestore = useCallback(() => {
@@ -1648,12 +1498,12 @@ export default function App() {
         setAutosaveEnabled(true);
         showToast('Không thể khôi phục phiên trước. Đã khởi tạo bản đồ mới.');
       });
-  }, [applyAtwBlob, pendingSession, showToast]);
+  }, [applyAtwBlob, pendingSession, setAutosaveEnabled, setPendingSession, showToast]);
 
   const handleDismissSessionRestore = useCallback(() => {
     setPendingSession(null);
     setAutosaveEnabled(true);
-  }, []);
+  }, [setAutosaveEnabled, setPendingSession]);
 
   const handleImportWorldJson = useCallback(
     (file: File) => {
@@ -1727,7 +1577,7 @@ export default function App() {
       };
       reader.readAsText(file);
     },
-    [applyAtwBlob, commitPlacedObjects, pushUndoSnapshot, showToast]
+    [applyAtwBlob, commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId, showToast]
   );
 
   const handleExportAtwV3 = useCallback(() => {
@@ -1755,7 +1605,7 @@ export default function App() {
           err instanceof Error ? err.message : 'Không thể xuất tệp .ATW.'
         );
       });
-  }, [showToast]);
+  }, [setDirtyTileCount, setSaveStatus, showToast]);
 
   const handleExportHeightmap16 = useCallback(() => {
     const engine = v3EngineRef.current;
@@ -1782,7 +1632,7 @@ export default function App() {
         setSaveStatus(engine.getSaveStatus());
         showToast('Không thể xuất Heightmap 16-bit.');
       });
-  }, [showToast]);
+  }, [setSaveStatus, showToast]);
 
   const selectedObject =
     placedObjects.find((o) => o.id === selectedObjectId) || null;
@@ -1864,7 +1714,7 @@ export default function App() {
     commitPlacedObjects((prev) => prev.filter((o) => o.id !== selId));
     setSelectedObjectId(null);
     showToast('Đã xóa vật thể khỏi bản đồ (Có thể nhấn Hoàn Tác để khôi phục).');
-  }, [commitPlacedObjects, pushUndoSnapshot, showToast]);
+  }, [commitPlacedObjects, pushUndoSnapshot, setSelectedObjectId, showToast]);
 
   const handleToggleCollapse = useCallback(() => {
     setIsDockCollapsed((prev) => !prev);

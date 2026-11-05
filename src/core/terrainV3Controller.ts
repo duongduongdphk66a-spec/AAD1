@@ -28,7 +28,7 @@ import {
 } from './tileStore';
 import { ADDRESSABLE_SAMPLES_L0, BASE_N, Level, Rect, tileSpan } from './units';
 
-export type TerrainSaveStatus = 'saving' | 'saved';
+export type TerrainSaveStatus = 'saving' | 'saved' | 'error';
 
 export interface PostImportIntegrityResult {
   totalTilesChecked: number;
@@ -158,9 +158,14 @@ export function createTerrainV3Engine(
     autosaveTimer = setTimeout(() => {
       autosaveTimer = null;
       emitSaveStatus('saving');
-      void tileStore.flush().finally(() => {
-        emitSaveStatus();
-      });
+      void tileStore
+        .flush()
+        .then(() => {
+          emitSaveStatus();
+        })
+        .catch(() => {
+          emitSaveStatus('error');
+        });
     }, 2000);
     if (typeof (autosaveTimer as unknown as { unref?: () => void }).unref === 'function') {
       (autosaveTimer as unknown as { unref: () => void }).unref();
@@ -335,7 +340,7 @@ export function createTerrainV3Engine(
         emitSaveStatus();
         return blob;
       } catch (err) {
-        emitSaveStatus();
+        emitSaveStatus('error');
         throw err;
       }
     },
@@ -413,12 +418,15 @@ export function createTerrainV3Engine(
       emitSaveStatus('saving');
       try {
         await tileStore.flush();
-      } finally {
         emitSaveStatus();
+      } catch (err) {
+        emitSaveStatus('error');
+        throw err;
       }
     },
 
     getSaveStatus(): TerrainSaveStatus {
+      if (saveStatus === 'error') return 'error';
       return tileStore.stats().dirty > 0 ? 'saving' : saveStatus;
     },
 
@@ -436,11 +444,11 @@ export function createTerrainV3Engine(
       const cStats: ClipmapStats = clipmap
         ? clipmap.getStats()
         : {
-            activeLevels: 10,
+            activeLevels: 0,
             fineActiveLevel: 0,
-            visiblePatches: 52,
-            visibleTriangles: 106_496,
-            uploadMs: 0.15,
+            visiblePatches: 0,
+            visibleTriangles: 0,
+            uploadMs: 0,
           };
       const l0Count = tileStore.countTilesAtLevel(0, 'height');
       const l0SpanKm = tileSpan(0) / 1000;

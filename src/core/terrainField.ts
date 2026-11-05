@@ -1,4 +1,4 @@
-import { DetailGenerator } from './detailGenerator';
+import { DetailGenerator, DetailParams } from './detailGenerator';
 import { StampIndex } from './stampSystem';
 import { Tile, TileStore } from './tileStore';
 import {
@@ -55,6 +55,9 @@ export interface TerrainField {
   notifyChanged(rect: Rect, minLevel?: Level): void;
   setBaseHeightMap(baseMap: Float32Array): void;
   getBaseHeightMap(): Float32Array;
+  getDetailParams?(): DetailParams;
+  isDetailEnabled?(): boolean;
+  getBiomeRoughness?(): number;
 }
 
 /**
@@ -113,6 +116,18 @@ export class UnifiedTerrainField implements TerrainField {
 
   getBaseHeightMap(): Float32Array {
     return this.baseMap;
+  }
+
+  getDetailParams(): DetailParams {
+    return this.detailGen.getParams();
+  }
+
+  isDetailEnabled(): boolean {
+    return this.detailGen.isEnabled();
+  }
+
+  getBiomeRoughness(): number {
+    return this.detailGen.getBiomeRoughness();
   }
 
   invalidateMruCache(): void {

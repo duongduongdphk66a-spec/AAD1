@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import * as THREE from 'three';
 import {
   MultiResBrushEngine,
   computeBrushTargetLevel,
@@ -8,18 +9,22 @@ import {
 } from '../core/brushEngine';
 import { computeClipmapMorphAlpha, snapRingOrigin } from '../core/clipmapRenderer';
 import { DeterministicDetailGenerator } from '../core/detailGenerator';
-import { NonDestructiveLinkSystem } from '../core/linkSystem';
 import {
   MAX_ATW_CHUNKS,
   WorldSaveV3,
   assertSafeJsonKeys,
+  compressGzip,
   crc32,
   exportAtw,
   importAtw,
-  migrateV2ToV3,
   validateSettingsV3,
 } from '../core/persistenceV3';
-import { clearSessions, loadNewestSession, putSession } from '../core/sessionStore';
+import {
+  clearSessions,
+  loadNewestSession,
+  nextOppositeSlot,
+  putSession,
+} from '../core/sessionStore';
 import {
   BrushStrokeCommand,
   CommandHistoryManager,
@@ -29,19 +34,20 @@ import {
   WorldSettingsState,
 } from '../core/undoCommands';
 import { Scheduler } from '../core/scheduler';
-import { evaluateProceduralSplatColor } from '../core/splatMaterial';
 import {
   SpatialStampIndex,
   Stamp,
-  evaluateFootprintSdf,
   smoothUnionSdf,
 } from '../core/stampSystem';
 import { UnifiedTerrainField } from '../core/terrainField';
 import { createTerrainV3Engine } from '../core/terrainV3Controller';
 import {
   InMemoryTilePersistence,
+  IndexedDbTilePersistence,
   SparseTileStore,
+  createZeroTile,
   decodeTileValue,
+  serializeTileToBytes,
   writeFloatTile,
 } from '../core/tileStore';
 import {
@@ -763,9 +769,10 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     targetEngine.dispose();
   });
 
-  it('12. SessionStore (fake-indexeddb) alternates slots a/b and returns the newest session', async () => {
+  it('12. SessionStore (fake-indexeddb) alternates slots a/b, tracks slot on newest session, and computes nextOppositeSlot', async () => {
     await clearSessions();
     assert.equal(await loadNewestSession(), null);
+    assert.equal(nextOppositeSlot(undefined), 'a');
 
     const bytesA = new Uint8Array([1, 2, 3, 4]).buffer;
     const bytesB = new Uint8Array([9, 8, 7, 6, 5]).buffer;
@@ -775,12 +782,16 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     assert.ok(afterA !== null);
     assert.equal(afterA.title, 'Phiên A');
     assert.equal(afterA.savedAt, 1000);
+    assert.equal(afterA.slot, 'a');
+    assert.equal(nextOppositeSlot(afterA.slot), 'b');
 
     await putSession('b', { savedAt: 2500, title: 'Phiên B Mới Hơn', bytes: bytesB });
     const afterB = await loadNewestSession();
     assert.ok(afterB !== null);
     assert.equal(afterB.title, 'Phiên B Mới Hơn');
     assert.equal(afterB.savedAt, 2500);
+    assert.equal(afterB.slot, 'b');
+    assert.equal(nextOppositeSlot(afterB.slot), 'a');
     assert.deepEqual(new Uint8Array(afterB.bytes), new Uint8Array([9, 8, 7, 6, 5]));
 
     // Overwrite slot 'a' with an even newer timestamp (3500) while keeping slot 'b' intact
@@ -789,6 +800,8 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     assert.ok(afterA2 !== null);
     assert.equal(afterA2.title, 'Phiên A Cập Nhật');
     assert.equal(afterA2.savedAt, 3500);
+    assert.equal(afterA2.slot, 'a');
+    assert.equal(nextOppositeSlot(afterA2.slot), 'b');
 
     await clearSessions();
     assert.equal(await loadNewestSession(), null);
@@ -1049,6 +1062,223 @@ describe('AetherTerra V3: 10-Billion Virtual Sample Clipmap & Non-Destructive St
     assert.equal(validated.elevationScale, 85);
     assert.equal(validated.detectedObjects.length, 1);
     assert.equal(validated.detectedObjects[0].rotationDeg, 45);
+
+    engine.dispose();
+  });
+
+  it('16. IndexedDbTilePersistence reload listKeys, clear, zeroed tile deletion, flush error retention, and compressGzip guard', async () => {
+    const dbName = `test_idb_tiles_${Date.now()}`;
+    const idb1 = new IndexedDbTilePersistence(dbName);
+    await idb1.clear('w1');
+
+    const store1 = new SparseTileStore({ worldId: 'w1', persistence: idb1, maxResidentTiles: 16 });
+    const t1 = store1.getOrCreate(0, 5, 6, 'height');
+    const buf = new Float32Array(TILE * TILE);
+    buf[0] = 12.5;
+    writeFloatTile(t1, buf);
+    store1.markTileDirty(t1);
+    await store1.flush();
+    assert.equal(store1.stats().dirty, 0);
+
+    // Fresh IndexedDbTilePersistence instance (simulating browser reload with empty RAM fallback)
+    const idb2 = new IndexedDbTilePersistence(dbName);
+    const keysAfterReload = await idb2.listKeys('w1', 'height');
+    assert.deepEqual(keysAfterReload, [t1.key], 'listKeys() must read persisted keys from IndexedDB after reload');
+
+    // Compacting a zeroed tile must remove it from IndexedDB so ensure() does not resurrect it
+    buf.fill(0);
+    writeFloatTile(t1, buf);
+    const compacted = store1.compactIfZero(0, 5, 6, 'height');
+    assert.equal(compacted, true);
+    await new Promise((r) => setTimeout(r, 15));
+    const resurrected = await store1.ensure('height', t1.key, false);
+    assert.equal(resurrected, undefined, 'Zeroed/compacted tile must not resurrect via ensure()');
+
+    // Re-save and verify clear() removes from IndexedDB
+    await idb2.saveBatch('w1', [{ kind: 'height', key: t1.key, bytes: serializeTileToBytes(t1) }]);
+    assert.equal((await idb2.listKeys('w1', 'height')).length, 1);
+    await idb2.clear('w1');
+    const idb3 = new IndexedDbTilePersistence(dbName);
+    assert.equal((await idb3.listKeys('w1', 'height')).length, 0, 'clear() must wipe IndexedDB entries');
+
+    // Verify flush() keeps tile dirty if saveBatch throws
+    const failingPersistence = new InMemoryTilePersistence();
+    failingPersistence.saveBatch = async () => {
+      throw new Error('Simulated disk full');
+    };
+    const failingStore = new SparseTileStore(16, failingPersistence);
+    const dirtyTile = failingStore.getOrCreate(0, 1, 1, 'height');
+    buf[0] = 5.0;
+    writeFloatTile(dirtyTile, buf);
+    failingStore.markTileDirty(dirtyTile);
+    await assert.rejects(async () => {
+      await failingStore.flush();
+    }, /Simulated disk full/);
+    assert.equal(dirtyTile.dirty, true, 'Tile must remain dirty when saveBatch fails');
+    assert.equal(failingStore.stats().dirty, 1);
+
+    // Verify compressGzip throws when CompressionStream is missing
+    const origCompressionStream = globalThis.CompressionStream;
+    try {
+      // @ts-expect-error testing missing CompressionStream in older browsers
+      delete globalThis.CompressionStream;
+      await assert.rejects(
+        async () => {
+          await compressGzip(new Uint8Array([1, 2, 3, 4]));
+        },
+        /CompressionStream/
+      );
+    } finally {
+      globalThis.CompressionStream = origCompressionStream;
+    }
+  });
+
+  it('17. Clipmap worker brush+stamp preservation, consecutive-frame multi-ring teleport convergence, custom seed/roughness sync, CRC=0 & splatLayers validation, and bounded IDB RAM cache', async () => {
+    const baseMap = new Float32Array(BASE_N * BASE_N);
+    baseMap.fill(10);
+    // Enable worker = true
+    const engine = createTerrainV3Engine(baseMap, 777, true);
+    engine.detailGen.setBiome('sahara_dunes');
+    engine.scheduler.syncWorkerTerrainState(
+      engine.terrainField.getBaseHeightMap(),
+      engine.detailGen.getParams(),
+      engine.detailGen.isEnabled(),
+      engine.detailGen.getBiomeRoughness()
+    );
+
+    const scene = new THREE.Scene();
+    const clipmap = engine.attachClipmap(scene, {
+      gpuProfile: 'discrete',
+      frameBudgetMs: 2.2,
+    });
+
+    // Wait briefly so worker_threads finishes initializing
+    await new Promise((r) => setTimeout(r, 40));
+
+    // 1. Sculpt terrain and place an object stamp at (0, 0)
+    engine.applySculptStrokeStamp(0, 0, 6.0, 95, 'raise', 0.2);
+    engine.syncPlacedObjects(
+      [
+        {
+          id: 'tower_1',
+          prefabId: 'windmill_cottage',
+          label: 'Tháp Cối Xay',
+          x: 4,
+          y: 25,
+          z: 4,
+          scale: 1,
+          rotationY: 0,
+        },
+      ],
+      true
+    );
+
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.set(0, 20, 0);
+    clipmap.update(cam);
+
+    // 2. Teleport camera far away (3000m) and back to (0, 0) while worker is active
+    cam.position.set(3000, 20, 3000);
+    clipmap.update(cam);
+    await new Promise((r) => setTimeout(r, 30));
+
+    cam.position.set(0, 20, 0);
+    clipmap.update(cam);
+    // Wait for worker composeResult callback to arrive BEFORE all main-thread strips finish
+    await new Promise((r) => setTimeout(r, 40));
+    // Now tick main-thread strips to completion across frames
+    for (let f = 0; f < 260 && engine.scheduler.pendingCount() > 0; f++) {
+      clipmap.update(cam);
+      if (f % 25 === 0) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+
+    const snapL0 = clipmap.getRingHeightSnapshot(0);
+    assert.ok(snapL0, 'L0 snapshot must exist');
+    let maxDiffL0 = 0;
+    for (let rz = 0; rz < TILE; rz += 8) {
+      for (let rx = 0; rx < TILE; rx += 8) {
+        const wx = snapL0.originX + rx * 0.1;
+        const wz = snapL0.originZ + rz * 0.1;
+        const expected = engine.terrainField.sampleHeight(wx, wz, 0);
+        const actual = snapL0.buffer[rz * TILE + rx];
+        maxDiffL0 = Math.max(maxDiffL0, Math.abs(actual - expected));
+      }
+    }
+    assert.ok(
+      maxDiffL0 < 1e-4,
+      `L0 buffer after worker + strip rebuild must match terrainField (edits + stamps + seed 777), got maxDiff=${maxDiffL0}`
+    );
+
+    // 3. Consecutive-frame teleports across altitude thresholds (L1 teleports on frame N, L0 teleports on frame N+1)
+    cam.position.set(2500, 200, 2500); // camHeight ~ 190 -> dynamicFineLevel = 2 (L0 and L1 hidden)
+    clipmap.update(cam);
+
+    // Frame N: descend to y=100 (camHeight ~ 90 -> dynamicFineLevel = 1 -> L1 becomes visible and teleports!)
+    cam.position.set(2500, 100, 2500);
+    clipmap.update(cam);
+
+    // Frame N+1: descend to y=30 (camHeight ~ 20 -> dynamicFineLevel = 0 -> L0 becomes visible and teleports!)
+    cam.position.set(2500, 30, 2500);
+    clipmap.update(cam);
+
+    // Run frame updates to drain progressive strips for all rings
+    for (let f = 0; f < 260 && engine.scheduler.pendingCount() > 0; f++) {
+      clipmap.update(cam);
+      if (f % 25 === 0) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    assert.equal(
+      engine.scheduler.pendingCount(),
+      0,
+      'All progressive strips for both L1 and L0 must drain without getting stuck'
+    );
+
+    const snapL1 = clipmap.getRingHeightSnapshot(1);
+    assert.ok(snapL1);
+    let maxDiffL1 = 0;
+    for (let rz = 0; rz < TILE; rz += 16) {
+      for (let rx = 0; rx < TILE; rx += 16) {
+        const wx = snapL1.originX + rx * 0.2;
+        const wz = snapL1.originZ + rz * 0.2;
+        const expected = engine.terrainField.sampleHeight(wx, wz, 1);
+        const actual = snapL1.buffer[rz * TILE + rx];
+        maxDiffL1 = Math.max(maxDiffL1, Math.abs(actual - expected));
+      }
+    }
+    assert.ok(
+      maxDiffL1 < 1e-4,
+      `L1 buffer must converge accurately after consecutive-frame teleport, got maxDiff=${maxDiffL1}`
+    );
+
+    // 4. Verify importAtw rejects tampered CRC = 0
+    const validBlob = await engine.exportWorldSaveV3([]);
+    const tamperedBytes = new Uint8Array(await validBlob.arrayBuffer());
+    new DataView(tamperedBytes.buffer).setUint32(12, 0, true); // Set expected CRC to 0
+    tamperedBytes[tamperedBytes.length - 1] ^= 0xff;
+    await assert.rejects(
+      async () => {
+        await importAtw(new Blob([tamperedBytes]));
+      },
+      /CRC không khớp/,
+      'importAtw must not bypass CRC check when expected CRC is set to 0'
+    );
+
+    // 5. Verify IndexedDbTilePersistence bounds in-memory sync cache to maxSyncCacheTiles
+    const boundedIdb = new IndexedDbTilePersistence(`test_bounded_${Date.now()}`, 4);
+    const entries = [];
+    for (let i = 0; i < 10; i++) {
+      const t = createZeroTile('height', tileKey(2, i, 0));
+      entries.push({ kind: 'height' as const, key: t.key, bytes: serializeTileToBytes(t) });
+    }
+    await boundedIdb.saveBatch('w_bounded', entries);
+    assert.ok(
+      boundedIdb.cachedSyncCount() <= 4,
+      `IndexedDbTilePersistence sync cache must be bounded to <= 4 entries, got ${boundedIdb.cachedSyncCount()}`
+    );
+    await boundedIdb.clear('w_bounded');
 
     engine.dispose();
   });

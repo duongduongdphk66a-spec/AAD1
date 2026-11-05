@@ -212,12 +212,27 @@ interface WorkerAdapter {
   terminate(): void;
 }
 
+interface WorkerSyncPayload {
+  type: 'syncState';
+  baseMap: Float32Array;
+  seed: number;
+  amplitude: number;
+  persistence: number;
+  maxDetailMeters: number;
+  biomeRoughness: number;
+  detailEnabled: boolean;
+}
+
 /**
  * Off-thread Worker pool for Clipmap window composition.
  * Automatically spawns a Web Worker in browser or an unref'd worker_threads Worker in Node.
  */
 let sharedWorkerInstance: WorkerAdapter | null = null;
 let sharedWorkerInitializing = false;
+let sharedWorkerFailureCount = 0;
+let sharedWorkerNextRetryAt = 0;
+let lastSharedSyncPayload: WorkerSyncPayload | null = null;
+const MAX_WORKER_RETRIES = 3;
 const sharedMessageListeners = new Set<(data: unknown) => void>();
 const sharedErrorListeners = new Set<() => void>();
 
@@ -228,13 +243,29 @@ function handleSharedWorkerFailure(terminate?: () => void): void {
     /* ignore */
   }
   sharedWorkerInstance = null;
-  // Keep sharedWorkerInitializing = true so ensureSharedWorker() stays null and falls back to main thread
+  sharedWorkerInitializing = false;
+  sharedWorkerFailureCount++;
+  sharedWorkerNextRetryAt = Date.now() + Math.min(5000, 250 * sharedWorkerFailureCount);
   for (const fn of sharedErrorListeners) fn();
+}
+
+function flushInitialSyncToWorker(worker: WorkerAdapter): void {
+  if (!lastSharedSyncPayload) return;
+  try {
+    worker.postMessage({
+      ...lastSharedSyncPayload,
+      baseMap: new Float32Array(lastSharedSyncPayload.baseMap),
+    });
+  } catch {
+    /* ignore */
+  }
 }
 
 function ensureSharedWorker(): WorkerAdapter | null {
   if (sharedWorkerInstance) return sharedWorkerInstance;
   if (sharedWorkerInitializing) return null;
+  if (sharedWorkerFailureCount >= MAX_WORKER_RETRIES) return null;
+  if (sharedWorkerFailureCount > 0 && Date.now() < sharedWorkerNextRetryAt) return null;
   sharedWorkerInitializing = true;
 
   // 1. Browser Web Worker via Blob URL
@@ -259,18 +290,22 @@ function ensureSharedWorker(): WorkerAdapter | null {
           URL.revokeObjectURL(url);
         },
       };
+      sharedWorkerInitializing = false;
+      flushInitialSyncToWorker(sharedWorkerInstance);
       return sharedWorkerInstance;
     } catch {
       // Fallback if CSP blocks blob worker
+      sharedWorkerInitializing = false;
     }
   }
 
   // 2. Node.js worker_threads (single shared unref'd worker so tests / benchmarks never spawn multiple V8 isolates or hang)
   if (typeof process !== 'undefined' && process.versions?.node) {
-    import('node:worker_threads')
+    const nodeWorkerMod = 'node:worker_threads';
+    import(/* @vite-ignore */ nodeWorkerMod)
       .then(({ Worker: NodeWorker }) => {
         const nw = new NodeWorker(WORKER_SCRIPT, { eval: true });
-        nw.on('message', (data) => {
+        nw.on('message', (data: unknown) => {
           for (const fn of sharedMessageListeners) fn(data);
         });
         nw.on('error', () => {
@@ -286,21 +321,38 @@ function ensureSharedWorker(): WorkerAdapter | null {
             void nw.terminate();
           },
         };
+        sharedWorkerInitializing = false;
+        flushInitialSyncToWorker(sharedWorkerInstance);
       })
       .catch(() => {
         handleSharedWorkerFailure();
       });
+  } else {
+    sharedWorkerInitializing = false;
+    sharedWorkerFailureCount = MAX_WORKER_RETRIES;
   }
 
   return sharedWorkerInstance;
 }
 
+interface PendingWorkerEntry {
+  epoch: number;
+  level: Level;
+  onResult: (res: WorkerComposeResult) => void;
+}
+
 export class ComposeWorkerPool {
   private static globalReqCounter = 1;
-  private pendingCallbacks = new Map<number, (res: WorkerComposeResult) => void>();
+  private pendingCallbacks = new Map<number, PendingWorkerEntry>();
   private disposed = false;
-  private lastBaseMap: Float32Array | null = null;
-  private lastDetailParams: DetailParams | null = null;
+  private lastDetailParams: DetailParams = {
+    seed: 1337,
+    amplitude: 0.85,
+    persistence: 0.52,
+    maxDetailMeters: 2.0,
+  };
+  private lastDetailEnabled = true;
+  private lastBiomeRoughness = 0.72;
   private readonly boundListener: (data: unknown) => void;
   private readonly boundErrorListener: () => void;
 
@@ -326,13 +378,13 @@ export class ComposeWorkerPool {
       heights?: Float32Array;
     };
     if (msg.type === 'composeResult' && typeof msg.id === 'number' && msg.heights) {
-      const cb = this.pendingCallbacks.get(msg.id);
-      if (!cb) return;
+      const entry = this.pendingCallbacks.get(msg.id);
+      if (!entry) return;
       this.pendingCallbacks.delete(msg.id);
-      cb({
+      entry.onResult({
         id: msg.id,
-        epoch: msg.epoch ?? 0,
-        level: (msg.level ?? 0) as Level,
+        epoch: msg.epoch ?? entry.epoch,
+        level: (msg.level ?? entry.level) as Level,
         originX: msg.originX ?? 0,
         originZ: msg.originZ ?? 0,
         w: msg.w ?? 256,
@@ -352,23 +404,36 @@ export class ComposeWorkerPool {
   syncState(
     baseMap: Float32Array,
     params?: DetailParams,
-    detailEnabled = true,
-    biomeRoughness = 0.72
+    detailEnabled?: boolean,
+    biomeRoughness?: number
   ): void {
-    this.lastBaseMap = baseMap;
-    if (params) this.lastDetailParams = params;
+    if (params) {
+      this.lastDetailParams = { ...params };
+    }
+    if (detailEnabled !== undefined) {
+      this.lastDetailEnabled = detailEnabled;
+    }
+    if (biomeRoughness !== undefined) {
+      this.lastBiomeRoughness = biomeRoughness;
+    }
+
+    const payload: WorkerSyncPayload = {
+      type: 'syncState',
+      baseMap: new Float32Array(baseMap),
+      seed: this.lastDetailParams.seed,
+      amplitude: this.lastDetailParams.amplitude,
+      persistence: this.lastDetailParams.persistence,
+      maxDetailMeters: this.lastDetailParams.maxDetailMeters,
+      biomeRoughness: this.lastBiomeRoughness,
+      detailEnabled: this.lastDetailEnabled,
+    };
+    lastSharedSyncPayload = payload;
+
     const worker = ensureSharedWorker();
     if (!worker || this.disposed) return;
-    const copy = new Float32Array(baseMap);
     worker.postMessage({
-      type: 'syncState',
-      baseMap: copy,
-      seed: params?.seed ?? 1337,
-      amplitude: params?.amplitude ?? 0.85,
-      persistence: params?.persistence ?? 0.52,
-      maxDetailMeters: params?.maxDetailMeters ?? 2.0,
-      biomeRoughness,
-      detailEnabled,
+      ...payload,
+      baseMap: new Float32Array(baseMap),
     });
   }
 
@@ -384,7 +449,7 @@ export class ComposeWorkerPool {
     const worker = ensureSharedWorker();
     if (!worker || this.disposed) return -1;
     const id = ComposeWorkerPool.globalReqCounter++;
-    this.pendingCallbacks.set(id, onResult);
+    this.pendingCallbacks.set(id, { epoch, level, onResult });
     worker.postMessage({
       type: 'composeWindow',
       id,
@@ -398,9 +463,12 @@ export class ComposeWorkerPool {
     return id;
   }
 
-  cancelBeforeEpoch(minEpoch: number): void {
-    void minEpoch;
-    this.pendingCallbacks.clear();
+  cancelBeforeEpoch(minEpoch: number, level?: Level): void {
+    for (const [id, entry] of this.pendingCallbacks.entries()) {
+      if (entry.epoch < minEpoch && (level === undefined || entry.level === level)) {
+        this.pendingCallbacks.delete(id);
+      }
+    }
   }
 
   pendingCount(): number {

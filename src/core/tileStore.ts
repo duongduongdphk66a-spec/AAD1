@@ -1,11 +1,9 @@
 import {
-  HALF,
   Level,
   MAX_LEVEL,
   Rect,
   TILE,
   TileKey,
-  spacing,
   tileKey,
   tileKeyToWorldRect,
   unpackTileKey,
@@ -37,6 +35,14 @@ export interface TilePersistence {
   saveBatchSync?(
     worldId: string,
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
+  ): void;
+  deleteBatch?(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): Promise<void>;
+  deleteBatchSync?(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
   ): void;
   listKeys(worldId: string, kind: TileKind): Promise<TileKey[]>;
   clear(worldId: string): Promise<void>;
@@ -182,13 +188,17 @@ export function deserializeTileFromBytes(
   bytes: Uint8Array
 ): Tile {
   const { level, tx, tz } = unpackTileKey(key);
-  const aligned = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  const view = new DataView(aligned);
-  const min = view.getFloat32(0, true);
-  const scale = view.getFloat32(4, true);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const min = bytes.byteLength >= 4 ? view.getFloat32(0, true) : 0;
+  const scale = bytes.byteLength >= 8 ? view.getFloat32(4, true) : 0;
   const data = new Int16Array(TILE * TILE);
-  if (aligned.byteLength >= 8 + BYTES_PER_TILE) {
-    data.set(new Int16Array(aligned, 8, TILE * TILE));
+  if (bytes.byteLength >= 8 + BYTES_PER_TILE) {
+    if ((bytes.byteOffset + 8) % 2 === 0) {
+      data.set(new Int16Array(bytes.buffer, bytes.byteOffset + 8, TILE * TILE));
+    } else {
+      const targetBytes = new Uint8Array(data.buffer, 0, BYTES_PER_TILE);
+      targetBytes.set(bytes.subarray(8, 8 + BYTES_PER_TILE));
+    }
   } else {
     data.fill(-QUANT_OFFSET);
   }
@@ -216,8 +226,15 @@ export class InMemoryTilePersistence implements TilePersistence {
   }
 
   loadSync(worldId: string, kind: TileKind, key: TileKey): Uint8Array | null {
-    const found = this.store.get(this.makeKey(worldId, kind, key));
-    return found ? new Uint8Array(found) : null;
+    const mapKey = this.makeKey(worldId, kind, key);
+    const found = this.store.get(mapKey);
+    if (found !== undefined) {
+      // Refresh LRU insertion order
+      this.store.delete(mapKey);
+      this.store.set(mapKey, found);
+      return found;
+    }
+    return null;
   }
 
   async load(worldId: string, kind: TileKind, key: TileKey): Promise<Uint8Array | null> {
@@ -229,8 +246,23 @@ export class InMemoryTilePersistence implements TilePersistence {
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
   ): void {
     for (const entry of entries) {
-      this.store.set(this.makeKey(worldId, entry.kind, entry.key), new Uint8Array(entry.bytes));
+      const mapKey = this.makeKey(worldId, entry.kind, entry.key);
+      this.store.delete(mapKey);
+      this.store.set(mapKey, entry.bytes);
     }
+  }
+
+  trimToMaxEntries(maxEntries: number): void {
+    if (maxEntries < 0) return;
+    while (this.store.size > maxEntries) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.store.delete(oldestKey);
+    }
+  }
+
+  cachedEntryCount(): number {
+    return this.store.size;
   }
 
   async saveBatch(
@@ -238,6 +270,22 @@ export class InMemoryTilePersistence implements TilePersistence {
     entries: { kind: TileKind; key: TileKey; bytes: Uint8Array }[]
   ): Promise<void> {
     this.saveBatchSync(worldId, entries);
+  }
+
+  deleteBatchSync(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): void {
+    for (const entry of entries) {
+      this.store.delete(this.makeKey(worldId, entry.kind, entry.key));
+    }
+  }
+
+  async deleteBatch(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): Promise<void> {
+    this.deleteBatchSync(worldId, entries);
   }
 
   async listKeys(worldId: string, kind: TileKind): Promise<TileKey[]> {
@@ -262,14 +310,22 @@ export class InMemoryTilePersistence implements TilePersistence {
   }
 }
 
+const DEFAULT_IDB_SYNC_CACHE_TILES = 64; // 64 * 128 KB = 8 MB bounded sync read cache
+
 export class IndexedDbTilePersistence implements TilePersistence {
   private fallback = new InMemoryTilePersistence();
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   public hasIndexedDbError = false;
   private dbName: string;
+  private maxSyncCacheTiles: number;
 
-  constructor(dbName = 'aetherterra_v3_tiles') {
+  constructor(dbName = 'aetherterra_v3_tiles', maxSyncCacheTiles = DEFAULT_IDB_SYNC_CACHE_TILES) {
     this.dbName = dbName;
+    this.maxSyncCacheTiles = Math.max(0, maxSyncCacheTiles);
+  }
+
+  cachedSyncCount(): number {
+    return this.fallback.cachedEntryCount();
   }
 
   private getDb(): Promise<IDBDatabase | null> {
@@ -320,7 +376,13 @@ export class IndexedDbTilePersistence implements TilePersistence {
           const res = req.result;
           if (res instanceof Uint8Array) {
             this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: res }]);
-            resolve(new Uint8Array(res));
+            this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
+            resolve(res);
+          } else if (ArrayBuffer.isView(res)) {
+            const view = new Uint8Array(res.buffer, res.byteOffset, res.byteLength);
+            this.fallback.saveBatchSync(worldId, [{ kind, key, bytes: view }]);
+            this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
+            resolve(view);
           } else {
             resolve(null);
           }
@@ -351,7 +413,7 @@ export class IndexedDbTilePersistence implements TilePersistence {
     const batchSize = 64;
     for (let i = 0; i < entries.length; i += batchSize) {
       const slice = entries.slice(i, i + batchSize);
-      await new Promise<void>((resolve) => {
+      await new Promise<void>((resolve, reject) => {
         try {
           const tx = db.transaction('tiles', 'readwrite');
           const store = tx.objectStore('tiles');
@@ -360,24 +422,127 @@ export class IndexedDbTilePersistence implements TilePersistence {
             store.put(item.bytes, `${worldId}:${normKind}:${item.key}`);
           }
           tx.oncomplete = () => resolve();
-          tx.onerror = () => {
+          tx.onerror = tx.onabort = () => {
             this.hasIndexedDbError = true;
-            resolve();
+            reject(tx.error ?? new Error('IndexedDB saveBatch transaction failed'));
           };
-        } catch {
+        } catch (err) {
           this.hasIndexedDbError = true;
-          resolve();
+          reject(err instanceof Error ? err : new Error(String(err)));
         }
       });
     }
+    // Once persisted to IndexedDB, bound the in-memory sync cache so RAM never grows unboundedly
+    if (!this.hasIndexedDbError) {
+      this.fallback.trimToMaxEntries(this.maxSyncCacheTiles);
+    }
+  }
+
+  deleteBatchSync(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): void {
+    this.fallback.deleteBatchSync(worldId, entries);
+    void this.deleteFromIdb(worldId, entries).catch(() => {});
+  }
+
+  async deleteBatch(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): Promise<void> {
+    this.fallback.deleteBatchSync(worldId, entries);
+    await this.deleteFromIdb(worldId, entries);
+  }
+
+  private async deleteFromIdb(
+    worldId: string,
+    entries: { kind: TileKind; key: TileKey }[]
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const db = await this.getDb();
+    if (!db) return;
+    await new Promise<void>((resolve) => {
+      try {
+        const tx = db.transaction('tiles', 'readwrite');
+        const store = tx.objectStore('tiles');
+        for (const item of entries) {
+          const normKind = item.kind === 'edit' ? 'height' : item.kind;
+          store.delete(`${worldId}:${normKind}:${item.key}`);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => {
+          this.hasIndexedDbError = true;
+          resolve();
+        };
+      } catch {
+        this.hasIndexedDbError = true;
+        resolve();
+      }
+    });
   }
 
   async listKeys(worldId: string, kind: TileKind): Promise<TileKey[]> {
-    return this.fallback.listKeys(worldId, kind);
+    const normKind = kind === 'edit' ? 'height' : kind;
+    const prefix = `${worldId}:${normKind}:`;
+    const keySet = new Set<TileKey>(await this.fallback.listKeys(worldId, kind));
+
+    const db = await this.getDb();
+    if (!db) return Array.from(keySet);
+
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction('tiles', 'readonly');
+        const store = tx.objectStore('tiles');
+        const req = store.getAllKeys();
+        req.onsuccess = () => {
+          const allKeys = req.result ?? [];
+          for (const rawKey of allKeys) {
+            if (typeof rawKey === 'string' && rawKey.startsWith(prefix)) {
+              const num = Number(rawKey.slice(prefix.length));
+              if (Number.isFinite(num)) {
+                keySet.add(num);
+              }
+            }
+          }
+          resolve(Array.from(keySet));
+        };
+        req.onerror = () => resolve(Array.from(keySet));
+      } catch {
+        this.hasIndexedDbError = true;
+        resolve(Array.from(keySet));
+      }
+    });
   }
 
   async clear(worldId: string): Promise<void> {
     await this.fallback.clear(worldId);
+    const db = await this.getDb();
+    if (!db) return;
+
+    const prefix = `${worldId}:`;
+    await new Promise<void>((resolve) => {
+      try {
+        const tx = db.transaction('tiles', 'readwrite');
+        const store = tx.objectStore('tiles');
+        const req = store.getAllKeys();
+        req.onsuccess = () => {
+          const allKeys = req.result ?? [];
+          for (const rawKey of allKeys) {
+            if (typeof rawKey === 'string' && rawKey.startsWith(prefix)) {
+              store.delete(rawKey);
+            }
+          }
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => {
+          this.hasIndexedDbError = true;
+          resolve();
+        };
+      } catch {
+        this.hasIndexedDbError = true;
+        resolve();
+      }
+    });
   }
 }
 
@@ -391,6 +556,11 @@ export class SparseTileStore implements TileStore {
   private worldId: string;
   private maxResidentTiles: number;
   private accessCounter = 1;
+
+  // Cached O(1) stats & level counts invalidated only on tile mutations/evictions
+  private cachedStats: TileStoreStats | null = null;
+  private cachedLevelCounts = new Map<string, number>();
+  private cachedActiveLevelMask: number | null = null;
 
   constructor(
     maxResidentOrOptions?:
@@ -417,6 +587,12 @@ export class SparseTileStore implements TileStore {
     }
   }
 
+  private invalidateStatsCache(): void {
+    this.cachedStats = null;
+    this.cachedLevelCounts.clear();
+    this.cachedActiveLevelMask = null;
+  }
+
   private getMap(kind: TileKind = 'height'): Map<TileKey, Tile> {
     return kind === 'splat' ? this.splatTiles : this.editTiles;
   }
@@ -426,10 +602,19 @@ export class SparseTileStore implements TileStore {
   }
 
   private emitDirty(key: TileKey): void {
+    this.invalidateStatsCache();
     if (this.dirtyListeners.size === 0) return;
     const rect = tileKeyToWorldRect(key);
     for (const fn of this.dirtyListeners) {
       fn(key, rect);
+    }
+  }
+
+  private deleteFromPersistence(kind: TileKind, key: TileKey): void {
+    if (this.persistence.deleteBatchSync) {
+      this.persistence.deleteBatchSync(this.worldId, [{ kind, key }]);
+    } else if (this.persistence.deleteBatch) {
+      void this.persistence.deleteBatch(this.worldId, [{ kind, key }]).catch(() => {});
     }
   }
 
@@ -467,6 +652,7 @@ export class SparseTileStore implements TileStore {
         tile.dirty = false;
         tile.lastUsed = ++this.accessCounter;
         map.set(key, tile);
+        this.invalidateStatsCache();
         return tile;
       }
     }
@@ -493,8 +679,13 @@ export class SparseTileStore implements TileStore {
 
   delete(level: Level, tx: number, tz: number, kind: TileKind = 'height'): boolean {
     const key = tileKey(level, tx, tz, kind);
-    this.getPersistedSet(kind).delete(key);
-    return this.getMap(kind).delete(key);
+    const wasPersisted = this.getPersistedSet(kind).delete(key);
+    const wasResident = this.getMap(kind).delete(key);
+    this.deleteFromPersistence(kind, key);
+    if (wasPersisted || wasResident) {
+      this.invalidateStatsCache();
+    }
+    return wasResident || wasPersisted;
   }
 
   compactIfZero(level: Level, tx: number, tz: number, kind: TileKind = 'height'): boolean {
@@ -505,14 +696,23 @@ export class SparseTileStore implements TileStore {
     if (this.isTileAllZero(tile)) {
       map.delete(key);
       this.getPersistedSet(kind).delete(key);
+      this.deleteFromPersistence(kind, key);
+      this.invalidateStatsCache();
       return true;
     }
     return false;
   }
 
   countTilesAtLevel(level: Level, kind: TileKind = 'height'): number {
-    const map = this.getMap(kind);
-    const persisted = this.getPersistedSet(kind);
+    const normKind = kind === 'edit' ? 'height' : kind;
+    const cacheKey = `${normKind}:${level}`;
+    const cached = this.cachedLevelCounts.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const map = this.getMap(normKind);
+    const persisted = this.getPersistedSet(normKind);
     const seen = new Set<TileKey>();
     for (const [k, t] of map.entries()) {
       if (t.level === level && (t.scale !== 0 || t.min !== 0)) {
@@ -524,10 +724,15 @@ export class SparseTileStore implements TileStore {
         seen.add(k);
       }
     }
-    return seen.size;
+    const count = seen.size;
+    this.cachedLevelCounts.set(cacheKey, count);
+    return count;
   }
 
   activeLevelMask(): number {
+    if (this.cachedActiveLevelMask !== null) {
+      return this.cachedActiveLevelMask;
+    }
     let mask = 0;
     for (const t of this.editTiles.values()) {
       if (t.scale !== 0 || t.min !== 0) {
@@ -538,6 +743,7 @@ export class SparseTileStore implements TileStore {
       const { level } = unpackTileKey(k);
       mask |= 1 << level;
     }
+    this.cachedActiveLevelMask = mask;
     return mask;
   }
 
@@ -576,6 +782,7 @@ export class SparseTileStore implements TileStore {
     this.splatTiles.clear();
     this.persistedEditKeys.clear();
     this.persistedSplatKeys.clear();
+    this.invalidateStatsCache();
     void this.persistence.clear(this.worldId);
   }
 
@@ -591,6 +798,7 @@ export class SparseTileStore implements TileStore {
       loaded.lastUsed = ++this.accessCounter;
       this.getMap(kind).set(key, loaded);
       this.getPersistedSet(kind).add(key);
+      this.invalidateStatsCache();
       return loaded;
     }
 
@@ -675,6 +883,7 @@ export class SparseTileStore implements TileStore {
     if (Math.abs(v) < 1e-5 && this.isTileAllZero(tile)) {
       map.delete(key);
       this.getPersistedSet(kind).delete(key);
+      this.deleteFromPersistence(kind, key);
     }
 
     this.emitDirty(key);
@@ -729,6 +938,10 @@ export class SparseTileStore implements TileStore {
   }
 
   stats(): TileStoreStats {
+    if (this.cachedStats !== null) {
+      return this.cachedStats;
+    }
+
     const editCount = this.editTiles.size;
     const splatCount = this.splatTiles.size;
     const resident = editCount + splatCount;
@@ -753,7 +966,8 @@ export class SparseTileStore implements TileStore {
     }
     const bytesResident = resident * BYTES_PER_TILE;
     const bytesEdited = edited * BYTES_PER_TILE;
-    return {
+
+    this.cachedStats = {
       tiles: resident,
       bytes: bytesResident,
       dirty,
@@ -765,26 +979,46 @@ export class SparseTileStore implements TileStore {
       maxResidentTiles: this.maxResidentTiles,
       softCapExceeded: resident > this.maxResidentTiles,
     };
+    return this.cachedStats;
   }
 
   async flush(): Promise<void> {
     const batch: { kind: TileKind; key: TileKey; bytes: Uint8Array }[] = [];
+    const pendingFlushed: Array<{
+      tile: Tile;
+      version: number;
+      persistedSet: Set<TileKey>;
+    }> = [];
+
     for (const tile of this.editTiles.values()) {
       if (tile.dirty) {
         batch.push({ kind: 'height', key: tile.key, bytes: serializeTileToBytes(tile) });
-        tile.dirty = false;
-        this.persistedEditKeys.add(tile.key);
+        pendingFlushed.push({
+          tile,
+          version: tile.version,
+          persistedSet: this.persistedEditKeys,
+        });
       }
     }
     for (const tile of this.splatTiles.values()) {
       if (tile.dirty) {
         batch.push({ kind: 'splat', key: tile.key, bytes: serializeTileToBytes(tile) });
-        tile.dirty = false;
-        this.persistedSplatKeys.add(tile.key);
+        pendingFlushed.push({
+          tile,
+          version: tile.version,
+          persistedSet: this.persistedSplatKeys,
+        });
       }
     }
     if (batch.length > 0) {
       await this.persistence.saveBatch(this.worldId, batch);
+      for (const item of pendingFlushed) {
+        item.persistedSet.add(item.tile.key);
+        if (item.tile.version === item.version) {
+          item.tile.dirty = false;
+        }
+      }
+      this.invalidateStatsCache();
     }
     // Once dirty tiles have been flushed to persistence and marked clean, evict excess clean tiles
     this.evict();
@@ -866,6 +1100,10 @@ export class SparseTileStore implements TileStore {
         c.persistedSet.add(c.key);
       }
       c.map.delete(c.key);
+    }
+
+    if (toRemove > 0) {
+      this.invalidateStatsCache();
     }
 
     if (syncSaveBatch.length > 0) {

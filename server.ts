@@ -32,7 +32,16 @@ export const CSP_SCRIPT_SRC = isProd ? "'self'" : "'self' 'unsafe-inline'";
 export const CSP_CONNECT_SRC = isProd ? "'self'" : "'self' ws: wss:";
 export const CSP_FRAME_ANCESTORS =
   process.env.CSP_FRAME_ANCESTORS ||
-  "'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com https://*.run.app";
+  [
+    "'self'",
+    'https://aistudio.google.com',
+    'https://*.google.com',
+    'https://*.googleusercontent.com',
+    process.env.APP_URL,
+    process.env.SHARED_APP_URL,
+  ]
+    .filter(Boolean)
+    .join(' ');
 
 export const CSP_HEADER_VALUE =
   `default-src 'self'; script-src ${CSP_SCRIPT_SRC}; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src ${CSP_CONNECT_SRC}; object-src 'none'; base-uri 'self'; frame-ancestors ${CSP_FRAME_ANCESTORS}; form-action 'self';`;
@@ -48,9 +57,25 @@ app.use((_req, res, next) => {
 
 // Client error reporting endpoint (placed before the 3.5MB parser so the 8KB limit is strictly enforced)
 const logHits = new Map<string, { n: number; resetAt: number }>();
+
+export function pruneExpiredLogHits(now = Date.now()): void {
+  for (const [key, val] of logHits.entries()) {
+    if (now > val.resetAt) {
+      logHits.delete(key);
+    }
+  }
+}
+
+export function resetClientLogHitsForTest(): void {
+  logHits.clear();
+}
+
 app.post('/api/client-log', express.json({ limit: '8kb' }), (req, res) => {
   const ip = req.ip ?? 'local';
   const now = Date.now();
+  if (logHits.size > 500) {
+    pruneExpiredLogHits(now);
+  }
   const h = logHits.get(ip);
   if (!h || h.resetAt < now) {
     logHits.set(ip, { n: 1, resetAt: now + 60_000 });
@@ -79,14 +104,21 @@ const jsonBody = express.json({ limit: '3.5mb' });
 const AI_BUDGET_WINDOW_MS = 3_600_000;
 const AI_DAILY_WINDOW_MS = 86_400_000;
 const AI_MAX_CALLS_PER_HOUR = Math.max(1, Number(process.env.AI_MAX_CALLS_PER_HOUR ?? 200));
+const AI_MAX_CALLS_PER_IP_HOUR = Math.max(
+  1,
+  Number(process.env.AI_MAX_CALLS_PER_IP_HOUR ?? 40)
+);
 const GEMINI_DAILY_BUDGET = Math.max(1, Number(process.env.GEMINI_DAILY_BUDGET ?? 500));
 let aiHourWindow = { count: 0, resetAt: 0 };
 let aiDayWindow = { count: 0, resetAt: 0 };
+const aiIpHourWindow = new Map<string, { count: number; resetAt: number }>();
 
 export function consumeGlobalAiBudget(
   now = Date.now(),
   maxHourly = AI_MAX_CALLS_PER_HOUR,
-  maxDaily = GEMINI_DAILY_BUDGET
+  maxDaily = GEMINI_DAILY_BUDGET,
+  clientIp?: string,
+  maxPerIpHourly = AI_MAX_CALLS_PER_IP_HOUR
 ): boolean {
   const hourExpired = now > aiHourWindow.resetAt;
   const dayExpired = now > aiDayWindow.resetAt;
@@ -96,6 +128,20 @@ export function consumeGlobalAiBudget(
   if (nextHourCount > maxHourly || nextDayCount > maxDaily) {
     return false;
   }
+
+  if (clientIp) {
+    const ipEntry = aiIpHourWindow.get(clientIp);
+    const ipExpired = !ipEntry || now > ipEntry.resetAt;
+    const nextIpCount = ipExpired ? 1 : ipEntry.count + 1;
+    if (nextIpCount > maxPerIpHourly) {
+      return false;
+    }
+    aiIpHourWindow.set(clientIp, {
+      count: nextIpCount,
+      resetAt: ipExpired ? now + AI_BUDGET_WINDOW_MS : ipEntry.resetAt,
+    });
+  }
+
   aiHourWindow = {
     count: nextHourCount,
     resetAt: hourExpired ? now + AI_BUDGET_WINDOW_MS : aiHourWindow.resetAt,
@@ -110,6 +156,7 @@ export function consumeGlobalAiBudget(
 export function resetAiBudgetForTest(): void {
   aiHourWindow = { count: 0, resetAt: 0 };
   aiDayWindow = { count: 0, resetAt: 0 };
+  aiIpHourWindow.clear();
 }
 
 const PROMPT_VERSION = 'v1';
@@ -159,7 +206,11 @@ export interface ApiQuotaResult {
   reason?: 'rate_limit' | 'byte_quota';
 }
 
-export function checkApiQuota(ip: string, payloadBytes = 0): ApiQuotaResult {
+export function checkApiQuota(
+  ip: string,
+  payloadBytes = 0,
+  incrementRequest = true
+): ApiQuotaResult {
   const now = Date.now();
   if (rateLimitMap.size > 500) {
     for (const [key, val] of rateLimitMap.entries()) {
@@ -169,6 +220,7 @@ export function checkApiQuota(ip: string, payloadBytes = 0): ApiQuotaResult {
     }
   }
   const safeBytes = Math.max(0, Math.floor(payloadBytes));
+  const reqDelta = incrementRequest ? 1 : 0;
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetAt) {
     const resetAt = now + RATE_LIMIT_WINDOW_MS;
@@ -181,15 +233,15 @@ export function checkApiQuota(ip: string, payloadBytes = 0): ApiQuotaResult {
         reason: 'byte_quota',
       };
     }
-    rateLimitMap.set(ip, { count: 1, bytes: safeBytes, resetAt });
+    rateLimitMap.set(ip, { count: reqDelta, bytes: safeBytes, resetAt });
     return {
       allowed: true,
-      remainingRequests: RATE_LIMIT_MAX_REQUESTS - 1,
+      remainingRequests: RATE_LIMIT_MAX_REQUESTS - reqDelta,
       remainingBytes: RATE_LIMIT_MAX_BYTES - safeBytes,
       resetAt,
     };
   }
-  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+  if (incrementRequest && entry.count >= RATE_LIMIT_MAX_REQUESTS) {
     return {
       allowed: false,
       remainingRequests: 0,
@@ -207,7 +259,7 @@ export function checkApiQuota(ip: string, payloadBytes = 0): ApiQuotaResult {
       reason: 'byte_quota',
     };
   }
-  entry.count += 1;
+  entry.count += reqDelta;
   entry.bytes += safeBytes;
   return {
     allowed: true,
@@ -270,6 +322,12 @@ const cleanupTimer = setInterval(() => {
   for (const [key, val] of rateLimitMap.entries()) {
     if (now > val.resetAt) {
       rateLimitMap.delete(key);
+    }
+  }
+  pruneExpiredLogHits(now);
+  for (const [key, val] of aiIpHourWindow.entries()) {
+    if (now > val.resetAt) {
+      aiIpHourWindow.delete(key);
     }
   }
 }, RATE_LIMIT_WINDOW_MS);
@@ -365,6 +423,21 @@ app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
       return;
     }
 
+    // Account for chunked transfer encoding where content-length was omitted or under-reported
+    const declaredLen = Math.max(0, Number(req.headers['content-length'] ?? 0) || 0);
+    const actualBodyBytes = Buffer.byteLength(imageBase64, 'utf8');
+    const unreportedBytes = Math.max(0, actualBodyBytes - declaredLen);
+    const clientIp = req.ip || 'local';
+    if (unreportedBytes > 0) {
+      const postParseQuota = checkApiQuota(clientIp, unreportedBytes, false);
+      if (!postParseQuota.allowed) {
+        res.status(429).json({
+          error: 'Đã vượt hạn mức băng thông phân tích AI trong 1 phút (tối đa 25MB/phút).',
+        });
+        return;
+      }
+    }
+
     const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '').trim();
     if (
       cleanBase64.length === 0 ||
@@ -404,7 +477,7 @@ app.post('/api/reconstruct', reconstructGuard, jsonBody, async (req, res) => {
         return;
       }
 
-      if (!consumeGlobalAiBudget()) {
+      if (!consumeGlobalAiBudget(Date.now(), AI_MAX_CALLS_PER_HOUR, GEMINI_DAILY_BUDGET, clientIp)) {
         res.json({
           source: 'pixel-engine',
           warning: 'Đã đạt giới hạn gọi AI trong giờ/ngày — sử dụng bộ phân tích Pixel Depth cục bộ.',
@@ -700,7 +773,8 @@ export function serveCompressedOrStatic(distPath: string) {
       }
 
       const cached = await pending;
-      const isHashedAsset = cleanPath.startsWith('/assets/');
+      const isHashedAsset =
+        cleanPath.startsWith('/assets/') && !cleanPath.startsWith('/assets/aistudio/');
       res.setHeader(
         'Cache-Control',
         isHashedAsset ? 'public, max-age=31536000, immutable' : 'no-cache'
@@ -727,6 +801,13 @@ async function startServer() {
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(serveCompressedOrStatic(distPath));
+    app.use(
+      '/assets/aistudio',
+      express.static(path.join(distPath, 'assets', 'aistudio'), {
+        immutable: false,
+        maxAge: '1d',
+      })
+    );
     app.use(
       '/assets',
       express.static(path.join(distPath, 'assets'), {

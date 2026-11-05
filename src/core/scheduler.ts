@@ -77,19 +77,45 @@ export class Scheduler {
     return this.epochCounter;
   }
 
-  bumpEpoch(): number {
+  bumpEpoch(cancelAll = false): number {
     this.epochCounter++;
-    if (this.workerPool) {
+    if (cancelAll && this.workerPool) {
       this.workerPool.cancelBeforeEpoch(this.epochCounter);
     }
     return this.epochCounter;
   }
 
+  cancelLevelJobsBeforeEpoch(level: Level, minEpoch: number): void {
+    if (this.workerPool) {
+      this.workerPool.cancelBeforeEpoch(minEpoch, level);
+    }
+    for (const p of [1, 2, 3, 4] as const) {
+      const q = this.queues[p];
+      for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].level === level && q[i].epoch < minEpoch) {
+          q.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  hasPendingJobsForLevel(level: Level, epoch: number): boolean {
+    for (const p of [1, 2, 3, 4] as const) {
+      const q = this.queues[p];
+      for (let i = 0; i < q.length; i++) {
+        if (q[i].level === level && q[i].epoch === epoch) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   syncWorkerTerrainState(
     baseMap: Float32Array,
     params?: DetailParams,
-    detailEnabled = true,
-    biomeRoughness = 0.72
+    detailEnabled?: boolean,
+    biomeRoughness?: number
   ): void {
     if (this.workerPool) {
       this.workerPool.syncState(baseMap, params, detailEnabled, biomeRoughness);
@@ -102,12 +128,13 @@ export class Scheduler {
     originZ: number,
     w: number,
     h: number,
-    onComplete: (res: WorkerComposeResult) => void
+    onComplete: (res: WorkerComposeResult) => void,
+    epoch?: number
   ): boolean {
     if (!this.workerPool || !this.workerPool.isAvailable()) {
       return false;
     }
-    const reqEpoch = this.epochCounter;
+    const reqEpoch = epoch ?? this.epochCounter;
     const id = this.workerPool.requestComposeWindow(
       reqEpoch,
       level,
@@ -116,7 +143,7 @@ export class Scheduler {
       w,
       h,
       (res) => {
-        if (res.epoch < this.epochCounter) {
+        if (res.epoch < reqEpoch) {
           return; // Stale epoch discarded
         }
         onComplete(res);

@@ -10,7 +10,7 @@ Hệ thống địa hình v3 tách biệt trường cao độ nền, tháp ô th
 
 $$H(x, z, L_{\min}) = H_{\text{stamp}}\!\left(x, z,\; H_{\text{base}}(x, z) + \sum_{L = L_{\min}}^{9} E_L(x, z) + D(x, z, L_{\min})\right)$$
 
-- **`units.ts`**: Hệ tọa độ chuẩn hóa, hằng số `WORLD_SIZE = 10_000`, `TILE = 256`, `LEVELS = 10` (`L0 = 0.1 m` đến `L9 = 51.2 m`), đóng gói khóa ô 53-bit an toàn (`tileKey` / `unpackTileKey`) kèm kiểm tra biên nghiêm ngặt.
+- **`units.ts`**: Hệ tọa độ chuẩn hóa, hằng số `WORLD_SIZE = 10_000`, `TILE = 256`, `LEVELS = 10` (`L0 = 0.1 m` đến `L9 = 51.2 m`), đóng gói khóa ô 25-bit không dấu (`level` 5 bit, `tx` 10 bit, `tz` 10 bit — `tileKey` / `unpackTileKey`) kèm kiểm tra biên nghiêm ngặt.
 - **`tileStore.ts`**: Tháp ô thưa `SparseTileStore` lượng tử hóa `Int16Array` động (`128 KB/ô`), cơ chế LRU chỉ loại bỏ ô đã lưu (`!dirty`), tự động lưu nền (autosave debounce 2 giây) và nạp lại đồng bộ từ `TilePersistence` mà không làm mất dữ liệu khi vượt 512 ô.
 - **`detailGenerator.ts`**: Nhiễu fBm 3-octave xác định theo hạt giống (`seed`), lọc thông thấp theo tần số Nyquist ở từng mức LOD để chống răng cưa.
 - **`stampSystem.ts`**: Tem nền vật thể SDF không phá hủy (`obb`, `ellipse`, `polygon`, `splineCorridor`) kết hợp bằng toán tử hợp mượt giao hoán (`smoothUnionSdf`), đảm bảo bất biến thứ tự và lũy đẳng tuyệt đối (`0.000 m` sai lệch sau 20 lần áp dụng).

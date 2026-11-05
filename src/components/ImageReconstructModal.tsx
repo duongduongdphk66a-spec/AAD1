@@ -305,6 +305,7 @@ export const ImageReconstructModal: React.FC<ImageReconstructModalProps> = ({
   };
 
   // Load initial preset when modal opens, and cancel pending AI requests on close/unmount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only run preset initialization when modal open state transitions
   useEffect(() => {
     if (!isOpen) {
       cancelPendingAiRequest();

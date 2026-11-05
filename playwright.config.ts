@@ -11,7 +11,10 @@ export default defineConfig({
     },
   },
   webServer: {
-    command: 'PORT=3100 node server.js --prod',
+    command: 'node server.js --prod',
+    env: {
+      PORT: '3100',
+    },
     url: 'http://127.0.0.1:3100/healthz',
     reuseExistingServer: !process.env.CI,
     timeout: 15_000,
