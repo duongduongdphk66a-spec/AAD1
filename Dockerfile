@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ ARG VITE_TERRAIN_V3=true
 ENV VITE_TERRAIN_V3=$VITE_TERRAIN_V3
 RUN npm run build
 
-FROM node:22-alpine AS runner
+FROM node:26-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production PORT=3000
 COPY package.json package-lock.json ./
